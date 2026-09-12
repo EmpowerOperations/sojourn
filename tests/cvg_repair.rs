@@ -23,7 +23,7 @@ use faer::Mat;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::{ConstraintSystem, InputVariable, Satisfiability};
+use sojourn::{ConstraintSystem, InputVariable, RepairError, Satisfiability};
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
 fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> ConstraintSystem {
@@ -48,6 +48,12 @@ fn anchors(points: &[&[f64]], rows: usize) -> Mat<f64> {
 /// seen in another.
 const SEED: u64 = 0x50_50_1E_5E_ED;
 
+/// The clearance the clearance fixtures ask for: a thousandth of each box
+/// width, large enough to see in a closed-form answer and small next to every
+/// fixture's geometry. The geometry fixtures above it run at `0.0`, which is
+/// the landing-on-the-bound contract, pinned as it was.
+const CLEARANCE: f64 = 1e-3;
+
 /// Whether every constraint holds at `point`, judged independently of `repair`
 /// through the public evaluator. A test that trusts the thing it is testing is
 /// not a test. Strict: the residual must be `<= 0`, no tolerance, because that
@@ -62,6 +68,27 @@ fn holds(system: &ConstraintSystem, point: &[f64]) -> bool {
     system.constraints().all(|constraint| {
         common::eval_one(constraint, &bindings).is_ok_and(|residual| residual <= 0.0)
     })
+}
+
+/// Whether `point` and each of its `2d` axis neighbours `clearance` box
+/// widths away hold, through the same independent evaluator. This is the
+/// clearance contract as `repair` states it, checked without `repair`.
+fn has_clearance(system: &ConstraintSystem, point: &[f64], clearance: f64) -> bool {
+    if !holds(system, point) || !in_box(system, point) {
+        return false;
+    }
+    let mut neighbour = point.to_vec();
+    for (coordinate, variable) in system.variables().iter().enumerate() {
+        let step = clearance * (variable.upper_bound - variable.lower_bound);
+        for sign in [-1.0, 1.0] {
+            neighbour[coordinate] = point[coordinate] + sign * step;
+            if !holds(system, &neighbour) || !in_box(system, &neighbour) {
+                return false;
+            }
+        }
+        neighbour[coordinate] = point[coordinate];
+    }
+    true
 }
 
 fn in_box(system: &ConstraintSystem, point: &[f64]) -> bool {
@@ -95,8 +122,8 @@ fn a_half_space_is_entered_along_its_steep_coordinate() {
     );
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 
-    let repaired =
-        sojourn::repair(&system, anchors.as_ref(), &[1.0, 1.0]).expect("a half-space is reachable");
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &[1.0, 1.0], 0.0)
+        .expect("a half-space is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -123,7 +150,7 @@ fn a_disc_is_entered_where_the_diamond_touches_it() {
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired =
-        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5]).expect("a disc is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5], 0.0).expect("a disc is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -156,7 +183,7 @@ fn a_disc_spelled_with_a_power_is_entered_the_same_way() {
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired =
-        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5]).expect("a disc is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5], 0.0).expect("a disc is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -187,7 +214,7 @@ fn a_driven_coordinate_is_not_privileged() {
     let anchors = anchors(&[&[1.0, 1.0]], 2);
 
     let repaired =
-        sojourn::repair(&system, anchors.as_ref(), &[3.0, 3.0]).expect("a slab is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[3.0, 3.0], 0.0).expect("a slab is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -217,7 +244,8 @@ fn the_nearer_band_wins_over_the_anchor_it_started_from() {
     );
     let anchors = anchors(&[&[-2.0], &[1.0]], 1);
 
-    let near_one = sojourn::repair(&system, anchors.as_ref(), &[0.9]).expect("a band is reachable");
+    let near_one =
+        sojourn::repair(&system, anchors.as_ref(), &[0.9], 0.0).expect("a band is reachable");
     assert!(
         holds(&system, &near_one),
         "{near_one:?} is outside both bands"
@@ -229,7 +257,7 @@ fn the_nearer_band_wins_over_the_anchor_it_started_from() {
     );
 
     let near_minus_two =
-        sojourn::repair(&system, anchors.as_ref(), &[-1.0]).expect("a band is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[-1.0], 0.0).expect("a band is reachable");
     assert!(
         holds(&system, &near_minus_two),
         "{near_minus_two:?} is outside both bands"
@@ -252,8 +280,8 @@ fn a_domain_hole_is_just_infeasible() {
     let system = system(variables(&[("x1", -1.0, 3.0)]), &["ln(x1) > 0"]);
     let anchors = anchors(&[&[2.0]], 1);
 
-    let repaired =
-        sojourn::repair(&system, anchors.as_ref(), &[-0.5]).expect("the log's domain is reachable");
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &[-0.5], 0.0)
+        .expect("the log's domain is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -281,7 +309,7 @@ fn two_hundred_bounds_are_landed_on_exactly() {
     let anchor = vec![10.75; DIMENSIONS];
     let anchors = anchors(&[&anchor], DIMENSIONS);
 
-    let repaired = sojourn::repair(&system, anchors.as_ref(), &vec![10.2; DIMENSIONS])
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &vec![10.2; DIMENSIONS], 0.0)
         .expect("a corner is reachable");
 
     assert!(
@@ -301,9 +329,10 @@ fn two_hundred_bounds_are_landed_on_exactly() {
 async fn repair_holds_its_contract_over_a_polytope() {
     // Five variables under three loose inequalities, anchored on a census from
     // a solve: the shape Artemis actually runs. For points scattered over the
-    // whole box: the result is feasible by an independent evaluation, inside the
-    // box, a fixed point of `repair`, the same on a second call, and never
-    // farther than the nearest anchor — which is a candidate itself.
+    // whole box: the result is feasible with clearance by an independent
+    // evaluation, inside the box, a fixed point of `repair`, the same on a
+    // second call, and never farther than the nearest anchor that has the
+    // clearance — which is a candidate itself.
     const ANCHORS: usize = 256;
     const TRIALS: usize = 64;
     let inputs = variables(&[
@@ -327,13 +356,21 @@ async fn repair_holds_its_contract_over_a_polytope() {
     };
     let anchors = pool.take(ANCHORS);
     assert_eq!(anchors.ncols(), ANCHORS, "the census should fill");
-    let anchor_points: Vec<Vec<f64>> = (0..ANCHORS)
+    // Only an anchor with the clearance is a candidate `repair` may answer
+    // with, so only those bound how far it may move. Judged once here: the
+    // independent evaluator compiles per call, and this is the hot loop.
+    let clear_anchors: Vec<Vec<f64>> = (0..ANCHORS)
         .map(|column| {
             (0..anchors.nrows())
                 .map(|row| anchors[(row, column)])
                 .collect()
         })
+        .filter(|anchor: &Vec<f64>| has_clearance(&system, anchor, CLEARANCE))
         .collect();
+    assert!(
+        !clear_anchors.is_empty(),
+        "the census should have room to spare"
+    );
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
     let mut complaints = Vec::new();
@@ -341,24 +378,27 @@ async fn repair_holds_its_contract_over_a_polytope() {
         let point: Vec<f64> = (0..inputs.len())
             .map(|_| rng.random_range(0.0..1.0))
             .collect();
-        let Some(repaired) = sojourn::repair(&system, anchors.as_ref(), &point) else {
+        let Ok(repaired) = sojourn::repair(&system, anchors.as_ref(), &point, CLEARANCE) else {
             complaints.push(format!("{point:?}: no repair"));
             continue;
         };
+        if !has_clearance(&system, &repaired, CLEARANCE) {
+            complaints.push(format!("{point:?} -> {repaired:?}: no clearance"));
+        }
         if !holds(&system, &repaired) {
             complaints.push(format!("{point:?} -> {repaired:?}: infeasible"));
         }
         if !in_box(&system, &repaired) {
             complaints.push(format!("{point:?} -> {repaired:?}: outside the box"));
         }
-        let again = sojourn::repair(&system, anchors.as_ref(), &repaired);
-        if again.as_deref() != Some(repaired.as_slice()) {
+        let again = sojourn::repair(&system, anchors.as_ref(), &repaired, CLEARANCE);
+        if again.as_deref() != Ok(repaired.as_slice()) {
             complaints.push(format!(
                 "{point:?} -> {repaired:?} -> {again:?}: not a fixed point"
             ));
         }
-        let twice = sojourn::repair(&system, anchors.as_ref(), &point);
-        let same = twice.as_ref().is_some_and(|twice| {
+        let twice = sojourn::repair(&system, anchors.as_ref(), &point, CLEARANCE);
+        let same = twice.as_ref().is_ok_and(|twice| {
             twice
                 .iter()
                 .zip(&repaired)
@@ -370,7 +410,7 @@ async fn repair_holds_its_contract_over_a_polytope() {
             ));
         }
         let moved = normalised_l1(&system, &point, &repaired);
-        let nearest = anchor_points
+        let nearest = clear_anchors
             .iter()
             .map(|anchor| normalised_l1(&system, &point, anchor))
             .fold(f64::INFINITY, f64::min);
@@ -394,7 +434,10 @@ fn without_anchors_a_gap_is_not_crossed() {
     );
     let none = Mat::<f64>::zeros(1, 0);
 
-    assert_eq!(sojourn::repair(&system, none.as_ref(), &[0.0]), None);
+    assert_eq!(
+        sojourn::repair(&system, none.as_ref(), &[0.0], 0.0),
+        Err(RepairError::Stranded)
+    );
 }
 
 #[test]
@@ -407,8 +450,8 @@ fn without_anchors_a_bound_is_still_reached() {
     );
     let none = Mat::<f64>::zeros(2, 0);
 
-    let repaired =
-        sojourn::repair(&system, none.as_ref(), &[1.0, 1.0]).expect("a half-space needs no anchor");
+    let repaired = sojourn::repair(&system, none.as_ref(), &[1.0, 1.0], 0.0)
+        .expect("a half-space needs no anchor");
     assert!(
         holds(&system, &repaired),
         "{repaired:?} violates the half-space"
@@ -425,7 +468,195 @@ fn a_feasible_point_is_returned_untouched() {
     let point = [-0.3, 0.7];
 
     assert_eq!(
-        sojourn::repair(&system, none.as_ref(), &point).as_deref(),
-        Some(point.as_slice())
+        sojourn::repair(&system, none.as_ref(), &point, 0.0).as_deref(),
+        Ok(point.as_slice())
+    );
+}
+
+// ---- clearance: a deliberate step inside, not an ulp ----------------------
+
+#[test]
+fn a_half_space_is_entered_clear_of_its_wall() {
+    // The steep-coordinate fixture again, asked for a thousandth of the box.
+    // `x1` lands `CLEARANCE * 4` inside the wall at 0 rather than on it, `x2`
+    // still does not move, and every axis neighbour at that distance holds.
+    let system = system(
+        variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
+        &["2*x1 + x2 < 1"],
+    );
+    let anchors = anchors(&[&[0.0, 0.0]], 2);
+
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &[1.0, 1.0], CLEARANCE)
+        .expect("a half-space is reachable");
+
+    assert!(
+        has_clearance(&system, &repaired, CLEARANCE),
+        "{repaired:?} lacks the clearance"
+    );
+    assert_eq!(repaired[1], 1.0, "the cheap coordinate was left alone");
+    let expected = -CLEARANCE * 4.0;
+    assert!(
+        (repaired[0] - expected).abs() < 1e-12,
+        "x1 should land {expected} inside the wall at 0, got {}",
+        repaired[0]
+    );
+}
+
+#[test]
+fn a_vertex_is_landed_clear_of_both_walls() {
+    // Two walls meeting at (0.5, 0.5), approached from (1, 1). Each clamp is
+    // its own axis projection, so the corner is the closed form: both
+    // coordinates land the clearance inside their wall. This is the shape the
+    // spring's optimum has, where a landing an ulp inside was found wanting.
+    let system = system(
+        variables(&[("x1", 0.0, 1.0), ("x2", 0.0, 1.0)]),
+        &["x1 < 0.5", "x2 < 0.5"],
+    );
+    let anchors = anchors(&[&[0.25, 0.25]], 2);
+
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &[1.0, 1.0], CLEARANCE)
+        .expect("a corner is reachable");
+
+    assert!(
+        has_clearance(&system, &repaired, CLEARANCE),
+        "{repaired:?} lacks the clearance"
+    );
+    for (index, value) in repaired.iter().enumerate() {
+        let expected = 0.5 - CLEARANCE;
+        assert!(
+            (value - expected).abs() < 1e-12,
+            "x{} should land at {expected}, got {value}",
+            index + 1
+        );
+    }
+}
+
+#[test]
+fn a_chord_landing_is_backed_off() {
+    // The two-bands fixture, which only the shotgun can answer, asked for a
+    // clearance a tenth of a band's half-width: the chord lands on the band's
+    // edge and the answer must be stepped inside it.
+    let system = system(
+        variables(&[("x", -5.0, 5.0)]),
+        &["(x + 2) * (x - 1) == 0 +/- 0.001"],
+    );
+    let anchors = anchors(&[&[-2.0], &[1.0]], 1);
+    // The band at 1 is about 0.00033 wide in `x`; a hundredth of that, over
+    // the box's width of 10.
+    let clearance = 0.000_033 / 10.0;
+
+    let repaired =
+        sojourn::repair(&system, anchors.as_ref(), &[0.9], clearance).expect("a band is reachable");
+
+    assert!(
+        has_clearance(&system, &repaired, clearance),
+        "{repaired:?} lacks the clearance"
+    );
+    assert!(
+        (repaired[0] - 1.0).abs() < 0.001,
+        "from 0.9 the band at 1 is nearer, got {}",
+        repaired[0]
+    );
+}
+
+#[test]
+fn a_slab_thinner_than_the_clearance_is_cramped() {
+    // A slab `0.002` wide in a box `2` wide, asked for a clearance of a
+    // hundredth of the box: `0.02` each side, ten times more room than the
+    // slab has. Nothing can be handed back with that clearance, and the
+    // honest answer names the nearest feasible point and says so.
+    let system = system(variables(&[("x", -1.0, 1.0)]), &["x == 0 +/- 0.001"]);
+    let anchors = anchors(&[&[0.0]], 1);
+
+    let verdict = sojourn::repair(&system, anchors.as_ref(), &[0.5], 1e-2);
+
+    match verdict {
+        Err(RepairError::Cramped { nearest, clearance }) => {
+            assert!(holds(&system, &nearest), "{nearest:?} is not even feasible");
+            assert_eq!(clearance, 1e-2);
+            assert!(
+                nearest[0].abs() <= 0.001,
+                "the nearest feasible point should be in the slab, got {}",
+                nearest[0]
+            );
+        }
+        other => panic!("expected Cramped, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_point_with_clearance_is_returned_untouched() {
+    let system = system(
+        variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
+        &["2*x1 + x2 < 1"],
+    );
+    let none = Mat::<f64>::zeros(2, 0);
+    let point = [-0.3, 0.7];
+
+    assert_eq!(
+        sojourn::repair(&system, none.as_ref(), &point, CLEARANCE).as_deref(),
+        Ok(point.as_slice())
+    );
+}
+
+#[test]
+fn a_feasible_point_without_clearance_is_moved_inward() {
+    // Feasible by a hair — `2 * x1 + x2` is `1 - 1e-12` — is the fixed point
+    // the caller sent back in, and with a clearance it is not returned as it
+    // came: it steps inside the wall. Not necessarily along one axis: on a
+    // wall every coordinate's clamp costs exactly the clearance, the tie goes
+    // to rounding, and a coordinate that moved first without clearing the
+    // other's neighbour is not always put back. What is promised is the
+    // clearance, and a move of at most the clearance per coordinate.
+    let system = system(
+        variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
+        &["2*x1 + x2 < 1"],
+    );
+    let none = Mat::<f64>::zeros(2, 0);
+    let point = [0.0, 1.0 - 1e-12];
+    assert!(holds(&system, &point), "the fixture should start feasible");
+    assert!(!has_clearance(&system, &point, CLEARANCE));
+
+    let repaired = sojourn::repair(&system, none.as_ref(), &point, CLEARANCE)
+        .expect("a half-space needs no anchor");
+
+    assert!(
+        has_clearance(&system, &repaired, CLEARANCE),
+        "{repaired:?} lacks the clearance"
+    );
+    let moved = normalised_l1(&system, &point, &repaired);
+    assert!(
+        moved <= 2.0 * CLEARANCE + 1e-12,
+        "{point:?} -> {repaired:?} moved {moved}, more than the clearance per coordinate"
+    );
+    for (index, (before, after)) in point.iter().zip(&repaired).enumerate() {
+        assert!(
+            after <= before,
+            "x{} should only ever step inward, {before} -> {after}",
+            index + 1
+        );
+    }
+}
+
+#[test]
+fn a_box_bound_is_a_wall_too() {
+    // A constraint that never binds; the box's own edge is the only wall. A
+    // point on it has no room to move outward, so it is moved the clearance
+    // inside — the caller's round trip can miss the edge by an ulp as well.
+    let system = system(variables(&[("x", 0.0, 1.0)]), &["x > -1"]);
+    let none = Mat::<f64>::zeros(1, 0);
+
+    let repaired = sojourn::repair(&system, none.as_ref(), &[1.0], CLEARANCE)
+        .expect("the box's inside is reachable");
+
+    assert!(
+        has_clearance(&system, &repaired, CLEARANCE),
+        "{repaired:?} lacks the clearance"
+    );
+    assert!(
+        (repaired[0] - (1.0 - CLEARANCE)).abs() < 1e-12,
+        "x should step to {}, got {}",
+        1.0 - CLEARANCE,
+        repaired[0]
     );
 }

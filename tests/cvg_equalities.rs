@@ -605,7 +605,9 @@ async fn both_arms_of_a_product_receive_points() {
 
     assert!(
         first >= wanted && second >= wanted,
-        "x1 * x2 == 0 is a cross of two equal arms, and the sample holds {first} \npoints on x1 = 0 against {second} on x2 = 0, of {} - each arm wants at least \n{wanted}. Driving parametrises one branch and cannot reach the other",
+        "x1 * x2 == 0 is a cross of two equal arms, and the sample holds {first} \
+        points on x1 = 0 against {second} on x2 = 0, of {} - each arm wants at least \
+        {wanted}. Driving parametrises one branch and cannot reach the other",
         points.len()
     );
 }

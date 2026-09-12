@@ -2496,8 +2496,13 @@ the census extents is Artemis's follow-up 2, not ours.
 ## The API — a function over the system, not a method on the pool
 
 ```rust
-pub fn repair(system: &ConstraintSystem, anchors: MatRef<'_, f64>, point: &[f64]) -> Option<Point>
+pub fn repair(
+    system: &ConstraintSystem, anchors: MatRef<'_, f64>, point: &[f64], clearance: f64,
+) -> Result<Point, RepairError>
 ```
+
+*(2026-09-12: `clearance` and the `Result` were added; see "The clearance" below. The paragraph
+that follows predates them and reads `None` for what is now `Err(RepairError::Stranded)`.)*
 
 The brief said "on `FeasibleSamples`, it owns the census and the problem". It owns neither: the
 compiled system is moved into the worker thread and the buffer is drained by `take`. What made a plain
@@ -2513,19 +2518,25 @@ land and no anchor was feasible; with the census the caller starts from, it does
 ## The algorithm — as built
 
 ```
-repair(system, anchors, x) -> Option<Point>
-  0. is_feasible(x)                          -> Some(x) unchanged     (idempotence)
+repair(system, anchors, x, eps) -> Result<Point, RepairError>
+  0. is_feasible(x, eps)                     -> Ok(x) unchanged       (idempotence)
   1. clamp, at most CLAMP_SWEEPS (8) rounds:
-       for every coordinate, its slice with the others held at the current point, and
-       the L1-normalised cost of clamping into it. Apply cheapest first, cumulatively;
-       land each on its bound by nudging inward through a doubling ladder of ulps until
-       the coordinate's own constraints pass; is_feasible after each -> done.
+       for every coordinate, its slice with the others held at the current point,
+       shrunk by eps * width at each end, and the L1-normalised cost of clamping into
+       it (a slice too narrow to shrink aims for its middle). Apply cheapest first,
+       cumulatively; nudge each landing inward through a doubling ladder of ulps until
+       the coordinate's own constraints pass with the clearance; is_feasible(eps) after
+       each -> done.
   2. shotgun: the ANCHOR_SHOTS (8) nearest feasible anchors by L1-normalised distance.
        From each, bisect t in [0, 1] along anchor -> current (t=0 feasible, t=1 not),
        settling driven coordinates at every probe; CHORD_BITS (60) halvings. Keep the
-       feasible end. The candidate nearest x wins; the anchor itself is a candidate.
-  3. release: put each moved coordinate back to x's value where that stays feasible.
-  4. nothing landed and no feasible anchor                -> None
+       feasible end and clamp it as in 1, which from a feasible point is the step off
+       the walls; where no slice can read a wall, back off along the chord in doublings
+       of eps until is_feasible(eps). The candidate nearest x wins; an anchor with the
+       clearance is a candidate itself.
+  3. release: put each moved coordinate back to x's value where that keeps the clearance.
+  4. something feasible seen but nothing with the clearance -> Err(Cramped { nearest })
+     nothing feasible at all                                -> Err(Stranded)
 ```
 
 Three things changed from the sketch. **Cheapest first, not schema order.** The L1 projection
@@ -2546,10 +2557,43 @@ narrowing declines, where `sqr(x)` is inverted (both branches, intersected with 
 disc fixture is written with `sqr` for that reason, and the gap is on the list below.
 
 Guarantees, in the order Artemis relies on them: the result passes `is_feasible` (which already
-includes `in_box`, so the declared box is never left — Artemis's sub-box hole is entirely theirs);
-unchanged input if already feasible, hence idempotent; deterministic given system, anchors and
-point, bit for bit; **never farther than the nearest feasible anchor among the shots**, because
-that anchor is itself a candidate. There is no randomness anywhere in it, not even a seed.
+includes `in_box`, so the declared box is never left — Artemis's sub-box hole is entirely theirs)
+*with the clearance*; unchanged input if it already has the clearance, hence idempotent;
+deterministic given system, anchors, point and clearance, bit for bit; **never farther than the
+nearest anchor with the clearance among the shots**, because that anchor is itself a candidate.
+There is no randomness anywhere in it, not even a seed.
+
+**The clearance** *(2026-09-12)*. Artemis's `e03-spring-3` found the ulp ladder wanting: its
+wrapper stores points normalised to `[-1, 1]` and denormalises before evaluating, the round trip
+is one ulp off for some values, and one ulp on the spring's wire diameter moves two residuals by
+`1e-8` (`d^4` in a term of order `1e5`). A landing a few ulps inside — the ladder's, or the
+sixty-bit bisection's along a chord — was `-1e-15` in the residual at the vertex where the
+deflection and shear constraints meet, and infeasible again by the time Artemis looked. Contract 1
+asked for "a final deliberate step inward"; a margin in ulps of the coordinate is not that at a
+vertex. So `repair` takes a `clearance`: a fraction of each variable's box width, `eps * width_i`
+on coordinate `i`, which is the per-axis tolerance without an array type, in the unit cube Artemis
+normalises into and the metric repair measures in. A point *has* it when it and its `2d` axis
+neighbours at that distance all pass — and on a convex region that is the whole L1 ball. The
+oracle did not grow a second family for it: `is_feasible` and `is_feasible_after` take the
+clearance, and it is a property of how *one constraint* is judged (`ConstraintSystem::holds`: the
+residual at the point and at `eps * width` either way along each variable the constraint names,
+with the box shrunk by the same step), so the after-a-move form consults the affected constraints
+alone exactly as it did at zero, and zero is the plain question. The slices construct it (clamp into the slice
+shrunk by the step; a slice is an outer enclosure, so this aims and never proves), the ladder
+breaks the tie a padded edge leaves against `is_feasible_after` with the clearance, and the chord backs off in
+doublings of `eps` where narrowing declines the constraint and no slice can read the wall.
+`1e-12` is the recommendation for a normalising caller; `0.0` is the old contract, bit for bit.
+`Err(Cramped)` names the nearest feasible point when the room is narrower than the clearance,
+which is the region being thinner than the caller's own noise floor. What was not done: a
+finite-difference normal (ill-defined at exactly the vertices this is for, and the axis and the
+chord are inward directions already in hand), and re-checking only the neighbours that share a
+constraint with a reverted coordinate in the release pass, which is the exact cheaper form of
+its full check if it ever shows in a profile. One softness, pinned by
+`a_feasible_point_without_clearance_is_moved_inward`: a point *on* a wall ties every
+coordinate's clamp at cost `eps`, the tie goes to rounding, and a coordinate that moved first
+without clearing another's neighbour is not always put back — the answer has the clearance and
+moved at most `eps` per coordinate, which is what is promised, not L1-optimality, which never was.
+The SSCCE is kept as `tests/regression_fixture.rs::repair_lands_too_close_at_a_vertex`.
 
 Cost: stage 1 is `sweeps × d` slices plus up to `d` feasibility checks a sweep, stage 2 is
 `K × CHORD_BITS` feasibility checks. Tens of microseconds on a simple tape; a millisecond at 200

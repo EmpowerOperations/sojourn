@@ -34,7 +34,7 @@ mod system;
 pub(crate) use eval::Schema;
 pub use eval::{CompiledExpression, compile, simd_isa};
 pub(crate) use frontend::{Ast, parse};
-pub use repair::repair;
+pub use repair::{RepairError, repair};
 pub use solve::{
     ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_SOLVER_LIMIT,
     FeasibleSamples, GPU_VARIABLE, Infeasibility, Satisfiability, SmtLogic, Status,

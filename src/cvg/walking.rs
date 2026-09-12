@@ -551,7 +551,7 @@ fn advance(
         // move. `TopCorner200DAsEqualities` is entirely this case.
         let mut candidate = from.clone();
         problem.retract(&mut candidate, rng);
-        return if problem.is_feasible(&candidate) {
+        return if problem.is_feasible(&candidate, 0.0) {
             candidate
         } else {
             from
@@ -615,9 +615,9 @@ fn advance(
         // is all of them but one. A random direction moves everything, so there
         // is nothing to skip and it takes the full check.
         let feasible = if along_axis {
-            problem.is_feasible_after(&candidate, swept)
+            problem.is_feasible_after(&candidate, swept, 0.0)
         } else {
-            problem.is_feasible(&candidate)
+            problem.is_feasible(&candidate, 0.0)
         };
         if feasible {
             return candidate;

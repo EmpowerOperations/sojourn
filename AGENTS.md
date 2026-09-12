@@ -244,8 +244,9 @@ system, the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
 That is what lets `sojourn::repair` be a plain function over a `&ConstraintSystem`
 and an anchor matrix rather than a handle: nothing is compiled per call.
 `repair` draws no randomness — not a seed, not a step — and lands a coordinate
-*on* its bound rather than near it; the design and the alternatives it
-displaced are in `docs/todo.md` under *Repair for Artemis*.
+at the caller's clearance inside its bound, *on* the bound at zero clearance;
+the design and the alternatives it displaced are in `docs/todo.md` under
+*Repair for Artemis*.
 `ConstraintSystem::adjusted` is the other, narrower thing: an ulp nudge for a
 solver's witness that landed a hair outside in `f64`.
 

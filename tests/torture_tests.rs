@@ -123,15 +123,19 @@ async fn what_sampling_cannot_find_is_reported_not_proved() {
 /// Repair has no interval to clamp to either — narrowing declines a real
 /// exponent as every solver does — so the chord from the anchor is all it has,
 /// and that is enough: the point lands inside, judged by the evaluator alone.
+/// The clearance has to come from the chord too, since no slice can say where
+/// the wall is to step off it: the landing is backed off along the chord
+/// until the axis neighbours pass.
 #[test]
 fn repair_lands_without_an_interval_to_clamp_to() {
+    const CLEARANCE: f64 = 1e-3;
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 < 5"],
     );
     let anchors = Mat::from_fn(2, 1, |_, _| 0.0);
 
-    let repaired = sojourn::repair(&system, anchors.as_ref(), &[9.0, 9.0])
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &[9.0, 9.0], CLEARANCE)
         .expect("the origin is feasible, so something is reachable");
 
     assert!(
@@ -142,4 +146,14 @@ fn repair_lands_without_an_interval_to_clamp_to() {
         in_box(&system, &repaired),
         "{repaired:?} is outside the box"
     );
+    for coordinate in 0..2 {
+        for sign in [-1.0, 1.0] {
+            let mut neighbour = repaired.clone();
+            neighbour[coordinate] += sign * CLEARANCE * 10.0;
+            assert!(
+                holds(&system, &neighbour) && in_box(&system, &neighbour),
+                "{repaired:?} lacks the clearance: {neighbour:?} is outside"
+            );
+        }
+    }
 }

@@ -812,7 +812,7 @@ mod tests {
             let exact: Vec<usize> = (0..batch.ncols())
                 .filter(|&column| {
                     let point: Point = (0..inputs.len()).map(|row| batch[(row, column)]).collect();
-                    problem.is_feasible(&point)
+                    problem.is_feasible(&point, 0.0)
                 })
                 .collect();
 

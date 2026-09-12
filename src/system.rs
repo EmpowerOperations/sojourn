@@ -661,25 +661,30 @@ impl ConstraintSystem {
         }
     }
 
-    /// Whether a point is inside the box and satisfies every constraint.
-    pub(crate) fn is_feasible(&self, point: &Point) -> bool {
-        if !self.in_box(point) {
+    /// Whether a point is inside the box and satisfies every constraint, with
+    /// `clearance` box widths of room to spare in every coordinate direction.
+    ///
+    /// At `clearance == 0` this is the plain question. Above it, each
+    /// constraint must also hold at the point moved `clearance * width` either
+    /// way along each variable it names, and the box shrinks by the same step
+    /// — see [`holds`](Self::holds). That is exactly "survives any
+    /// per-coordinate perturbation smaller than the step", which is what a
+    /// caller's own normalise-and-back round trip inflicts, and on a convex
+    /// region the axis neighbours span the whole L1 ball of that radius in
+    /// box-normalised coordinates: the ball in the metric
+    /// [`repair`](crate::repair) measures distance in.
+    pub(crate) fn is_feasible(&self, point: &Point, clearance: f64) -> bool {
+        if point.len() != self.variables.len() {
+            return false;
+        }
+        if !(0..self.variables.len()).all(|coordinate| self.within(point, coordinate, clearance)) {
             return false;
         }
         // `eval_row` rather than a one-column batch. This question is asked one
         // point at a time by nature — the walker cannot propose its next
         // candidate until it has judged this one — and wrapping each point in a
         // matrix cost five times the evaluation: `p118` ran 32s against 6s.
-        self.constraints.iter().all(|constraint| {
-            constraint
-                .compiled
-                .eval_row(point)
-                .ok()
-                // Babel's boolean rewrite yields a residual whose sign carries
-                // the truth value: `<= 0` is satisfied. A non-finite residual is
-                // an `Err` and not a pass.
-                .is_some_and(|residual| residual <= 0.0)
-        })
+        (0..self.constraints.len()).all(|index| self.holds(ConstraintId(index), point, clearance))
     }
 
     /// [`is_feasible`](Self::is_feasible), for a point that differs from a
@@ -692,7 +697,9 @@ impl ConstraintSystem {
     /// the number it evaluated to before, and that number was `<= 0` — so
     /// re-deriving it is arithmetic nobody reads. Only the constraints in
     /// `affected[moved]` can have changed, and the box only needs re-checking
-    /// where the point actually moved.
+    /// where the point actually moved. The same holds with a clearance: a
+    /// constraint's neighbours are along the variables it names, and those
+    /// residuals were judged with the constraint.
     ///
     /// # Why it matters
     ///
@@ -704,31 +711,85 @@ impl ConstraintSystem {
     ///
     /// # The precondition is the caller's
     ///
-    /// The point this was derived from **must** have been feasible. `advance`
-    /// holds that by the chain's invariant. Anywhere that does not, use
-    /// [`is_feasible`](Self::is_feasible).
-    pub(crate) fn is_feasible_after(&self, point: &Point, moved: usize) -> bool {
+    /// The point this was derived from **must** have been feasible, with the
+    /// same clearance. `advance` holds that by the chain's invariant. Anywhere
+    /// that does not, use [`is_feasible`](Self::is_feasible).
+    pub(crate) fn is_feasible_after(&self, point: &Point, moved: usize, clearance: f64) -> bool {
         if point.len() != self.variables.len() {
             return false;
         }
-        if !self.variables[moved].contains(point[moved]) {
+        if !self.within(point, moved, clearance) {
             return false;
         }
         if let Some(plan) = &self.plan {
             for driven in plan.driven() {
-                if !self.variables[*driven].contains(point[*driven]) {
+                if !self.within(point, *driven, clearance) {
                     return false;
                 }
             }
         }
 
-        self.incidence.affected(Row(moved)).iter().all(|id| {
+        self.incidence
+            .affected(Row(moved))
+            .iter()
+            .all(|id| self.holds(*id, point, clearance))
+    }
+
+    /// Whether `point[coordinate]` is inside its bounds with `clearance` box
+    /// widths to spare on each side. A zero-width coordinate has no room to
+    /// ask for and is judged on containment alone.
+    fn within(&self, point: &Point, coordinate: usize, clearance: f64) -> bool {
+        let variable = &self.variables[coordinate];
+        let value = point[coordinate];
+        let step = clearance * (variable.upper_bound - variable.lower_bound);
+        if step > 0.0 {
+            variable.contains(value - step) && variable.contains(value + step)
+        } else {
+            variable.contains(value)
+        }
+    }
+
+    /// Whether one constraint is satisfied at `point`, and — for a positive
+    /// clearance — at `point` moved `clearance * width` either way along each
+    /// variable the constraint names.
+    ///
+    /// Babel's boolean rewrite yields a residual whose sign carries the truth
+    /// value: `<= 0` is satisfied. A non-finite residual is an `Err` and not a
+    /// pass. The neighbours are along the constraint's own variables only,
+    /// because moving any other coordinate leaves its residual where it was;
+    /// that is what lets [`is_feasible_after`](Self::is_feasible_after) judge
+    /// a move with the clearance by consulting the affected constraints alone.
+    fn holds(&self, id: ConstraintId, point: &Point, clearance: f64) -> bool {
+        let passes = |point: &Point| {
             self.constraints[id.index()]
                 .compiled
                 .eval_row(point)
                 .ok()
                 .is_some_and(|residual| residual <= 0.0)
-        })
+        };
+        if !passes(point) {
+            return false;
+        }
+        if clearance == 0.0 {
+            return true;
+        }
+        let mut neighbour = point.clone();
+        for row in self.incidence.rows_of(id) {
+            let coordinate = row.index();
+            let variable = &self.variables[coordinate];
+            let step = clearance * (variable.upper_bound - variable.lower_bound);
+            if step <= 0.0 {
+                continue;
+            }
+            for sign in [-1.0, 1.0] {
+                neighbour[coordinate] = point[coordinate] + sign * step;
+                if !passes(&neighbour) {
+                    return false;
+                }
+            }
+            neighbour[coordinate] = point[coordinate];
+        }
+        true
     }
 
     /// The points among `points` that are feasible, in order.
@@ -738,7 +799,7 @@ impl ConstraintSystem {
     pub(crate) fn keep_feasible(&self, points: Vec<Point>) -> Vec<Point> {
         points
             .into_iter()
-            .filter(|point| self.is_feasible(point))
+            .filter(|point| self.is_feasible(point, 0.0))
             .collect()
     }
 
@@ -763,7 +824,7 @@ impl ConstraintSystem {
     /// Returns `None` when the point cannot be brought inside, which is then
     /// the honest answer rather than a silent near-miss.
     pub(crate) fn adjusted(&self, mut point: Point) -> Option<Point> {
-        if self.is_feasible(&point) {
+        if self.is_feasible(&point, 0.0) {
             return Some(point);
         }
 
@@ -792,7 +853,7 @@ impl ConstraintSystem {
                 }
             }
 
-            if self.is_feasible(&point) {
+            if self.is_feasible(&point, 0.0) {
                 return Some(point);
             }
             if !improved {
@@ -915,7 +976,7 @@ pub(crate) mod tests {
                 system.retract(&mut point, &mut rng);
                 // The precondition: the restricted check is only sound about a
                 // point derived from a feasible one.
-                if !system.is_feasible(&point) {
+                if !system.is_feasible(&point, 0.0) {
                     continue;
                 }
 
@@ -925,8 +986,8 @@ pub(crate) mod tests {
                 system.retract(&mut candidate, &mut rng);
 
                 assert_eq!(
-                    system.is_feasible_after(&candidate, moved),
-                    system.is_feasible(&candidate),
+                    system.is_feasible_after(&candidate, moved, 0.0),
+                    system.is_feasible(&candidate, 0.0),
                     "{sources:?}: moving coordinate {moved} of {point:?} to \
                      {candidate:?} is judged differently by the two checks"
                 );
@@ -1032,7 +1093,7 @@ pub(crate) mod tests {
                     .iter()
                     .map(|(low, high)| rng.random_range(*low..=*high))
                     .collect();
-                if !system.is_feasible(&point) {
+                if !system.is_feasible(&point, 0.0) {
                     continue;
                 }
                 feasible_seen += 1;
@@ -1147,13 +1208,13 @@ pub(crate) mod tests {
         // happens to land inside. That difference is the entire bug.
         let edge: f64 = "3.140592653589793".parse().expect("a literal");
         assert!(
-            !system.is_feasible(&vec![edge]),
+            !system.is_feasible(&vec![edge], 0.0),
             "this test is pointless unless the boundary really does miss"
         );
         let adjusted_edge = system
             .adjusted(vec![edge])
             .expect("a near-miss should be adjusted");
-        assert!(system.is_feasible(&adjusted_edge));
+        assert!(system.is_feasible(&adjusted_edge, 0.0));
         assert!(
             (adjusted_edge[0] - edge).abs() < 1e-12,
             "the adjustment moved the point {} away from the witness, which is not a nudge",
