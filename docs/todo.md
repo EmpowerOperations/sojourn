@@ -608,10 +608,15 @@ thing to read, and is the first work item rather than an admission.
       instruction is free to the instrument and not to the user.
 
 - [ ] **Find what the walker actually spends its time on.** Two changes that
-      should each have been large were not: `ConstraintSystem::is_feasible_after` cuts an
+      should each have been large were not: `ConstraintSystem::is_feasible_after` cut an
       axis move on `top_corner_200d` from two hundred constraint evaluations to
       one and bought 3% (134.7s to 130.6s), and 6% on `p118` (35.1s to 32.8s).
       Consistently positive, an order of magnitude short of predicted.
+      *2026-09-12: re-measured with the full check on every axis move and the
+      difference was gone — 270 s against 255 s on `top_corner_200d`, inside
+      run-to-run noise — so the restricted check was removed along with the
+      soundness precondition its callers had to hold. The walker judges every
+      candidate with `is_feasible`.*
 
       So constraint evaluation is **not** the bottleneck it was assumed to be.
       The unexamined candidates are `ConstraintSystem::slice` walking an `Ast`
@@ -701,9 +706,9 @@ thing to read, and is the first work item rather than an admission.
       | 8 | 1600 | 1 |
       | 16 | 3200 | 3 |
 
-      Raising it costs wall clock linearly and `ConstraintSystem::is_feasible_after` did
-      **not** make that affordable — see the entry on where the walker's time
-      actually goes. Left alone deliberately: nothing red depends on it now, and
+      Raising it costs wall clock linearly and the restricted feasibility check
+      (since removed; it measured out) did **not** make that affordable — see
+      the entry on where the walker's time actually goes. Left alone deliberately: nothing red depends on it now, and
       changing it without knowing the cost driver would be guessing.
 
 
@@ -2496,13 +2501,18 @@ the census extents is Artemis's follow-up 2, not ours.
 ## The API — a function over the system, not a method on the pool
 
 ```rust
-pub fn repair(
-    system: &ConstraintSystem, anchors: MatRef<'_, f64>, point: &[f64], clearance: f64,
-) -> Result<Point, RepairError>
+impl FeasibleRegion {
+    pub fn repair(&self, anchors: MatRef<'_, f64>, point: &[f64], clearance: f64)
+        -> Result<Point, RepairError>
+}
 ```
 
-*(2026-09-12: `clearance` and the `Result` were added; see "The clearance" below. The paragraph
-that follows predates them and reads `None` for what is now `Err(RepairError::Stranded)`.)*
+*(2026-09-12: `clearance` and the `Result` were added; see "The clearance" below. Later the
+same day `repair` moved onto `FeasibleRegion` — the renamed `FeasibleSamples`, which now holds a
+clone of its system — as `region.repair(anchors, point, clearance)`; the free function is gone
+from the crate root. A region that could not be solved has nothing to repair toward, and the
+one caller with anchors in hand is the one holding a region. The paragraph that follows predates
+both changes and reads `None` for what is now `Err(RepairError::Stranded)`.)*
 
 The brief said "on `FeasibleSamples`, it owns the census and the problem". It owns neither: the
 compiled system is moved into the worker thread and the buffer is drained by `take`. What made a plain
@@ -2646,7 +2656,11 @@ Artemis's note already names.
 ## Work items
 
 - [x] **Public `repair`** — as a function over `ConstraintSystem` and an anchor matrix, for the
-      reasons above. `Driven by:` `tests/cvg_repair.rs`, all ten green.
+      reasons above. `Driven by:` `tests/cvg_repair.rs`, all ten green. *2026-09-12: now
+      `FeasibleRegion::repair`, the anchors still an argument; see the note under the API.*
+- [x] **A public `worst_residual`.** Artemis's wrapper was recompiling every constraint to
+      grade a point itself. `ConstraintSystem::worst_residual` is public as of 2026-09-12:
+      `None` outside the box or on a fault, else the largest residual, `<= 0` when feasible.
 - [ ] **`check` with the fault split.** Inf → `Infeasible(INFINITY)`, NaN → `Indeterminate`.
       `Driven by:` a fixture with `exp(x)` at the box edge that must rank infeasible, and one
       with `ln(x)` over a box crossing zero that must be indeterminate on the wrong side.

@@ -20,52 +20,54 @@ use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability,
 /// no route now: every batch is sampled first and walked for the rest.
 mod a_lucky_probe_must_not_strand_the_sampling_route {
     use super::*;
+    use anyhow::anyhow;
 
     const DIM: usize = 20;
     const HALF_WIDTH: f64 = 32.768;
     const SLAB: &str = "x1 == x2 + 1 +/- 0.01";
     const WANTED: usize = 1500;
 
-    fn system() -> ConstraintSystem {
+    fn system() -> anyhow::Result<ConstraintSystem> {
         let inputs: Vec<InputVariable> = (1..=DIM)
             .map(|i| InputVariable::new(format!("x{i}"), -HALF_WIDTH, HALF_WIDTH))
             .collect();
-        ConstraintSystem::new(inputs, [SLAB]).expect("the slab binds to its box")
+        Ok(ConstraintSystem::new(inputs, [SLAB])?)
     }
 
-    async fn points_from(seed: u64) -> (usize, Status) {
+    async fn points_from(seed: u64) -> anyhow::Result<(usize, Status)> {
         let verdict = ConstraintSolver::new()
             .with_seed(seed)
-            .solve(system())
-            .await
-            .expect("solve does not error");
-        let mut samples = match verdict {
-            Satisfiability::Satisfied { samples } => samples,
+            .solve(&system()?)
+            .await?;
+        let mut region = match verdict {
+            Satisfiability::Satisfied { region } => region,
             Satisfiability::Unsatisfiable { because } => {
-                panic!("seed {seed}: unsatisfiable: {because:?}")
+                return Err(anyhow!("seed {seed}: unsatisfiable: {because}"));
             }
         };
-        let got = samples.take(WANTED).ncols();
-        (got, samples.status())
+        let got = region.take(WANTED).ncols();
+        Ok((got, region.status()))
     }
 
     #[pollster::test]
-    async fn seed_2_streams_the_whole_request() {
-        let (got, status) = points_from(2).await;
+    async fn seed_2_streams_the_whole_request() -> anyhow::Result<()> {
+        let (got, status) = points_from(2).await?;
         assert_eq!(
             got, WANTED,
             "seed 2 delivered {got} of {WANTED} and ended in {status:?}; a connected slab \
              with points in hand should never exhaust"
         );
         assert_eq!(status, Status::Filling);
+        Ok(())
     }
 
     #[pollster::test]
-    async fn every_other_seed_streams_the_same_slab() {
+    async fn every_other_seed_streams_the_same_slab() -> anyhow::Result<()> {
         for seed in (0..10u64).filter(|s| *s != 2) {
-            let (got, status) = points_from(seed).await;
+            let (got, status) = points_from(seed).await?;
             assert_eq!(got, WANTED, "seed {seed} ended early in {status:?}");
         }
+        Ok(())
     }
 }
 
@@ -87,8 +89,9 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
 /// which is what the clearance argument now is.
 mod repair_lands_too_close_at_a_vertex {
     use super::*;
+    use anyhow::{Context, anyhow};
     use faer::Mat;
-    use sojourn::{compile, repair};
+    use sojourn::{FeasibleRegion, compile};
 
     const NAMES: [&str; 3] = ["d", "D", "N"];
     const LO: [f64; 3] = [0.05, 0.25, 2.0];
@@ -103,29 +106,26 @@ mod repair_lands_too_close_at_a_vertex {
     /// recommends for a caller that normalises and back.
     const CLEARANCE: f64 = 1e-12;
 
-    fn system() -> ConstraintSystem {
+    fn system() -> anyhow::Result<ConstraintSystem> {
         let vars = NAMES
             .iter()
             .zip(LO)
             .zip(HI)
             .map(|((n, lo), hi)| InputVariable::new(*n, lo, hi))
             .collect();
-        ConstraintSystem::new(vars, CONSTRAINTS.iter().map(|s| (*s).to_string()))
-            .expect("the spring binds")
+        Ok(ConstraintSystem::new(
+            vars,
+            CONSTRAINTS.iter().map(|s| (*s).to_string()),
+        )?)
     }
 
     /// Every constraint's residual at `x`, through the public evaluator: the
     /// same numbers the user's evaluator would see.
-    fn residuals(x: &[f64]) -> Vec<f64> {
+    fn residuals(x: &[f64]) -> anyhow::Result<Vec<f64>> {
         let sample = Mat::from_fn(3, 1, |i, _| x[i]);
         CONSTRAINTS
             .iter()
-            .map(|src| {
-                compile(src, &NAMES)
-                    .expect("the fixture parses")
-                    .eval(sample.as_ref())
-                    .expect("the fixture evaluates")[0]
-            })
+            .map(|src| Ok(compile(src, &NAMES)?.eval(sample.as_ref())?[0]))
             .collect()
     }
 
@@ -143,15 +143,20 @@ mod repair_lands_too_close_at_a_vertex {
             .collect()
     }
 
-    async fn anchors() -> Mat<f64> {
+    /// The solved region, with 256 census points taken as anchors.
+    async fn region_and_anchors() -> anyhow::Result<(FeasibleRegion, Mat<f64>)> {
         match ConstraintSolver::new()
             .with_seed(0x50_50_1E_5E_ED)
-            .solve(system())
-            .await
-            .expect("solve does not error")
+            .solve(&system()?)
+            .await?
         {
-            Satisfiability::Satisfied { mut samples } => samples.take(256),
-            Satisfiability::Unsatisfiable { because } => panic!("{because:?}"),
+            Satisfiability::Satisfied { mut region } => {
+                let anchors = region.take(256);
+                Ok((region, anchors))
+            }
+            Satisfiability::Unsatisfiable { because } => {
+                Err(anyhow!("the spring is unsatisfiable: {because}"))
+            }
         }
     }
 
@@ -161,23 +166,24 @@ mod repair_lands_too_close_at_a_vertex {
     /// it is not a fixed point any more: it comes back stepped inside, and
     /// the round trip leaves it feasible.
     #[pollster::test]
-    async fn the_spring_vertex_is_landed_one_rounding_error_inside() {
-        let system = system();
-        let anchors = anchors().await;
+    async fn the_spring_vertex_is_landed_one_rounding_error_inside() -> anyhow::Result<()> {
+        let (region, anchors) = region_and_anchors().await?;
         let landed = [
             0.052_986_411_203_565_92_f64,
             0.388_738_764_466_29,
             9.632_040_910_614,
         ];
 
-        let back = repair(&system, anchors.as_ref(), &landed, CLEARANCE).expect("repairable");
+        let back = region
+            .repair(anchors.as_ref(), &landed, CLEARANCE)
+            .context("repairable")?;
 
-        let g = residuals(&back);
+        let g = residuals(&back)?;
         assert!(
             g.iter().all(|v| *v <= 0.0),
             "repair's own output is not feasible: {g:?}"
         );
-        let g_rt = residuals(&round_trip(&back));
+        let g_rt = residuals(&round_trip(&back))?;
         assert!(
             g_rt.iter().all(|v| *v <= 0.0),
             "repair's output is feasible by {:.1e} but infeasible after a one-ulp frame round \
@@ -185,6 +191,7 @@ mod repair_lands_too_close_at_a_vertex {
             worst(&g),
             worst(&g_rt)
         );
+        Ok(())
     }
 
     /// The general statement: from a point just outside, `repair` lands
@@ -192,28 +199,29 @@ mod repair_lands_too_close_at_a_vertex {
     /// passed before the clearance existed, one step away from the vertex; it
     /// is here so a fix for the vertex does not lose it.
     #[pollster::test]
-    async fn a_repaired_point_should_survive_a_one_ulp_perturbation() {
-        let system = system();
-        let anchors = anchors().await;
+    async fn a_repaired_point_should_survive_a_one_ulp_perturbation() -> anyhow::Result<()> {
+        let (region, anchors) = region_and_anchors().await?;
         // Just outside the vertex: a thicker wire violates the deflection
         // constraint (the first, which grows with `d^4` in the denominator)
         // while the others stay satisfied.
         let outside = [0.0529 * 1.02, 0.3887, 9.632];
-        let g0 = residuals(&outside);
+        let g0 = residuals(&outside)?;
         assert!(
             g0.iter().any(|v| *v > 0.0),
             "the starting point should be infeasible: {g0:?}"
         );
 
-        let landed = repair(&system, anchors.as_ref(), &outside, CLEARANCE).expect("repairable");
+        let landed = region
+            .repair(anchors.as_ref(), &outside, CLEARANCE)
+            .context("repairable")?;
 
-        let g = residuals(&landed);
+        let g = residuals(&landed)?;
         assert!(g.iter().all(|v| *v <= 0.0));
         for i in 0..3 {
             for up in [false, true] {
                 let mut p = landed.clone();
                 p[i] = if up { p[i].next_up() } else { p[i].next_down() };
-                let nudged = worst(&residuals(&p));
+                let nudged = worst(&residuals(&p)?);
                 assert!(
                     nudged <= 0.0,
                     "one ulp {} on {} makes the landed point infeasible by {nudged:.1e}; repair's \
@@ -224,5 +232,6 @@ mod repair_lands_too_close_at_a_vertex {
                 );
             }
         }
+        Ok(())
     }
 }

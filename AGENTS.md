@@ -25,7 +25,7 @@ Read these before changing anything, in this order:
 | path | what | status |
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
-| `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the compiled system, how to solve it, and how to repair a point against it. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
+| `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the validated system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
 | `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the SMT emitter, the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
@@ -140,7 +140,7 @@ only `&mut` in the search is an RNG or a walker's chain.
 or `Opaque`. A `Driven` variable is one the walker *computes* rather than
 searches, which is what lets it move along a measure-zero surface instead of
 jittering beside it — `classify::plan` turns a system into the schema positions
-the walker moves and the ones it computes, in evaluation order, and `ConstraintSystem::retract`
+the walker moves and the ones it computes, in evaluation order, and `classify::retract`
 applies it. Three rules hold the whole thing up:
 
 - **Driving is a Gibbs draw, not an evaluation.** `y == f(x) +/- t` admits the
@@ -164,7 +164,7 @@ applies it. Three rules hold the whole thing up:
 a variable that occurs **exactly once** (*linear* in it, in the term-rewriting
 sense) can all be undone, so `x1 + x2 == 3` drives `x1`. It answers *whether*,
 not *what*: it used to build the rearrangement `3 - x2` for `retract` to
-evaluate, and `ConstraintSystem::slice` derives that band by narrowing the constraint
+evaluate, and `interval::slice` derives that band by narrowing the constraint
 itself, so the expression lost its consumer and the walk down the path is all
 that survives. The arithmetic those rules encoded lives in
 `interval::invert_binary`, tested there against the same cases — the two arms
@@ -198,7 +198,7 @@ than "a subscript", and nothing downstream special-cases one.
 **A constraint says what interval a coordinate may take.** `cvg::interval` is
 HC4-revise: evaluate an expression forward over a box, then push the requirement
 that the constraint be *true* back down through each operator's inverse.
-`ConstraintSystem::slice` intersects that across every constraint naming a coordinate, and
+`interval::slice` intersects that across every constraint naming a coordinate, and
 both the walker's axis moves and `retract` draw from it.
 
 **Every interval is a superset of what it models, and that asymmetry is the
@@ -226,29 +226,37 @@ eighty, where twenty-four are wanted. This is why `classify::Plan`'s topological
 order cannot be replaced by a per-coordinate Gibbs sweep, and the attempt is
 written up in todo.md.
 
-**A move is judged against what could have changed.** An axis move touches one
-coordinate, and `retract` touches the driven ones, so every constraint naming
-none of those evaluates to the residual it evaluated to before — which held, or
-the walker would not have been standing there. `ConstraintSystem::is_feasible_after` asks
-only `Incidence::affected`, precomputed. This is exact rather than a heuristic,
-and the precondition is the caller's: the point it was derived from **must**
-have been feasible.
+**Every candidate is judged by the whole system.** There used to be a
+restricted check for an axis move — only the constraints naming the moved
+coordinate, via `Incidence::affected` — with the precondition that the point it
+was derived from had been feasible. Re-measured on 2026-09-12 it bought nothing
+outside noise (270 s against 255 s on `top_corner_200d`), so it went, and with
+it a precondition a caller could get wrong. `Incidence::affected` still serves
+the repair clamp's per-coordinate filter, where "which walls can this landing
+see" is the actual question.
 
-**`ConstraintSystem` is the compiled system, and every strategy takes one.**
+**`ConstraintSystem` is data, and every strategy borrows one.**
 `ConstraintSystem::new` (in `src/system.rs`) compiles every constraint to prove
 it binds and keeps the tape beside the AST as one `Constraint`, along with the
-drive plan and the incidence graph, so every point-level question —
-`is_feasible`, `slice`, `retract`, `settle` — is answered by the system. There
-is no wrapper type around it: the one thing a solver call needs beyond the
-system, the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
-That is what lets `sojourn::repair` be a plain function over a `&ConstraintSystem`
-and an anchor matrix rather than a handle: nothing is compiled per call.
-`repair` draws no randomness — not a seed, not a step — and lands a coordinate
-at the caller's clearance inside its bound, *on* the bound at zero clearance;
-the design and the alternatives it displaced are in `docs/todo.md` under
-*Repair for Artemis*.
-`ConstraintSystem::adjusted` is the other, narrower thing: an ulp nudge for a
-solver's witness that landed a hair outside in `f64`.
+drive plan and the incidence graph, both derived while proving the set fits
+together. Its fields are crate-visible and it answers the simple questions
+only: `is_feasible` (with a clearance) and `worst_residual`. The moves are the
+engine's, as free functions over `&ConstraintSystem` in the module that owns
+the idea — `classify::retract` and `classify::settle` for the plan,
+`interval::slice` for the narrowing question, `smt::adjusted` for the ulp
+nudge of a solver's witness that landed a hair outside in `f64`. There is no
+wrapper type around the system: the one thing a solver call needs beyond it,
+the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
+
+**`FeasibleRegion` is the solved system.** `ConstraintSolver::solve` takes the
+system by reference and clones it twice, once for the worker thread and once
+for the region, so the region can answer for the system after the search:
+`system()`, `take` for samples, and `repair` — which lives here rather than
+on the system because a region that could not be solved has nothing to repair
+toward. `repair` draws no randomness — not a seed, not a step — and lands a
+coordinate at the caller's clearance inside its bound, *on* the bound at zero
+clearance; the design and the alternatives it displaced are in `docs/todo.md`
+under *Repair for Artemis*.
 
 `cvg::incidence` is the bipartite graph of constraints and coordinates, kept in
 both directions because the walker traverses it both ways. Its indices are

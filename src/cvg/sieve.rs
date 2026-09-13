@@ -416,12 +416,9 @@ impl Sieve {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bounds"),
-                contents: &bytes_of_f32(
-                    problem
-                        .box_bounds()
-                        .iter()
-                        .flat_map(|&(low, high)| [narrow(low), narrow(high)]),
-                ),
+                contents: &bytes_of_f32(problem.variables.iter().flat_map(|variable| {
+                    [narrow(variable.lower_bound), narrow(variable.upper_bound)]
+                })),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let survivors = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -653,9 +650,10 @@ fn shader(problem: &ConstraintSystem) -> String {
     Shader {
         prelude: Prelude::new(),
         functions: problem
-            .compiled()
+            .constraints
+            .iter()
             .enumerate()
-            .map(|(index, compiled)| compiled.wgsl(&format!("c{index}")))
+            .map(|(index, constraint)| constraint.compiled.wgsl(&format!("c{index}")))
             .collect(),
         bindings: &BINDINGS,
         n: problem.variables().len(),

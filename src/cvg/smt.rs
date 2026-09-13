@@ -414,6 +414,83 @@ pub(crate) enum Verdict {
     Inconclusive { unexpressed: Vec<usize> },
 }
 
+/// Nudges a solver's witness back onto the feasible side of `f64`.
+///
+/// A solver reasons in **exact real arithmetic** and answers with a witness
+/// that is exactly on a boundary — asked for `x == pi +/- 0.001` it
+/// returns exactly `pi - 0.001`, because a boundary is the simplest
+/// solution there is. The pool then re-checks in `f64`, where `pi`, the
+/// tolerance, and the subtraction each round, and the point lands a hair
+/// outside. Discarding it wastes the entire solver call over an error in
+/// the last place.
+///
+/// This is not a general-purpose repair and does not pretend to be; that
+/// is [`FeasibleRegion::repair`](crate::FeasibleRegion::repair), which starts
+/// from anywhere in the box. This is a bounded coordinate sweep: for each
+/// variable, try a step of a few ulps each way and keep it if the worst
+/// residual falls. That reaches a point which is *barely* outside, which is
+/// the only case a solver witness produces. It will not rescue a point that
+/// is genuinely infeasible, and it should not.
+///
+/// Returns `None` when the point cannot be brought inside, which is then
+/// the honest answer rather than a silent near-miss.
+pub(crate) fn adjusted(problem: &ConstraintSystem, mut point: Point) -> Option<Point> {
+    if problem.is_feasible(&point, 0.0) {
+        return Some(point);
+    }
+
+    for sweep in 0..ADJUST_SWEEPS {
+        let mut improved = false;
+
+        for index in 0..point.len() {
+            let before = problem.worst_residual(&point)?;
+            let original = point[index];
+
+            // Growing the step across sweeps: an ulp first, because that
+            // is what a boundary witness misses by, then wider in case the
+            // rounding compounded through a longer expression.
+            let step = ulps(original, 1 << (2 * sweep));
+
+            for candidate in [original + step, original - step] {
+                point[index] = candidate;
+                let better = problem
+                    .worst_residual(&point)
+                    .is_some_and(|after| after < before);
+                if better {
+                    improved = true;
+                    break;
+                }
+                point[index] = original;
+            }
+        }
+
+        if problem.is_feasible(&point, 0.0) {
+            return Some(point);
+        }
+        if !improved {
+            break;
+        }
+    }
+
+    None
+}
+
+/// How many coordinate sweeps an adjustment gets before it gives up.
+///
+/// A near-miss is a rounding error, so it yields in one or two passes or it was
+/// never a near-miss. This is a cap on wasted work rather than a tuning knob.
+const ADJUST_SWEEPS: usize = 4;
+
+/// `count` units in the last place of `value`, as a distance.
+///
+/// Scaled to the value rather than absolute, because a witness near `1e-9` and
+/// one near `1e9` miss by wildly different amounts and the same absolute step
+/// would be useless for one and enormous for the other.
+fn ulps(value: f64, count: u32) -> f64 {
+    let magnitude = if value == 0.0 { 1.0 } else { value.abs() };
+    f64::from(count) * (magnitude.next_up() - magnitude)
+}
+
 /// Asks a solver for a first point, once rejection sampling has failed to find
 /// one.
 ///
@@ -462,7 +539,11 @@ pub(crate) fn seed_away_from(
     cancel: &Cancellation<'_>,
 ) -> Result<Verdict> {
     let inputs = problem.variables();
-    let document = smtlib::emit_away_from(inputs, problem.written(), logic, avoid, reach);
+    let written = problem
+        .constraints
+        .iter()
+        .map(|constraint| &constraint.written);
+    let document = smtlib::emit_away_from(inputs, written, logic, avoid, reach);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text, limit, cancel)? {
@@ -496,6 +577,50 @@ pub(crate) fn seed_away_from(
 mod tests {
     use super::*;
     use crate::InputVariable;
+
+    /// A witness one ulp outside is brought in; one genuinely outside is not.
+    ///
+    /// The first case is what a solver actually produces. Asked for
+    /// `x1 == pi +/- 0.001` Z3 answers with the *boundary* — exactly
+    /// `pi - 0.001` — because a boundary is the simplest solution there is. It
+    /// reasons in exact reals; the pool re-checks in `f64`, where `pi`, the
+    /// tolerance and the subtraction each round, and the point lands a hair
+    /// outside. Before this existed the whole solver call was thrown away over
+    /// that, and `cvg_pools::constants` passed only because the *previous*
+    /// encoding happened to make Z3 pick the other edge, where the rounding
+    /// went the other way. Luck, not correctness.
+    ///
+    /// The second case is the one that matters more: the nudge must not rescue
+    /// a point that is simply infeasible, or `Unsatisfiable` stops meaning
+    /// anything.
+    #[test]
+    fn a_boundary_witness_is_adjusted_and_a_wrong_one_is_not() {
+        let system = crate::system::tests::system(
+            vec![InputVariable::new("x1", 0.0, 10.0)],
+            &["x1 == pi +/- 0.001"],
+        );
+
+        // The value Z3 actually returns, as a decimal parsed back into f64 —
+        // not `PI - 0.001`, which Rust computes to a *different* f64 and which
+        // happens to land inside. That difference is the entire bug.
+        let edge: f64 = "3.140592653589793".parse().expect("a literal");
+        assert!(
+            !system.is_feasible(&[edge], 0.0),
+            "this test is pointless unless the boundary really does miss"
+        );
+        let adjusted_edge = adjusted(&system, vec![edge]).expect("a near-miss should be adjusted");
+        assert!(system.is_feasible(&adjusted_edge, 0.0));
+        assert!(
+            (adjusted_edge[0] - edge).abs() < 1e-12,
+            "the adjustment moved the point {} away from the witness, which is not a nudge",
+            (adjusted_edge[0] - edge).abs()
+        );
+
+        assert!(
+            adjusted(&system, vec![7.0]).is_none(),
+            "a point nowhere near the band was 'adjusted' into feasibility"
+        );
+    }
 
     /// How many assertions a solver actually took from a document.
     ///

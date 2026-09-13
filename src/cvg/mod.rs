@@ -13,7 +13,7 @@
 //! Finding the *first* feasible point is the hard part, and for a tight region
 //! it needs a solver. Once there, cheap strategies cover the space quickly. That
 //! is why `ConstraintSolver::solve` is the expensive, awaitable call and
-//! `FeasibleSamples::take` is not.
+//! `FeasibleRegion::take` is not.
 //!
 //! This module is the engine. The types a caller holds — the system, the
 //! solver, the samples handle, the verdicts — are defined at the crate root
@@ -125,7 +125,7 @@ const BARREN_BATCHES: usize = 3;
 ///
 /// Lives entirely on the worker thread and is never shared. That is the whole
 /// concurrency design — no locks, because there is nothing to lock. What the
-/// caller holds is [`FeasibleSamples`], which is a handle to the worker and
+/// caller holds is [`FeasibleRegion`], which is a handle to the worker and
 /// owns none of this. What the search has *found* is not here either: that is
 /// a [`Progress`] value the worker threads through its loop.
 pub(crate) struct Ladder {
@@ -180,7 +180,7 @@ impl Ladder {
                 Strategy::Solver => ladder.solver = Some(budgets.solver_limit),
                 Strategy::BruteSquad => {
                     let sampler = RandomSampler::new(
-                        system.box_bounds(),
+                        &system.variables,
                         stream,
                         budgets.proposals,
                         budgets.threads,
@@ -279,9 +279,9 @@ const GAP_QUERIES: usize = 16;
 /// exclusion query means "nothing that far from what we hold", never that the
 /// problem is unsatisfiable.
 ///
-/// Everything returned is still a hint: [`ConstraintSystem::keep_feasible`]
-/// filters them and [`ConstraintSystem::adjusted`] nudges a boundary witness,
-/// so a bad one costs a solver call and never a wrong point.
+/// Everything returned has been judged: [`smt::adjusted`] nudges a boundary
+/// witness and answers only with a point that passes `is_feasible`, so a bad
+/// one costs a solver call and never a wrong point.
 fn cover_gaps(
     problem: &ConstraintSystem,
     logic: &SmtLogic,
@@ -324,7 +324,7 @@ fn cover_gaps(
         // Avoided whether or not it survives repair: the solver has told us
         // about this piece, and asking again would be told the same thing.
         avoid.push(point.clone());
-        if let Some(seed) = problem.adjusted(point) {
+        if let Some(seed) = smt::adjusted(problem, point) {
             seeds.push(seed);
         }
     }
@@ -368,7 +368,11 @@ pub(crate) fn serve(
     stop: &AtomicBool,
 ) {
     // Hints are judged, not trusted, and count as points rather than trials.
-    let progress = Progress::empty().extend(problem.keep_feasible(known));
+    let known = known
+        .into_iter()
+        .filter(|point| problem.is_feasible(point, 0.0))
+        .collect();
+    let progress = Progress::empty().extend(known);
     let cancel = Cancellation::watching(&opening);
 
     let (verdict, progress) = match open(problem, &mut ladder, progress, &cancel) {
@@ -448,7 +452,7 @@ fn open(
     if !progress.is_empty() {
         if walker_will_carry && let Some(limit) = ladder.solver {
             let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-            progress = progress.extend(problem.keep_feasible(gaps));
+            progress = progress.extend(gaps);
         }
         return Ok((Opening::Satisfied, progress));
     }
@@ -456,7 +460,7 @@ fn open(
     let unexpressed = match ladder.solver {
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
-        None => (0..problem.constraints().count()).collect(),
+        None => (0..problem.constraints.len()).collect(),
         Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel)? {
             smt::Verdict::Impossible { blamed } => {
                 return Ok((Opening::Impossible { blamed }, progress));
@@ -469,8 +473,7 @@ fn open(
                 // A seed is not a sample either: it satisfies whatever could
                 // be expressed, and it is judged against *everything*; if it
                 // does not survive that, brute force still gets its turn.
-                let witness = problem.adjusted(point).into_iter().collect();
-                progress = progress.extend(problem.keep_feasible(witness));
+                progress = progress.extend(smt::adjusted(problem, point).into_iter().collect());
 
                 // With a point in hand the search knows one piece of its region,
                 // so now ask the solver about the rest of the box. A region in
@@ -478,7 +481,7 @@ fn open(
                 // nowhere: a chain cannot cross between them afterwards.
                 if !progress.is_empty() {
                     let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-                    progress = progress.extend(problem.keep_feasible(gaps));
+                    progress = progress.extend(gaps);
                 }
                 unexpressed
             }
@@ -572,7 +575,10 @@ fn next_batch(
         && let Some(walker) = &mut ladder.walker
     {
         let walked = walker.extend(problem, progress.points(), count - points.len());
-        let walked = problem.keep_feasible(walked);
+        let walked: Vec<Point> = walked
+            .into_iter()
+            .filter(|point| problem.is_feasible(point, 0.0))
+            .collect();
         progress = progress.extend(walked.clone());
         points.extend(walked);
     }
@@ -601,11 +607,14 @@ mod tests {
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_threads(2)
-            .solve(one_in_a_million())
+            .solve(&one_in_a_million())
             .await
             .expect("nothing should go wrong");
 
-        let Satisfiability::Satisfied { mut samples } = verdict else {
+        let Satisfiability::Satisfied {
+            region: mut samples,
+        } = verdict
+        else {
             panic!("brute force should have found the region: {verdict:?}");
         };
         let delivered = samples.take(10);
@@ -628,7 +637,7 @@ mod tests {
         let by_solver = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_proposal_budget(0)
-            .solve(one_in_a_million())
+            .solve(&one_in_a_million())
             .await
             .expect("nothing should go wrong");
         assert!(
@@ -648,10 +657,13 @@ mod tests {
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_proposal_budget(1_000_000)
             .with_threads(2)
-            .solve(transcendental)
+            .solve(&transcendental)
             .await
             .expect("nothing should go wrong");
-        let Satisfiability::Satisfied { mut samples } = by_brute_force else {
+        let Satisfiability::Satisfied {
+            region: mut samples,
+        } = by_brute_force
+        else {
             panic!("brute force should have taken over from Z3's `unknown`: {by_brute_force:?}");
         };
         let delivered = samples.take(5);
@@ -690,7 +702,7 @@ mod tests {
             .with_solver_limit(30_000)
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(hard)
+            .solve(&hard)
             .await
             .expect("nothing should go wrong");
         let took = started.elapsed();
@@ -715,7 +727,7 @@ mod tests {
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(one_in_a_million())
+            .solve(&one_in_a_million())
             .await
             .expect("nothing should go wrong");
 

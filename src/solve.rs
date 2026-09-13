@@ -4,11 +4,13 @@
 //! [`ConstraintSolver`] is every knob — the seed, the budgets, the strategy
 //! list, the SMT logic — with a default for each, and one awaitable call,
 //! [`solve`](ConstraintSolver::solve), that starts the engine on a worker
-//! thread. [`FeasibleSamples`] is what a satisfied search returns: a handle to
-//! that worker, from which feasible points are taken as a matrix. The verdicts
-//! say what a search concluded, and whether that was a proof or a shrug. The
-//! engine itself is `cvg`.
+//! thread. [`FeasibleRegion`] is what a satisfied search returns: the solved
+//! region — a handle to that worker, from which feasible points are taken as
+//! a matrix, the system it was solved over, and repair of any point against
+//! it. The verdicts say what a search concluded, and whether that was a proof
+//! or a shrug. The engine itself is `cvg`.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +26,8 @@ use faer::Mat;
 
 use crate::cvg;
 use crate::cvg::{CHANNEL_CAPACITY, Ladder, Opening};
-use crate::{ConstraintRef, ConstraintSystem, Point, Schema};
+use crate::repair::RepairError;
+use crate::{ConstraintRef, ConstraintSystem, Point};
 
 /// What a search concluded.
 ///
@@ -39,8 +42,12 @@ use crate::{ConstraintRef, ConstraintSystem, Point, Schema};
 /// is what makes the two arms sufficient — there is no "probably fine, ask
 /// later" state to represent.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "produced once per solve and moved once; the region carries its system, and boxing it would cost every caller a deref for a few hundred bytes"
+)]
 pub enum Satisfiability {
-    Satisfied { samples: FeasibleSamples },
+    Satisfied { region: FeasibleRegion },
     Unsatisfiable { because: Infeasibility },
 }
 
@@ -285,10 +292,10 @@ impl std::fmt::Display for SmtLogic {
 ///     vec![sojourn::parse("x > 0")?],
 /// )?;
 ///
-/// if let Satisfiability::Satisfied { mut samples } = system.solve().await? {
+/// if let Satisfiability::Satisfied { mut region } = system.solve().await? {
 ///     // One column per sample, one row per variable — an input matrix as it
 ///     // stands, no transpose.
-///     let batch = samples.take(1_000);
+///     let batch = region.take(1_000);
 /// }
 /// # Ok(())
 /// # }
@@ -378,7 +385,7 @@ impl ConstraintSolver {
     /// What a caller reproducing a run supplies. Every point the search
     /// delivers is a function of this seed and the budgets, so two solves of
     /// the same system under the same seed hand out the same points in the
-    /// same order — which is also what makes a [`repair`](crate::repair) anchored on those
+    /// same order — which is also what makes a [`repair`](FeasibleRegion::repair) anchored on those
     /// points repeat.
     #[must_use]
     pub fn with_seed(self, seed: u64) -> Self {
@@ -520,27 +527,19 @@ impl ConstraintSolver {
     /// how to cancel:** a brute-force search notices between batches and
     /// stops, freeing every core it took, and a solver call in progress is
     /// interrupted — see [`with_solver_limit`](Self::with_solver_limit) for
-    /// what happens if Z3 ignores that. [`FeasibleSamples::take`] is
+    /// what happens if Z3 ignores that. [`FeasibleRegion::take`] is
     /// synchronous by design. Recorded in `docs/todo.md`.
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An
     /// unsatisfiable problem is a [`Satisfiability`], not an error.
-    pub async fn solve(self, system: ConstraintSystem) -> Result<Satisfiability> {
-        // Kept so the verdict's constraint indices can be turned back into
-        // something a caller reads; the worker takes the originals. The names
-        // rather than a clone of the system, which now carries every tape.
-        let blame_table: Vec<ConstraintRef> = (0..system.constraints().count())
-            .map(|i| system.named(i))
-            .collect();
-        let schema = system.schema().clone();
-        let ladder = Ladder::new(
-            &system,
-            self.logic,
-            self.rng,
-            &self.strategies,
-            self.budgets,
-        );
+    pub async fn solve(self, system: &ConstraintSystem) -> Result<Satisfiability> {
+        // The worker owns a clone and the handle another: the thread needs
+        // `'static`, and the handle answers for the region after the search,
+        // which is where repair lives. A system is tapes and two small graphs,
+        // so two clones are nothing against the search.
+        let ladder = Ladder::new(system, self.logic, self.rng, &self.strategies, self.budgets);
+        let system = system.clone();
 
         let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (send_opening, opening) = oneshot::channel();
@@ -548,9 +547,10 @@ impl ConstraintSolver {
 
         let worker_stop = Arc::clone(&stop);
         let known_feasible = self.known_feasible;
+        let worker_system = system.clone();
         let worker = std::thread::spawn(move || {
             cvg::serve(
-                &system,
+                &worker_system,
                 ladder,
                 known_feasible,
                 send_opening,
@@ -565,8 +565,8 @@ impl ConstraintSolver {
 
         // Built even for an unsatisfiable problem, which does not keep it: its
         // `Drop` is what joins the worker.
-        let pool = FeasibleSamples {
-            schema,
+        let region = FeasibleRegion {
+            system,
             batches,
             buffer: VecDeque::new(),
             worker: Some(worker),
@@ -578,14 +578,14 @@ impl ConstraintSolver {
         let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
             indices
                 .into_iter()
-                .map(|i| blame_table[i].clone())
+                .map(|i| region.system.named(i))
                 .collect()
         };
 
         Ok(match verdict {
-            // The pool is dropped on both unsatisfiable paths, and its `Drop` is
-            // what joins the worker.
-            Opening::Satisfied => Satisfiability::Satisfied { samples: pool },
+            // The region is dropped on both unsatisfiable paths, and its `Drop`
+            // is what joins the worker.
+            Opening::Satisfied => Satisfiability::Satisfied { region },
             Opening::Impossible { blamed } => Satisfiability::Unsatisfiable {
                 because: Infeasibility::Proved {
                     blamed: name_all(blamed),
@@ -615,13 +615,21 @@ pub enum Status {
     Failed(String),
 }
 
-/// A feasible region being sampled on a background thread.
+/// A solved region: the system a search found feasible points in, being
+/// sampled on a background thread.
 ///
 /// Holds no search state — the engine's ladder and its progress value live
-/// on the worker thread and nowhere else. This is a receiving end, a buffer,
-/// and the means to stop the worker.
-pub struct FeasibleSamples {
-    schema: Schema,
+/// on the worker thread and nowhere else. This is the system, a receiving
+/// end, a buffer, and the means to stop the worker. It is also where a point
+/// that is not a sample is brought to the region, [`repair`](Self::repair):
+/// a region that could not be solved has nothing to repair toward, which is
+/// why that lives here and not on the system.
+///
+/// Slight misnomer: this region is "solved", and may be disjoint
+/// (meaning its "feasible regions"),
+/// at time of writing it has no mechanism to discover this.
+pub struct FeasibleRegion {
+    system: ConstraintSystem,
     batches: Receiver<Vec<Point>>,
     buffer: VecDeque<Point>,
     worker: Option<JoinHandle<()>>,
@@ -632,16 +640,68 @@ pub struct FeasibleSamples {
     failure: Option<String>,
 }
 
-impl std::fmt::Debug for FeasibleSamples {
+impl std::fmt::Debug for FeasibleRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FeasibleSamples")
+        f.debug_struct("FeasibleRegion")
             .field("buffered", &self.buffer.len())
             .field("status", &self.status())
             .finish()
     }
 }
 
-impl FeasibleSamples {
+impl FeasibleRegion {
+    /// The system this region was solved over.
+    #[must_use]
+    pub const fn system(&self) -> &ConstraintSystem {
+        &self.system
+    }
+
+    /// A point that satisfies the system with room to spare, near `point`,
+    /// the same every time.
+    ///
+    /// `anchors` are feasible points the caller believes in, one per column in
+    /// schema order — what [`take`](Self::take) hands out is the intended
+    /// source, and the caller supplies them rather than this reading its own
+    /// buffer because the answer has to be a function of what the caller can
+    /// see: same system, same anchors, same point, same output, bit for bit.
+    /// They are judged rather than trusted; an infeasible column is skipped.
+    /// With no anchors at all the answer is whatever clamping alone reaches,
+    /// which is enough wherever the constraints name where their feasible
+    /// side is.
+    ///
+    /// `clearance` is the room kept from every wall, as a fraction of each
+    /// variable's box width: the result and each of its `2d` axis neighbours
+    /// `clearance * width` away pass [`ConstraintSystem::is_feasible`]. `0.0`
+    /// asks for feasibility alone and lands on the bounds. A caller that
+    /// normalises points and back wants a few thousand ulps of the unit cube,
+    /// `1e-12`: far above what any per-coordinate round trip loses and
+    /// invisible to an optimiser. There is no default because the right value
+    /// is the caller's own noise floor.
+    ///
+    /// A point that already has the clearance comes back unchanged, so
+    /// `repair(repair(x)) == repair(x)`; a feasible point without it is moved
+    /// inward. And never farther from `point`, in L1 over box-normalised
+    /// coordinates, than the nearest anchor with the clearance among the few
+    /// considered. The algorithm is `src/repair.rs`.
+    ///
+    /// # Errors
+    /// [`RepairError::Stranded`] when nothing feasible was reached at all, and
+    /// [`RepairError::Cramped`] when something feasible was but the clearance
+    /// could not be had there.
+    ///
+    /// # Panics
+    /// If `point` or `anchors` do not have one entry per variable, or
+    /// `clearance` is negative or not finite. That is a caller mixing up
+    /// systems, not a verdict about the point.
+    pub fn repair(
+        &self,
+        anchors: faer::MatRef<'_, f64>,
+        point: &[f64],
+        clearance: f64,
+    ) -> std::result::Result<Point, RepairError> {
+        crate::repair::repair(&self.system, anchors, point, clearance)
+    }
+
     /// Up to `count` samples, waiting for them.
     ///
     /// **One column per sample, one row per schema variable** — the shape
@@ -713,7 +773,7 @@ impl FeasibleSamples {
     /// Takes `count` from the buffer as a column-per-sample matrix.
     fn drain(&mut self, count: usize) -> Mat<f64> {
         let taken = count.min(self.buffer.len());
-        let rows = self.schema.len();
+        let rows = self.system.variables.len();
         // `from_fn` visits in the matrix's own order, so the points come out of
         // the buffer by index rather than by draining as it goes.
         let samples = Mat::from_fn(rows, taken, |row, column| self.buffer[column][row]);
@@ -731,7 +791,7 @@ impl FeasibleSamples {
     }
 }
 
-impl Drop for FeasibleSamples {
+impl Drop for FeasibleRegion {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
 
@@ -755,7 +815,7 @@ impl Drop for FeasibleSamples {
 /// travels back as a return value rather than being written to a field from in
 /// here.
 fn reap(handle: JoinHandle<()>) -> Option<String> {
-    let payload = handle.join().err()?;
+    let payload: Box<dyn Any> = handle.join().err()?;
     Some(
         payload
             .downcast_ref::<&str>()

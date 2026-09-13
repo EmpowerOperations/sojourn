@@ -16,21 +16,30 @@
 
 mod common;
 
+use anyhow::{Context, anyhow};
 use faer::Mat;
-use sojourn::{ConstraintSolver, ConstraintSystem, Infeasibility, InputVariable, Satisfiability};
+use sojourn::{
+    ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable,
+    Satisfiability,
+};
 
 /// Same value the other cvg suites use, so a point seen in one is the point
 /// seen in another.
 const SEED: u64 = 0x50_50_1E_5E_ED;
 
-/// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
-fn system(variables: &[(&str, f64, f64)], constraints: &[&str]) -> ConstraintSystem {
+/// A fixture's [`ConstraintSystem`]; one that does not bind is the test's error.
+fn system(
+    variables: &[(&str, f64, f64)],
+    constraints: &[&str],
+) -> anyhow::Result<ConstraintSystem> {
     let variables = variables
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
         .collect();
-    ConstraintSystem::new(variables, constraints.iter().copied())
-        .expect("a fixture's constraints should bind to its own box")
+    Ok(ConstraintSystem::new(
+        variables,
+        constraints.iter().copied(),
+    )?)
 }
 
 /// Whether every constraint holds at `point`, judged independently of the
@@ -59,23 +68,37 @@ fn solver() -> ConstraintSolver {
     common::solver().with_seed(SEED)
 }
 
+/// The region a solve returns, which is where `repair` lives. The fixture
+/// below hands it its own anchor, so the census is not what is being tested.
+fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
+    match pollster::block_on(solver().solve(system))? {
+        Satisfiability::Satisfied { region } => Ok(region),
+        Satisfiability::Unsatisfiable { because } => {
+            Err(anyhow!("the fixture is unsatisfiable: {because}"))
+        }
+    }
+}
+
 /// A curve `x1^1.234 + x2^1.234 == 5` thickened to a band a hundredth wide in
 /// a hundred-unit box: about one proposal in two thousand lands, which is
 /// well inside brute force's reach and far outside the probe's luck. The
 /// solver can say nothing about it, so every point here was sampled.
 #[pollster::test]
-async fn a_thin_curve_is_found_by_sampling_alone() {
+async fn a_thin_curve_is_found_by_sampling_alone() -> anyhow::Result<()> {
     const WANTED: usize = 10;
 
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
-    );
+    )?;
     let verdict = solver()
-        .solve(system.clone())
+        .solve(&system)
         .await
-        .expect("solve does not error");
-    let Satisfiability::Satisfied { mut samples } = verdict else {
+        .context("solve does not error")?;
+    let Satisfiability::Satisfied {
+        region: mut samples,
+    } = verdict
+    else {
         panic!("a curve that sampling can reach was reported {verdict:?}");
     };
 
@@ -88,6 +111,7 @@ async fn a_thin_curve_is_found_by_sampling_alone() {
         assert!(holds(&system, &point), "{point:?} is off the curve");
         assert!(in_box(&system, &point), "{point:?} is outside the box");
     }
+    Ok(())
 }
 
 /// `x^1.234` never reaches a million on `[0, 10]`, but nothing can prove that:
@@ -100,10 +124,13 @@ async fn a_thin_curve_is_found_by_sampling_alone() {
 /// every thread in release, about ten seconds — because giving up early
 /// would be the bug.
 #[pollster::test]
-async fn what_sampling_cannot_find_is_reported_not_proved() {
+async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
     let source = "x1^1.234 > 1000000";
-    let system = system(&[("x1", 0.0, 10.0)], &[source]);
-    let verdict = solver().solve(system).await.expect("solve does not error");
+    let system = system(&[("x1", 0.0, 10.0)], &[source])?;
+    let verdict = solver()
+        .solve(&system)
+        .await
+        .context("solve does not error")?;
 
     let Satisfiability::Unsatisfiable { because } = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
@@ -118,6 +145,7 @@ async fn what_sampling_cannot_find_is_reported_not_proved() {
         sentence.contains("sampling found nothing") && sentence.contains(source),
         "the verdict should read as a sentence a caller can act on, got {sentence:?}"
     );
+    Ok(())
 }
 
 /// Repair has no interval to clamp to either — narrowing declines a real
@@ -127,16 +155,18 @@ async fn what_sampling_cannot_find_is_reported_not_proved() {
 /// the wall is to step off it: the landing is backed off along the chord
 /// until the axis neighbours pass.
 #[test]
-fn repair_lands_without_an_interval_to_clamp_to() {
+fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     const CLEARANCE: f64 = 1e-3;
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 < 5"],
-    );
+    )?;
     let anchors = Mat::from_fn(2, 1, |_, _| 0.0);
 
-    let repaired = sojourn::repair(&system, anchors.as_ref(), &[9.0, 9.0], CLEARANCE)
-        .expect("the origin is feasible, so something is reachable");
+    let region = region(&system)?;
+    let repaired = region
+        .repair(anchors.as_ref(), &[9.0, 9.0], CLEARANCE)
+        .context("the origin is feasible, so something is reachable")?;
 
     assert!(
         holds(&system, &repaired),
@@ -156,4 +186,5 @@ fn repair_lands_without_an_interval_to_clamp_to() {
             );
         }
     }
+    Ok(())
 }

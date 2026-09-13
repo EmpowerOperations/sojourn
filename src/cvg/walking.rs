@@ -123,6 +123,7 @@ use faer::{Mat, Side};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
+use super::{classify, interval};
 use crate::{ConstraintSystem, Point};
 
 /// How many chains to run at once.
@@ -368,8 +369,9 @@ impl HitAndRunWalker {
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * dimensions);
         let cadence = thinning_for(dimensions);
         self.movable = problem
-            .free_coordinates()
-            .map_or_else(|| (0..dimensions).collect(), <[usize]>::to_vec);
+            .plan
+            .as_ref()
+            .map_or_else(|| (0..dimensions).collect(), |plan| plan.free().to_vec());
         let mut states: Vec<Vec<f64>> = Vec::new();
 
         // Selection is quadratic in the candidate count, and `existing` grows
@@ -550,7 +552,7 @@ fn advance(
         // bands still have width, and a Gibbs sweep over them is a legitimate
         // move. `TopCorner200DAsEqualities` is entirely this case.
         let mut candidate = from.clone();
-        problem.retract(&mut candidate, rng);
+        classify::retract(problem, &mut candidate, rng);
         return if problem.is_feasible(&candidate, 0.0) {
             candidate
         } else {
@@ -584,7 +586,7 @@ fn advance(
     };
 
     // An axis move is a move in one coordinate, which is the one question the
-    // constraints can be asked directly: `ConstraintSystem::slice` propagates them and
+    // constraints can be asked directly: `interval::slice` propagates them and
     // answers with the interval this coordinate may occupy. A random direction
     // has no such answer — narrowing works per coordinate — so it still clips
     // against the box alone and finds feasibility by shrinking.
@@ -606,20 +608,9 @@ fn advance(
             .collect();
         // Back onto the surface. A no-op when nothing is driven, and never
         // trusted: the judgement below is unchanged in what it concludes.
-        problem.retract(&mut candidate, rng);
+        classify::retract(problem, &mut candidate, rng);
 
-        // An axis move changed one coordinate, plus whatever retraction
-        // recomputed — so every constraint naming none of those still holds the
-        // residual it held for `from`, which was feasible. Asking them again is
-        // arithmetic nobody reads, and on two hundred separable constraints it
-        // is all of them but one. A random direction moves everything, so there
-        // is nothing to skip and it takes the full check.
-        let feasible = if along_axis {
-            problem.is_feasible_after(&candidate, swept, 0.0)
-        } else {
-            problem.is_feasible(&candidate, 0.0)
-        };
-        if feasible {
+        if problem.is_feasible(&candidate, 0.0) {
             return candidate;
         }
 
@@ -675,7 +666,7 @@ fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64>
 /// after each draw is still doing the deciding and this is still only a
 /// proposal.
 fn axis_chord(from: &Point, axis: usize, problem: &ConstraintSystem) -> (f64, f64) {
-    let slice = problem.slice(from, axis);
+    let slice = interval::slice(problem, from, axis);
     if slice.is_empty() {
         return (0.0, 0.0);
     }

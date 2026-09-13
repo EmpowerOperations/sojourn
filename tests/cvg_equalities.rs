@@ -126,12 +126,12 @@ async fn assert_explores(case: Case<'_>) {
 
     let solution = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system)
+        .solve(&system)
         .await
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", case.what));
 
     let mut pool = match solution {
-        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Satisfied { region: samples } => samples,
         Satisfiability::Unsatisfiable { because } => {
             panic!("{}: reported unsatisfiable, blaming {because:?}", case.what)
         }
@@ -586,10 +586,13 @@ async fn both_arms_of_a_product_receive_points() {
 
     let solution = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system)
+        .solve(&system)
         .await
         .expect("solving should not fail");
-    let Satisfiability::Satisfied { mut samples } = solution else {
+    let Satisfiability::Satisfied {
+        region: mut samples,
+    } = solution
+    else {
         panic!("a cross through the origin is satisfiable");
     };
 
@@ -780,11 +783,11 @@ async fn the_tolerance_floor_is_where_it_was_left() {
 
         let solution = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .solve(system)
+            .solve(&system)
             .await
             .unwrap_or_else(|e| panic!("solving {source:?} failed: {e}"));
 
-        let Satisfiability::Satisfied { samples } = solution else {
+        let Satisfiability::Satisfied { region: samples } = solution else {
             break;
         };
         let mut pool = samples;

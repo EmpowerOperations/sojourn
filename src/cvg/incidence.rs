@@ -110,9 +110,10 @@ impl Incidence {
     /// affected by **any** move, whichever coordinate it touched.
     ///
     /// Taken as an argument rather than worked out here because what belongs in
-    /// it is the walker's business and not the graph's — see
-    /// `ConstraintSystem::is_feasible_after`, the only reader, where both entries are
-    /// soundness rather than efficiency.
+    /// it is the search's business and not the graph's — see
+    /// `ConstraintSystem::new`, where both entries are soundness rather than
+    /// efficiency. The readers are the repair clamp's per-coordinate filter
+    /// and `interval::slice`.
     pub(crate) fn with_always(mut self, always: &[ConstraintId]) -> Self {
         for constraints in &mut self.affected {
             constraints.extend_from_slice(always);

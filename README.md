@@ -14,8 +14,8 @@ let residuals = compiled.eval(samples.as_ref())?;
 ```
 
 Source text goes in and nothing hands back a syntax tree: `compile` parses and binds an
-expression to evaluate, `ConstraintSystem::new` parses a set of constraints to solve, and
-`repair` moves a point onto the region those constraints describe.
+expression to evaluate, `ConstraintSystem::new` parses a set of constraints to solve, and the
+`FeasibleRegion` a solve returns hands out samples and repairs a point onto the region.
 
 Sojourn is consumed as a cargo git dependency; it is not on crates.io.
 

@@ -73,12 +73,12 @@ async fn assert_generates(variables: &[(&str, f64, f64)], sources: &[&str]) {
 
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(inputs.clone(), sources))
+        .solve(&system(inputs.clone(), sources))
         .await
         .expect("solving should not fail");
 
     let mut pool = match solution {
-        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Satisfied { region: samples } => samples,
         Satisfiability::Unsatisfiable { because } => {
             panic!("reported unsatisfiable: {because:?}")
         }
@@ -159,11 +159,11 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(inputs.clone(), &[source]))
+        .solve(&system(inputs.clone(), &[source]))
         .await
         .expect("solving should not fail");
 
-    let Satisfiability::Satisfied { samples: mut pool } = solution else {
+    let Satisfiability::Satisfied { region: mut pool } = solution else {
         panic!("a sine band is reachable by walking, so this should be satisfiable");
     };
 
@@ -198,7 +198,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() {
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(
+        .solve(&system(
             vec![InputVariable::new("x1", 0.0, 10.0)],
             &["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"],
         ))
@@ -206,7 +206,7 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
         .expect("solving should not fail");
 
     let mut pool = match solution {
-        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Satisfied { region: samples } => samples,
         Satisfiability::Unsatisfiable { because } => {
             // Also a fine answer, and it would mean the emitter grew `%`.
             assert!(matches!(because, Infeasibility::Proved { ref blamed } if !blamed.is_empty()));
@@ -241,7 +241,7 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
 async fn dropping_a_pool_mid_fill_does_not_deadlock() {
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(
+        .solve(&system(
             vec![
                 InputVariable::new("x1", 0.0, 10.0),
                 InputVariable::new("x2", 0.0, 10.0),
@@ -251,7 +251,7 @@ async fn dropping_a_pool_mid_fill_does_not_deadlock() {
         .await
         .expect("solving should not fail");
 
-    let Satisfiability::Satisfied { samples: mut pool } = solution else {
+    let Satisfiability::Satisfied { region: mut pool } = solution else {
         panic!("a wide-open region should be satisfiable");
     };
 
@@ -274,7 +274,7 @@ async fn the_same_seed_delivers_the_same_points() {
     for _ in 0..2 {
         let solution = common::solver()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .solve(system(
+            .solve(&system(
                 vec![
                     InputVariable::new("x1", 0.0, 10.0),
                     InputVariable::new("x2", 0.0, 10.0),
@@ -284,7 +284,7 @@ async fn the_same_seed_delivers_the_same_points() {
             .await
             .expect("solving should not fail");
 
-        let Satisfiability::Satisfied { samples: mut pool } = solution else {
+        let Satisfiability::Satisfied { region: mut pool } = solution else {
             panic!("a wide-open region should be satisfiable");
         };
         runs.push(columns(&pool.take(500)));
@@ -304,7 +304,7 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() {
     // exists only because a solver is wired up.
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(
+        .solve(&system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             &["x > 8", "x < 2"],
         ))
@@ -332,7 +332,7 @@ async fn a_satisfiable_problem_is_not_blamed_on_anything() {
     // nothing wrong, or an `Unsatisfiable` means nothing.
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(
+        .solve(&system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             &["x > 8", "x < 9"],
         ))

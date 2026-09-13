@@ -12,8 +12,8 @@
 //! variable names and runs it over a batch, and the constrained vector
 //! generator, which reads the structure of a set of constraints to search for
 //! points that satisfy them — a [`ConstraintSystem`] solved by a
-//! [`ConstraintSolver`] into [`FeasibleSamples`], with [`repair`] for a point
-//! that is not one of them.
+//! [`ConstraintSolver`] into a [`FeasibleRegion`], which hands out samples and
+//! repairs a point that is not one of them.
 //! `src/README.md` has the picture.
 //!
 //! Boolean expressions evaluate to a scalar whose *sign* carries the truth
@@ -34,10 +34,10 @@ mod system;
 pub(crate) use eval::Schema;
 pub use eval::{CompiledExpression, compile, simd_isa};
 pub(crate) use frontend::{Ast, parse};
-pub use repair::{RepairError, repair};
+pub use repair::RepairError;
 pub use solve::{
     ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_SOLVER_LIMIT,
-    FeasibleSamples, GPU_VARIABLE, Infeasibility, Satisfiability, SmtLogic, Status,
+    FeasibleRegion, GPU_VARIABLE, Infeasibility, Satisfiability, SmtLogic, Status,
 };
 pub use system::{ConstraintRef, ConstraintSystem, InputVariable, Point, SystemError};
 

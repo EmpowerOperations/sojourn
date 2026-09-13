@@ -42,9 +42,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rand::RngExt;
+use rand::rngs::Xoshiro256PlusPlus;
+
 use crate::ast::{Expr, GlobalId, Kind, Program};
 use crate::cvg::interval;
-use crate::{Ast, Schema};
+use crate::{Ast, ConstraintSystem, Point, Schema};
 
 /// What one equality lets us conclude.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +107,7 @@ pub(crate) struct Plan {
     ///
     /// Positions, and nothing else. This used to carry each coordinate's
     /// defining expression and tolerance so that `retract` could evaluate
-    /// `f(free) ± t`; `ConstraintSystem::slice` derives that band from the constraint
+    /// `f(free) ± t`; [`interval::slice`] derives that band from the constraint
     /// itself, along with every other constraint naming the coordinate, so the
     /// only thing the walker still needs from a reading of the equalities is
     /// **which coordinates are computed and in what order**.
@@ -120,6 +123,106 @@ impl Plan {
 
     pub(crate) fn driven(&self) -> &[usize] {
         &self.driven
+    }
+}
+
+/// Recomputes every driven coordinate of `point` from the free ones, in place.
+///
+/// A point on an equality surface leaves it under almost any move, because
+/// the surface has no volume — which is why a walker that moves every
+/// coordinate independently is reduced to jitter around wherever it started.
+/// Driving is the answer: move what is free, and compute the rest.
+///
+/// # Why this samples rather than evaluates
+///
+/// The obvious version assigns `y = f(free)` and is **wrong**, because
+/// babel has no bare equality: `y == f(x) +/- t` admits the whole band, and
+/// collapsing it to its centre line throws away a dimension of the feasible
+/// region. On `xi == 10.75 +/- 0.2` over two hundred variables that is not
+/// subtle — every coordinate pins to `10.75` and the pool returns the same
+/// point two hundred times, which is exactly what it did before this
+/// sampled.
+///
+/// So it draws uniformly from `f(free) ± t`. That is not a fudge, it is a
+/// **Gibbs step**: with the other coordinates held, the feasible slice for a
+/// driven variable *is* that interval, and drawing uniformly from a
+/// conditional slice is the move that leaves the uniform distribution
+/// invariant. Evaluating to the centre would not.
+///
+/// The slice comes from [`interval::slice`] rather than from the one
+/// equality that defined the coordinate, so **every** constraint mentioning
+/// it has a say. The band `f(free) ± t` is what that equality contributes
+/// and the intersection can only be tighter, which turns draws that used to
+/// land outside the other constraints and be rejected into draws that
+/// cannot.
+///
+/// Silent about failure by design. A coordinate whose slice comes back
+/// empty is left alone, and the candidate is judged exactly as an
+/// unretracted one would be. **Feasibility is never assumed from a
+/// successful retraction** — a wrong drive costs rejected moves, not wrong
+/// points, and that is what makes this safe to apply without proving it.
+///
+/// Order still matters, and for the same reason: a driven coordinate may be
+/// defined in terms of another, and `slice` reads the point as it stands,
+/// so computing them out of order reads a stale value.
+pub(crate) fn retract(system: &ConstraintSystem, point: &mut Point, rng: &mut Xoshiro256PlusPlus) {
+    let Some(plan) = &system.plan else {
+        return;
+    };
+    // A driven coordinate holds a value that is about to be replaced, so
+    // narrowing against a constraint that mentions one still waiting its
+    // turn conditions on a stale number. That is not merely wasteful, it
+    // **destroys the freedom driving exists to exploit**: on
+    // `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y` on the
+    // current `z` pins it within `t` of `z - 1`, and then `z` is pinned
+    // within `t` of the new `y`. The pair shuffles by `t` a sweep instead
+    // of travelling, and `two_coupled_equalities_are_traversed` measured it
+    // as three occupied cells of eighty where twenty-four are wanted.
+    //
+    // So a coordinate becomes conditionable only once it has been drawn.
+    // Everything free is conditionable from the start.
+    let mut settled = vec![true; point.len()];
+    for driven in plan.driven() {
+        settled[*driven] = false;
+    }
+
+    for driven in plan.driven().iter().copied() {
+        let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
+        if !slice.is_empty() {
+            point[driven] = if slice.width() > 0.0 {
+                rng.random_range(slice.lo()..=slice.hi())
+            } else {
+                slice.lo()
+            };
+        }
+        settled[driven] = true;
+    }
+}
+
+/// [`retract`] without the draw: every driven coordinate is clamped into its
+/// slice rather than drawn from it.
+///
+/// The walker must draw, because it is producing a *sample* and the draw is
+/// what keeps the uniform distribution invariant. A repair is producing one
+/// point, near a given one, and must produce the same point every time it
+/// is asked — so it moves each driven coordinate the least distance that
+/// puts it inside its band, and no further. Same order, same settled mask,
+/// same silence on an empty slice, for the same reasons.
+pub(crate) fn settle(system: &ConstraintSystem, point: &mut Point) {
+    let Some(plan) = &system.plan else {
+        return;
+    };
+    let mut settled = vec![true; point.len()];
+    for driven in plan.driven() {
+        settled[*driven] = false;
+    }
+
+    for driven in plan.driven().iter().copied() {
+        let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
+        if !slice.is_empty() {
+            point[driven] = point[driven].clamp(slice.lo(), slice.hi());
+        }
+        settled[driven] = true;
     }
 }
 
@@ -204,7 +307,7 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
 /// # It answers whether, not what
 ///
 /// This used to *build* the rearrangement — `3 - x2` — for `retract` to
-/// evaluate. `ConstraintSystem::slice` derives the same band by narrowing the constraint
+/// evaluate. [`interval::slice`] derives the same band by narrowing the constraint
 /// itself, so the expression had no consumer left and the walk down the path is
 /// all that survives. The arithmetic those rules encoded now lives in
 /// `interval::invert_binary`, tested there against the same cases.
@@ -597,7 +700,7 @@ mod tests {
     /// It refused because it *built* the rearrangement, and a symbolic inverse
     /// of a non-injective function has to choose a branch — `sqr` gives two
     /// answers and `asin` infinitely many. `reaches` chooses nothing: it says
-    /// the coordinate is determined, and `ConstraintSystem::slice` narrows it by
+    /// the coordinate is determined, and `interval::slice` narrows it by
     /// intersecting the branches with what the argument can already be.
     #[test]
     fn a_function_with_an_inverse_is_reached_through() {

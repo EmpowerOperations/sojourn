@@ -31,8 +31,9 @@
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use crate::Ast;
 use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, UnaryOp};
+use crate::cvg::incidence::Row;
+use crate::{Ast, ConstraintSystem, Point};
 
 /// A closed interval of reals, represented by two `f64` endpoints.
 ///
@@ -490,6 +491,85 @@ fn in_block(block: &Block, globals: &[Interval], frame: &mut Vec<Interval>) -> I
     in_expr(&block.result, globals, frame)
 }
 
+// ------------------------------------------------------------- over a system
+
+/// The interval `coordinate` may take with every other coordinate held at its
+/// value in `point`.
+///
+/// The declared box, narrowed by each constraint naming the coordinate in turn
+/// through [`narrow`]. **A superset of the feasible slice**, so a value drawn
+/// from it is still judged by [`ConstraintSystem::is_feasible`] like any other
+/// candidate — see the module doc for why that leaves the distribution alone.
+///
+/// Constraints are applied in order and each sees what the previous ones
+/// concluded, so a system narrows further than any one of its constraints
+/// would. Nothing here iterates to a fixpoint: every coordinate but this one
+/// is a point, which leaves a second pass with nothing to tighten.
+pub(crate) fn slice(system: &ConstraintSystem, point: &Point, coordinate: usize) -> Interval {
+    slice_conditioned(system, point, coordinate, None)
+}
+
+/// [`slice`], optionally ignoring constraints that mention a coordinate whose
+/// value is about to change.
+///
+/// `settled[row]` says the point's value there is one to condition on. A
+/// constraint naming an unsettled coordinate is skipped, because narrowing
+/// against a value that is about to be overwritten conditions on a stale
+/// number — see [`retract`](crate::cvg::classify::retract), which is the only
+/// caller that passes a mask.
+pub(crate) fn slice_conditioned(
+    system: &ConstraintSystem,
+    point: &Point,
+    coordinate: usize,
+    settled: Option<&[bool]>,
+) -> Interval {
+    let input = &system.variables[coordinate];
+    let mut interval = Interval::new(input.lower_bound, input.upper_bound);
+
+    let coordinate = Row(coordinate);
+    for id in system.incidence.naming(coordinate) {
+        let rows = system.incidence.rows_of(*id);
+        if let Some(settled) = settled
+            && rows
+                .iter()
+                .any(|row| *row != coordinate && !settled[row.index()])
+        {
+            continue;
+        }
+        let wanted = rows
+            .iter()
+            .position(|row| *row == coordinate)
+            .expect("`naming` lists only constraints that name the coordinate");
+
+        // The constraint's symbols, in its own order, as intervals: a point
+        // for everything held, and the running narrowing for the one asked
+        // about.
+        let globals: Vec<Interval> = rows
+            .iter()
+            .enumerate()
+            .map(|(symbol, row)| {
+                if symbol == wanted {
+                    interval
+                } else {
+                    Interval::point(point[row.index()])
+                }
+            })
+            .collect();
+
+        let wanted = u32::try_from(wanted).expect("fewer than four billion symbols");
+        interval = interval.intersect(narrow(
+            &system.constraints[id.index()].written,
+            &globals,
+            GlobalId::from_index(wanted),
+        ));
+        if interval.is_empty() {
+            break;
+        }
+    }
+
+    interval
+}
+
 // ------------------------------------------------------------------ backward
 
 /// The interval `wanted` may take if `constraint` is to hold, with every other
@@ -922,9 +1002,162 @@ mod tests {
 
     use crate::ast::GlobalId;
 
-    use super::{Interval, in_block};
-    use crate::Ast;
+    use super::{Interval, in_block, slice};
     use crate::eval;
+    use crate::system::tests::system;
+    use crate::{Ast, InputVariable, Point};
+
+    /// **The invariant `slice` exists to keep.**
+    ///
+    /// A feasible point satisfies every constraint, so each of its coordinates
+    /// is in that coordinate's true feasible slice — and the narrowing is a
+    /// *superset* of that slice, so it must contain the coordinate too. If it
+    /// ever does not, the walker is being handed an interval that excludes
+    /// where it is standing, and the points it cannot propose are gone from the
+    /// answer silently.
+    ///
+    /// This is the check that separates the two ways narrowing can be wrong.
+    /// Too wide only costs a rejected proposal; too narrow biases, and shows up
+    /// here.
+    #[test]
+    fn a_feasible_point_is_inside_every_slice_it_sits_in() {
+        let fixtures: [(Vec<InputVariable>, &[&str]); 5] = [
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 + x2 == 3 +/- 0.1"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 + x2 < 3", "x1 - x2 > -4"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", 0.5, 10.0),
+                    InputVariable::new("x2", 0.5, 10.0),
+                ],
+                &["x1 / x2 < 4", "ln(x1) < 2"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 * x2 == 6 +/- 0.5"],
+            ),
+            (vec![InputVariable::new("x1", 10.0, 11.0)], &["x1 > 10.5"]),
+        ];
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x0051_1CE5);
+        for (inputs, sources) in fixtures {
+            let bounds: Vec<(f64, f64)> = inputs
+                .iter()
+                .map(|input| (input.lower_bound, input.upper_bound))
+                .collect();
+            let system = system(inputs, sources);
+
+            let mut feasible_seen = 0_usize;
+            for _ in 0..20_000 {
+                let point: Point = bounds
+                    .iter()
+                    .map(|(low, high)| rng.random_range(*low..=*high))
+                    .collect();
+                if !system.is_feasible(&point, 0.0) {
+                    continue;
+                }
+                feasible_seen += 1;
+                for coordinate in 0..point.len() {
+                    let slice = slice(&system, &point, coordinate);
+                    assert!(
+                        slice.contains(point[coordinate]),
+                        "{sources:?}: the feasible point {point:?} has coordinate \
+                         {coordinate} narrowed out of [{}, {}]",
+                        slice.lo(),
+                        slice.hi()
+                    );
+                }
+            }
+            assert!(
+                feasible_seen > 0,
+                "{sources:?}: no feasible point was drawn, so this asserted nothing"
+            );
+        }
+    }
+
+    /// **`slice` can only tighten what the equality already said.**
+    ///
+    /// `retract` used to draw from `f(free) ± t`, evaluated from the one
+    /// equality that defined the coordinate. It now draws from `slice`, which
+    /// starts at the declared box and applies every constraint naming that
+    /// coordinate — the defining equality among them. So the new interval is
+    /// contained in the old one, and the change is a narrowing rather than a
+    /// different claim.
+    ///
+    /// The band is computed here from **Rust's own `sin`** rather than read off
+    /// a `Drive`. That is the point: nothing in production carries the
+    /// definition any more, so a test that asked production what the band was
+    /// would be asking the thing under test. If this ever fails, `slice` is
+    /// admitting values the equality forbids.
+    const TOLERANCE: f64 = 0.05;
+
+    #[test]
+    fn a_slice_is_never_wider_than_the_band_its_equality_defines() {
+        let inputs = vec![
+            InputVariable::new("x", -4.0, 4.0),
+            InputVariable::new("y", -8.0, 8.0),
+            InputVariable::new("z", -8.0, 8.0),
+        ];
+        let bounds: Vec<(f64, f64)> = inputs
+            .iter()
+            .map(|input| (input.lower_bound, input.upper_bound))
+            .collect();
+        let system = system(inputs, &["y == sin(x) +/- 0.05", "z == y + 1 +/- 0.05"]);
+
+        /// A driven coordinate and what its equality says its centre is.
+        /// `x` is free and has no band, so it is absent.
+        type Band = (usize, fn(&Point) -> f64);
+
+        let bands: [Band; 2] = [(1, |point| point[0].sin()), (2, |point| point[1] + 1.0)];
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x0000_BA4D);
+        for _ in 0..5_000 {
+            let point: Point = bounds
+                .iter()
+                .map(|(low, high)| rng.random_range(*low..=*high))
+                .collect();
+
+            for (position, centre_of) in bands {
+                let centre = centre_of(&point);
+                let slice = slice(&system, &point, position);
+                if slice.is_empty() {
+                    continue;
+                }
+                // Narrowing pads outward once per operation it passes through,
+                // so the interval exceeds the band by a rounding step per node.
+                // The slack is *relative* rather than counted in ulps, because
+                // an ulp is not a stable unit across a subtraction that
+                // cancels: the padding is added while the intermediate is
+                // around `centre`, and the endpoint it lands on can be an order
+                // of magnitude smaller, where ulps are an order of magnitude
+                // finer. Measured in ulps of the endpoint, two ulps of real
+                // padding read as nine.
+                let slack = 16.0 * f64::EPSILON * (1.0 + centre.abs() + TOLERANCE);
+                assert!(
+                    slice.lo() >= centre - TOLERANCE - slack
+                        && slice.hi() <= centre + TOLERANCE + slack,
+                    "coordinate {position} narrowed to [{}, {}], outside the \
+                     band {centre} +/- {TOLERANCE} its equality defines",
+                    slice.lo(),
+                    slice.hi()
+                );
+            }
+        }
+    }
 
     /// The interval an expression takes over a box.
     ///

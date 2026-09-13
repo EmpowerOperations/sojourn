@@ -1,5 +1,12 @@
 //! A feasible point near a given one, deterministically.
 //!
+//! Reached as [`FeasibleRegion::repair`](crate::FeasibleRegion::repair), which
+//! carries the contract; this module is the algorithm, over a
+//! `&ConstraintSystem`. It lives on the solved region rather than on the
+//! system because a region that could not be solved has nothing to repair
+//! toward, and because a caller with a region in hand is the only one who
+//! ever asks.
+//!
 //! The consumer is an optimizer that cannot evaluate its objective at an
 //! infeasible point — the constraints encode things like mesh validity, and a
 //! bad point is a crashed solver rather than a bad number. Every point it
@@ -12,8 +19,8 @@
 //! # Two stages, in series
 //!
 //! **Clamp.** Every coordinate has a conditional slice — the interval it may
-//! occupy with the others held where they are, from [`ConstraintSystem::slice`]
-//! — and clamping into it is the exact axis projection onto that coordinate's
+//! occupy with the others held where they are, from [`interval::slice`] — and
+//! clamping into it is the exact axis projection onto that coordinate's
 //! constraints. Clamps are applied cheapest first, cumulatively, and the point
 //! is judged after each. Cheapest first matters: the L1 projection onto a
 //! half-space moves the single coordinate with the steepest normal component,
@@ -107,6 +114,8 @@
 
 use faer::MatRef;
 
+use crate::cvg::incidence::Row;
+use crate::cvg::{classify, interval};
 use crate::{ConstraintSystem, Point};
 
 /// How many rounds of clamping a point gets before the anchors take over.
@@ -139,7 +148,7 @@ const CHORD_BITS: usize = 60;
 /// accumulates and still nothing next to the tolerances constraints carry.
 const LANDING_LADDER: u32 = 20;
 
-/// Why [`repair`] could not answer.
+/// Why [`FeasibleRegion::repair`](crate::FeasibleRegion::repair) could not answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepairError {
     /// Nothing feasible was reached: clamping could not land, and no anchor
@@ -171,44 +180,11 @@ impl std::fmt::Display for RepairError {
 
 impl std::error::Error for RepairError {}
 
-/// A point that satisfies `system` with room to spare, near `point`, the same
-/// every time.
-///
-/// `anchors` are feasible points the caller believes in, one per column in
-/// schema order — the matrix [`FeasibleSamples::take`](crate::FeasibleSamples::take)
-/// hands out is the intended source. They are judged rather than trusted:
-/// an infeasible column is skipped. With no anchors at all the answer is
-/// whatever clamping alone reaches, which is enough wherever the constraints
-/// name where their feasible side is, and [`RepairError::Stranded`] where they
-/// do not.
-///
-/// `clearance` is the room kept from every wall, as a fraction of each
-/// variable's box width: the result and each of its `2d` axis neighbours
-/// `clearance * width` away pass the same feasibility check the search uses —
-/// inside the box, every constraint `<= 0`, nothing non-finite. `0.0` asks for
-/// feasibility alone and lands on the bounds. A caller that normalises points
-/// and back wants a few thousand ulps of the unit cube, `1e-12`: far above
-/// what any per-coordinate round trip loses and invisible to an optimiser.
-/// There is no default because the right value is the caller's own noise
-/// floor.
-///
-/// A point that already has the clearance comes back unchanged, so
-/// `repair(repair(x)) == repair(x)`; a feasible point without it is moved
-/// inward. Given the same system, anchors, point and clearance, the same
-/// output, bit for bit. And never farther from `point`, in L1 over
-/// box-normalised coordinates, than the nearest anchor with the clearance
-/// among the few considered.
-///
-/// # Errors
-/// [`RepairError::Stranded`] when nothing feasible was reached at all, and
-/// [`RepairError::Cramped`] when something feasible was but the clearance
-/// could not be had there.
-///
-/// # Panics
-/// If `point` or `anchors` do not have one entry per variable, or `clearance`
-/// is negative or not finite. That is a caller mixing up systems, not a
-/// verdict about the point.
-pub fn repair(
+/// A point that satisfies `system` with `clearance` to spare, near `point`,
+/// the same every time. The contract — anchors, clearance, the guarantees,
+/// the errors and the panics — is documented on
+/// [`FeasibleRegion::repair`](crate::FeasibleRegion::repair), the only caller.
+pub(crate) fn repair(
     system: &ConstraintSystem,
     anchors: MatRef<'_, f64>,
     point: &[f64],
@@ -313,7 +289,7 @@ pub fn repair(
                 .zip(&current)
                 .map(|(from, to)| from + middle * (to - from))
                 .collect();
-            system.settle(&mut probe);
+            classify::settle(system, &mut probe);
             if system.is_feasible(&probe, 0.0) {
                 lower = middle;
                 landed = probe;
@@ -348,7 +324,7 @@ pub fn repair(
                         .zip(&current)
                         .map(|(from, to)| from + (lower - rung) * (to - from))
                         .collect();
-                    system.settle(&mut probe);
+                    classify::settle(system, &mut probe);
                     if system.is_feasible(&probe, clearance) {
                         backed = Some(probe);
                         break;
@@ -410,7 +386,7 @@ fn clamped(
         // point rather than about the order the coordinates happen to be in.
         let mut clamps: Vec<(f64, usize, f64)> = (0..current.len())
             .filter_map(|coordinate| {
-                let slice = system.slice(&current, coordinate);
+                let slice = interval::slice(system, &current, coordinate);
                 if slice.is_empty() {
                     return None;
                 }
@@ -450,22 +426,22 @@ fn clamped(
             // constraints naming this coordinate pass, with the clearance:
             // a landing `step` inside the padded edge is a hair short of
             // `step` inside the wall, and its neighbours tie with the wall.
-            // `is_feasible_after` with the clearance is exactly that check; it
-            // is used here as a filter over one coordinate's constraints and
-            // never as the judge, which the full check below remains.
+            // `landed` is exactly that check; it is a filter over one
+            // coordinate's constraints and never the judge, which the full
+            // check below remains.
             //
             // The ulp is the box width's, not the value's. A bound at zero has
             // ulps of `5e-324`, and a strict comparison is satisfied only past
             // an absolute `f64::MIN_POSITIVE`, which no ladder of those reaches;
             // the width is the scale the residual's own rounding lives at.
-            if !system.is_feasible_after(&current, coordinate, clearance) {
+            if !landed(system, &current, coordinate, clearance) {
                 let inward = if target > value { 1.0 } else { -1.0 };
                 let magnitude = target.abs().max(widths[coordinate]).max(f64::MIN_POSITIVE);
                 let ulp = magnitude.next_up() - magnitude;
                 for rung in 0..LANDING_LADDER {
                     let nudged = target + inward * ulp * f64::from(1u32 << rung);
                     current[coordinate] = nudged;
-                    if system.is_feasible_after(&current, coordinate, clearance) {
+                    if landed(system, &current, coordinate, clearance) {
                         break;
                     }
                     current[coordinate] = target;
@@ -485,6 +461,31 @@ fn clamped(
     } else {
         Err(current)
     }
+}
+
+/// Whether the constraints naming `coordinate` hold at `point` with the
+/// clearance, and the box does on that coordinate.
+///
+/// The clamp's filter, never its judge: mid-clamp the rest of the system may
+/// still be broken, and the question is only whether *this* landing is on the
+/// right side of the walls it can see. A constraint naming none of the
+/// coordinates that moved is not consulted; a computed subscript counts as
+/// naming every coordinate, which the incidence graph carries.
+fn landed(system: &ConstraintSystem, point: &Point, coordinate: usize, clearance: f64) -> bool {
+    if !system.within(point, coordinate, clearance) {
+        return false;
+    }
+    let mut neighbour = point.clone();
+    system.incidence.affected(Row(coordinate)).iter().all(|id| {
+        let rows = system.incidence.rows_of(*id);
+        system.constraints[id.index()].holds(
+            point,
+            rows,
+            &system.variables,
+            clearance,
+            &mut neighbour,
+        )
+    })
 }
 
 /// `candidate` with every coordinate put back to its value in `original`

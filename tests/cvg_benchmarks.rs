@@ -165,12 +165,12 @@ async fn generate(
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())
-        .solve(system(problem.inputs.clone(), problem.constraints.clone()))
+        .solve(&system(problem.inputs.clone(), problem.constraints.clone()))
         .await
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", problem.name));
 
     let mut pool = match solution {
-        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Satisfied { region: samples } => samples,
         Satisfiability::Unsatisfiable { because } => {
             panic!(
                 "{}: reported unsatisfiable, blaming {because:?}",

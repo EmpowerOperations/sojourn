@@ -250,13 +250,16 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_strategies(SAMPLING_ONLY.to_vec());
 
-    let mut future = pin!(solver.solve(system(&sources)));
+    let system = system(&sources);
+    let mut future = pin!(solver.solve(&system));
     let mut context = Context::from_waker(Waker::noop());
     let start = Instant::now();
 
     loop {
         match future.as_mut().poll(&mut context) {
-            Poll::Ready(Ok(Satisfiability::Satisfied { mut samples })) => {
+            Poll::Ready(Ok(Satisfiability::Satisfied {
+                region: mut samples,
+            })) => {
                 let elapsed = start.elapsed();
 
                 // `Satisfied` promises a point is already in hand; make it
@@ -355,7 +358,7 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
         common::solver()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
-            .solve(system(&constraints)),
+            .solve(&system(&constraints)),
     )
     .expect("solving should not fail");
 

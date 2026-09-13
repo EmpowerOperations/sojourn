@@ -26,10 +26,11 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
 use super::Cancellation;
+use super::classify;
 use super::progress::Trial;
 #[cfg(feature = "gpu")]
 use super::sieve::{GPU_BATCH, Sieve};
-use crate::{ConstraintSystem, Point};
+use crate::{ConstraintSystem, InputVariable, Point};
 
 /// How many candidates to propose per point asked for.
 ///
@@ -138,11 +139,15 @@ pub(crate) struct RandomSampler {
 
 impl RandomSampler {
     pub(crate) fn new(
-        bounds: Vec<(f64, f64)>,
+        variables: &[InputVariable],
         rng: Xoshiro256PlusPlus,
         budget: u64,
         threads: usize,
     ) -> Self {
+        let bounds = variables
+            .iter()
+            .map(|variable| (variable.lower_bound, variable.upper_bound))
+            .collect();
         Self {
             rng,
             bounds,
@@ -292,7 +297,19 @@ impl RandomSampler {
                 // seed-finding path, which no oracle reads. The rng is seeded
                 // per batch, so brute force stays a function of the seed and the
                 // budget rather than of the thread count.
-                problem.retract_columns(&mut candidates, &mut rng);
+                // Every driven coordinate recomputed per column; a problem
+                // without an equality pays nothing here.
+                if problem.plan.is_some() {
+                    let rows = candidates.nrows();
+                    for column in 0..candidates.ncols() {
+                        let mut point: Point =
+                            (0..rows).map(|row| candidates[(row, column)]).collect();
+                        classify::retract(problem, &mut point, &mut rng);
+                        for (row, value) in point.into_iter().enumerate() {
+                            candidates[(row, column)] = value;
+                        }
+                    }
+                }
                 let hits = problem.feasible_columns(candidates.as_ref());
                 proposed.fetch_add(columns as u64, Ordering::Relaxed);
 
@@ -482,7 +499,7 @@ mod brute_force_tests {
     ) -> (Trial, usize) {
         let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
         let mut sampler = RandomSampler::new(
-            problem.box_bounds(),
+            &problem.variables,
             Xoshiro256PlusPlus::seed_from_u64(SEED),
             budget,
             threads,
@@ -560,7 +577,7 @@ mod brute_force_tests {
             });
             let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &["x1 > 2"]);
             let mut sampler = RandomSampler::new(
-                problem.box_bounds(),
+                &problem.variables,
                 Xoshiro256PlusPlus::seed_from_u64(SEED),
                 u64::MAX,
                 4,
