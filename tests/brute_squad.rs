@@ -118,10 +118,13 @@ const THIRD_SEED: u64 = 0xB2_07_E5_90_AD;
 /// Three attempts, three unrelated seeds. Pinned so that a failure reproduces.
 const SEEDS: [u64; 3] = [SEED, RIVAL_SEED, THIRD_SEED];
 
-/// The production ladder with the solver removed. Pinned against
-/// [`DEFAULT_STRATEGIES`] by [`sampling_only_is_the_default_ladder_minus_the_solver`],
-/// so a tier added to production is measured here without anybody remembering
-/// to add it.
+/// The production ladder with everything that finds a point by means other
+/// than sampling removed — the solver, and the local solve, which would seed
+/// every rung from the box centre in milliseconds and measure nothing. Pinned
+/// against [`DEFAULT_STRATEGIES`] by
+/// [`sampling_only_is_the_default_ladder_minus_the_seeders`], so a tier added
+/// to production is measured here unless it is a seeder, which is the one kind
+/// this file must not measure.
 const SAMPLING_ONLY: &[Strategy] = &[Strategy::BruteSquad, Strategy::HitAndRun];
 
 const VARIABLES: [&str; 3] = ["x1", "x2", "x3"];
@@ -333,14 +336,16 @@ fn the_harness_finds_an_easy_region() {
     }
 }
 
-/// The strategy list this file measures with is production minus the solver
-/// and nothing else, so a tier that joins the defaults is measured here too.
+/// The strategy list this file measures with is production minus the seeders
+/// — the solver and the local solve — and nothing else, so a tier that joins
+/// the defaults is measured here too unless it is one more way of finding a
+/// point without sampling.
 #[test]
-fn sampling_only_is_the_default_ladder_minus_the_solver() {
+fn sampling_only_is_the_default_ladder_minus_the_seeders() {
     let expected: Vec<Strategy> = DEFAULT_STRATEGIES
         .iter()
         .copied()
-        .filter(|strategy| *strategy != Strategy::Solver)
+        .filter(|strategy| !matches!(strategy, Strategy::Solver | Strategy::LocalSolve))
         .collect();
     assert_eq!(SAMPLING_ONLY, expected.as_slice());
 }

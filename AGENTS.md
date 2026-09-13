@@ -26,7 +26,7 @@ Read these before changing anything, in this order:
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
 | `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the validated system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
-| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the SMT emitter, the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
+| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the local solve (`local.rs`, COBYLA from `basin`), the SMT emitter, the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
 | `docs/sojourn/` | notes and statement of intent from the original CVG project, whose code became `crate::cvg` | reference |
@@ -115,15 +115,19 @@ a named vector kernel or a named `*_scalar` one; do not rely on auto-vectorisati
 anywhere. Never use pulp's `mul_add` (fused on every backend) or its `max`/`min`
 (x86 semantics, not NaN-propagating). The crate has no `unsafe`; keep it that way.
 
-**The pool's ladder is probe, solver, brute force.** `cvg`'s uniform sampler
-(`Strategy::BruteSquad`) probes with one brute-force batch — tens of
-microseconds — and delivers where that lands often enough. Where it lands
-nothing, Z3 is asked first, under a resource limit (`with_solver_limit`, in
-Z3's own units so the answer is machine-independent) — it settles a ribbon or a
-contradiction in milliseconds and answers `unknown` on anything transcendental
-or on anything past the limit — and only what Z3 could not decide gets brute force: the same
-sampler on every core for a proposal budget (`with_proposal_budget`, default a
-billion). What brute force finds is a function of the seed and the budget, never
+**The pool's ladder is probe, local solve, solver, brute force.** `cvg`'s
+uniform sampler (`Strategy::BruteSquad`) probes with one brute-force batch —
+tens of microseconds — and delivers where that lands often enough. Where it
+lands nothing, a local solve goes first (`Strategy::LocalSolve`, `cvg/local.rs`):
+COBYLA from the box centre and a few seeded starts, stopped at the first point
+the oracle judges feasible — 24 evaluations and 150 ms on the 100-segment
+stepped beam, where Z3 needs minutes per query. Only where every start fails is
+Z3 asked, under a resource limit (`with_solver_limit`, in Z3's own units so the
+answer is machine-independent) — it settles a contradiction in milliseconds,
+which is now its role: the proof that there is nothing to find. It answers
+`unknown` on anything transcendental or past the limit, and only what it could
+not decide gets brute force: the same sampler on every core for a proposal
+budget (`with_proposal_budget`, default a billion). What brute force finds is a function of the seed and the budget, never
 of the thread count — keep it that way (the batch is the unit of randomness).
 `Strategy` is a test-only configuration, not a user-facing one; the fairness
 oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool

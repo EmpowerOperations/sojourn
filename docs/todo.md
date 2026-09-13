@@ -2253,6 +2253,48 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       brute-force budget is a count of proposals, not of work, and that mismatch is its own
       entry waiting to be written.
 
+- [x] **A local solve finds the seed; Z3 is reached only to prove there is none.**
+      *2026-09-13.* `Strategy::LocalSolve`, `src/cvg/local.rs`: COBYLA (`basin`, pure Rust,
+      MIT/Apache-2.0, caret-pinned at 1.11) over the unit cube, every constraint in babel's own
+      `<= 0` form plus the box as `2d` more rows, from the box centre and three seeded starts,
+      each capped at `8 (d + 1)` evaluations. Every evaluation is judged by the oracle and the
+      run stops at the first that passes — on the 100-segment stepped beam that is evaluation
+      24, inside COBYLA's initial simplex, 150 ms; on two hundred strict bounds, 189 ms. Two
+      things learned. **The objective is the sum of the residuals, not the worst:** on the
+      bounds started at the centre every residual is `+2e-308` and the maximum is flat across
+      the whole simplex, so COBYLA converges three hundred iterations later on a point the
+      oracle rejects; the sum has a slope on every coordinate and the same start lands in the
+      simplex. **Do not let COBYLA converge:** its model algebra grows with `d² m`, 0.3 s an
+      iteration at 200 variables, and driving inward from the first feasible point cost 1,600
+      evaluations at 20 segments and would cost hours at 100; the walker's burn-in moves off
+      the walls far more cheaply. Found on the way and fixed: dropping a `FeasibleRegion` waited
+      out the walker's burn-in, 95 s at 200 dimensions, because burn-in never read the stop
+      flag; it does now, per step. Acceptance is `the_100_segment_beam_opens_by_local_solve`
+      and the 30-segment census in `tests/regression_fixture.rs`, both with the solver off the
+      ladder, because with it on the opening still spends one budgeted gap query on the beam's
+      document after the seed — which is the next entry's question. Left as measured, not
+      fixed: the walker's burn-in at 200 dimensions on the beam is 95 s and 256 points 335 s,
+      the deflection `sum` evaluated every step.
+
+- [ ] **Coverage after a seed the probe did not find.** The budgeted `cover_gaps` still runs
+      after a local-solve seed and asks Z3 about the region's other pieces — minutes on the
+      beam's document, for insurance against a second component. Three things to decide with
+      Z3's fate below: whether coverage is worth anything a local seed cannot vouch against
+      (a second local start from elsewhere is a cheaper second opinion); whether it should be
+      skipped when the probe found points by uniform sampling, since `k` uniform hits already
+      miss a component of measure `f` with probability only `(1 - f)^k`; and whether it moves
+      off the opening's critical path per the concurrent-coverage entry.
+
+- [ ] **Z3: prove it earns its build, or delete it.** Since the local solve, Z3 finds nothing
+      the search could not find without it; its remaining role is `Infeasibility::Proved`. The
+      test to write: a system interval analysis cannot prove empty — propagation over the box
+      never contracts a domain to nothing, as on `x*y == 1 ∧ x + y == 1` — where a proof and an
+      unsat core are what a user needs. If that test cannot be written from a real problem, the
+      honest outcome is deleting `smt.rs`, `smtlib.rs`, the leash, the `z3`/`z3-sys`
+      dependencies and their bundled build, and answering `NotFound` where `Proved` was; a
+      propagation-based emptiness check with blame covers the contradictions users actually
+      write (`x > 8 ∧ x < 2`, a bound an equality cannot meet).
+
 - [ ] **Concurrent coverage: start the walker from the first hit, cover gaps beside it.**
       Settled in discussion on 2026-09-12 as the follow-up to the budget above. Cases: (A)
       sampling carries — coverage is already skipped; (B) the solver finds the seed and the

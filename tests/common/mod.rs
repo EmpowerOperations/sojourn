@@ -14,6 +14,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use faer::Mat;
+use sojourn::{ConstraintSystem, InputVariable};
 
 /// One expression at one point, as a one-column batch.
 ///
@@ -324,4 +325,46 @@ pub fn timestamp_utc() -> String {
     let year = era * 400 + year_of_era + i64::from(month <= 2);
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// The stepped cantilever (Vanderplaats 1984; OASIS `Samples/PowerShell/Stepped
+/// Beam 100` for the constants and box), `n` segments: `b1..bn in [1, 5]`,
+/// `h1..hn in [5, 100]`; per segment a bending-stress limit and the aspect
+/// ratio `h_i <= 20 b_i`; one tip-deflection limit coupling every segment.
+/// Artemis's `e06`; the all-max corner is feasible. Shared because it is the
+/// scale the search is expected to reach and more than one fixture measures
+/// against it.
+pub fn stepped_beam(n: usize) -> anyhow::Result<ConstraintSystem> {
+    const P: f64 = 50000.0;
+    const E: f64 = 2.0e7;
+    const L: f64 = 500.0;
+    const SIG: f64 = 14000.0;
+    const YMX: f64 = 2.54;
+    const ASPECT: f64 = 20.0;
+    #[expect(clippy::cast_precision_loss, reason = "a segment count is small")]
+    let l = L / n as f64;
+    let mut vars: Vec<InputVariable> = (1..=n)
+        .map(|i| InputVariable::new(format!("b{i}"), 1.0, 5.0))
+        .collect();
+    vars.extend((1..=n).map(|i| InputVariable::new(format!("h{i}"), 5.0, 100.0)));
+    let mut constraints = Vec::with_capacity(2 * n + 1);
+    for i in 1..=n {
+        #[expect(clippy::cast_precision_loss, reason = "a segment index is small")]
+        let m = P * (L + l - i as f64 * l);
+        constraints.push(format!(
+            "(0.5 * {m} * h{i}) / (b{i} * (h{i}^3) / 12) / {SIG} - 1 < 0"
+        ));
+    }
+    for i in 1..=n {
+        constraints.push(format!("h{i} - {ASPECT} * b{i} < 0"));
+    }
+    let inertia = format!("(var[i] * (var[i + {n}]^3) / 12)");
+    let local = format!(
+        "sum(1, {n}, i -> 0.5 * {P} * {l} * {l} * ({L} - i * {l} + 2 * {l} / 3) / ({E} * {inertia}))"
+    );
+    let slope = format!(
+        "sum(1, {n}, i -> {P} * {l} * ({L} + 0.5 * {l} - i * {l}) / ({E} * {inertia}) * {l} * ({n} - i))"
+    );
+    constraints.push(format!("({local} + {slope}) / {YMX} - 1 < 0"));
+    Ok(ConstraintSystem::new(vars, constraints)?)
 }

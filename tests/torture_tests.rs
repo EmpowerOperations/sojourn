@@ -20,7 +20,7 @@ use anyhow::{Context, anyhow};
 use faer::Mat;
 use sojourn::{
     ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable,
-    Satisfiability,
+    Satisfiability, Strategy,
 };
 
 /// Same value the other cvg suites use, so a point seen in one is the point
@@ -82,9 +82,10 @@ fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
 /// A curve `x1^1.234 + x2^1.234 == 5` thickened to a band a hundredth wide in
 /// a hundred-unit box: about one proposal in two thousand lands, which is
 /// well inside brute force's reach and far outside the probe's luck. The
-/// solver can say nothing about it, so every point here was sampled.
+/// solver can say nothing about it, so nothing here was proved; every point
+/// was sampled or walked from a sampled or locally solved seed.
 #[pollster::test]
-async fn a_thin_curve_is_found_by_sampling_alone() -> anyhow::Result<()> {
+async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()> {
     const WANTED: usize = 10;
 
     let system = system(
@@ -145,6 +146,39 @@ async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()
         sentence.contains("sampling found nothing") && sentence.contains(source),
         "the verdict should read as a sentence a caller can act on, got {sentence:?}"
     );
+    Ok(())
+}
+
+/// The same band, seeded by the local solve alone: a real exponent is outside
+/// every solver's theories and a band this thin is outside the probe's luck,
+/// but a point on it is an ordinary constrained optimisation from the box
+/// centre, and that is what the local solve is for.
+#[pollster::test]
+async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
+    let system = system(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
+        &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
+    )?;
+    let verdict = solver()
+        .with_strategies(vec![Strategy::LocalSolve, Strategy::HitAndRun])
+        .solve(&system)
+        .await
+        .context("solve does not error")?;
+    let Satisfiability::Satisfied { mut region } = verdict else {
+        return Err(anyhow!("the band is not empty, yet: {verdict:?}"));
+    };
+    let points = region.take(4);
+    assert_eq!(
+        points.ncols(),
+        4,
+        "the walker should carry on from the seed"
+    );
+    for column in 0..points.ncols() {
+        let point: Vec<f64> = (0..points.nrows())
+            .map(|row| points[(row, column)])
+            .collect();
+        assert!(holds(&system, &point), "{point:?} is off the curve");
+    }
     Ok(())
 }
 

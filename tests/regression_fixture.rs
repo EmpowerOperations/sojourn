@@ -5,7 +5,11 @@
 //! probe's luck is only reproducible with the luck held still — and they stay
 //! here after the fix so the luck can never turn again.
 
-use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, Status};
+mod common;
+
+use sojourn::{
+    ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, Status, Strategy,
+};
 
 /// Artemis, 2026-09-11. `x1 == x2 + 1 +/- 0.01` over `[-32.768, 32.768]^20`:
 /// a 0.02-wide slab in a 65.5-wide box, one driven variable, the rest free.
@@ -253,42 +257,8 @@ mod repair_lands_too_close_at_a_vertex {
 /// `unknown`; see `cover_gaps` in `src/cvg/mod.rs`.
 mod census_does_not_return_on_the_20_segment_beam {
     use super::*;
+    use crate::common::stepped_beam;
     use anyhow::anyhow;
-
-    fn stepped_beam(n: usize) -> anyhow::Result<ConstraintSystem> {
-        const P: f64 = 50000.0;
-        const E: f64 = 2.0e7;
-        const L: f64 = 500.0;
-        const SIG: f64 = 14000.0;
-        const YMX: f64 = 2.54;
-        const ASPECT: f64 = 20.0;
-        #[expect(clippy::cast_precision_loss, reason = "a segment count is small")]
-        let l = L / n as f64;
-        let mut vars: Vec<InputVariable> = (1..=n)
-            .map(|i| InputVariable::new(format!("b{i}"), 1.0, 5.0))
-            .collect();
-        vars.extend((1..=n).map(|i| InputVariable::new(format!("h{i}"), 5.0, 100.0)));
-        let mut constraints = Vec::with_capacity(2 * n + 1);
-        for i in 1..=n {
-            #[expect(clippy::cast_precision_loss, reason = "a segment index is small")]
-            let m = P * (L + l - i as f64 * l);
-            constraints.push(format!(
-                "(0.5 * {m} * h{i}) / (b{i} * (h{i}^3) / 12) / {SIG} - 1 < 0"
-            ));
-        }
-        for i in 1..=n {
-            constraints.push(format!("h{i} - {ASPECT} * b{i} < 0"));
-        }
-        let inertia = format!("(var[i] * (var[i + {n}]^3) / 12)");
-        let local = format!(
-            "sum(1, {n}, i -> 0.5 * {P} * {l} * {l} * ({L} - i * {l} + 2 * {l} / 3) / ({E} * {inertia}))"
-        );
-        let slope = format!(
-            "sum(1, {n}, i -> {P} * {l} * ({L} + 0.5 * {l} - i * {l}) / ({E} * {inertia}) * {l} * ({n} - i))"
-        );
-        constraints.push(format!("({local} + {slope}) / {YMX} - 1 < 0"));
-        Ok(ConstraintSystem::new(vars, constraints)?)
-    }
 
     /// How many of `count` points the census hands back for the `n`-segment
     /// beam, at the default solver limit — the one Artemis ran. No wall clock
@@ -328,6 +298,48 @@ mod census_does_not_return_on_the_20_segment_beam {
             256,
             "the region is not empty (b = 5, h = 100 is feasible)"
         );
+        Ok(())
+    }
+
+    /// The ladder without the solver: the probe, the local solve, the walker.
+    /// Beyond ten segments the probe lands nothing and the seed is the local
+    /// solve's; with the solver configured the opening would then spend one
+    /// budgeted gap query on the beam's document — minutes at a hundred
+    /// segments — looking for components a local seed cannot vouch against.
+    /// What that coverage should be after a local seed is the next question
+    /// (`docs/todo.md`); these tests pin what the seed itself costs.
+    fn without_the_solver() -> ConstraintSolver {
+        ConstraintSolver::new().with_seed(0).with_strategies(vec![
+            Strategy::BruteSquad,
+            Strategy::LocalSolve,
+            Strategy::HitAndRun,
+        ])
+    }
+
+    /// Artemis's target scale, 2026-09-13: the census opens — a feasible point
+    /// is in hand — in about 150 ms at 200 variables, by a local solve whose
+    /// first feasible point is its 24th evaluation. The points that follow are
+    /// the walker's, and its burn-in at 200 dimensions on this system is about
+    /// 95 s before the first one, so this test asks for the opening alone.
+    #[pollster::test]
+    async fn the_100_segment_beam_opens_by_local_solve() -> anyhow::Result<()> {
+        let verdict = without_the_solver().solve(&stepped_beam(100)?).await?;
+        assert!(
+            matches!(verdict, Satisfiability::Satisfied { .. }),
+            "the beam is not empty (b = 5, h = 100 is feasible), yet: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    /// Past where the probe reaches, the whole census: seed by local solve,
+    /// then 256 walked points — about 35 s at thirty segments.
+    #[pollster::test]
+    async fn the_30_segment_beam_census_returns_from_a_local_seed() -> anyhow::Result<()> {
+        let verdict = without_the_solver().solve(&stepped_beam(30)?).await?;
+        let Satisfiability::Satisfied { mut region } = verdict else {
+            return Err(anyhow!("the beam is not empty, yet: {verdict:?}"));
+        };
+        assert_eq!(region.take(256).ncols(), 256);
         Ok(())
     }
 }

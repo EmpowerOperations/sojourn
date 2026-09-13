@@ -32,18 +32,25 @@
 //!   converges to the uniform distribution over the region, so what a caller
 //!   receives is governed by the strategy with a guarantee. It cannot start
 //!   without a feasible point, and a seed comes from the probe's own hits,
-//!   from the solver, or from brute force.
+//!   from the local solve, from the solver, or from brute force.
+//! * **The local solve** ([`local`]) *seeds* where the probe found nothing:
+//!   COBYLA from the box centre and a few seeded starts, stopped at the first
+//!   point the oracle judges feasible. Finding one point of a nonlinear system
+//!   is an ordinary constrained optimisation, and a local method does it in
+//!   milliseconds at two hundred variables where a decision procedure spends
+//!   minutes per query and brute force cannot find a region a millionth of its
+//!   box. It cannot prove anything: a start that finds nothing says only that
+//!   its basin held nothing.
 //!
-//! Neither can reach a region of measure zero — an equality constraint with a
-//! tolerance tight enough is a ribbon that sampling will not land on and a walk
-//! cannot be started in. That is the solver's job, and it goes *before* brute
-//! force: when the probe comes back empty *and* [`Strategy::Solver`] is in
-//! the list, Z3 is asked for a seed. It settles a ribbon or a contradiction
-//! in milliseconds where brute force would spend its whole budget, and only
-//! it can return [`Infeasibility::Proved`]. What it answers `unknown` on —
-//! anything transcendental — is exactly what brute force then spends the
-//! budget on. Without a solver in the list the probe hands straight to brute
-//! force, and an empty search is simply [`Infeasibility::NotFound`].
+//! None of those can prove a region *empty*. That is the solver's job, and it
+//! comes after the local solve and *before* brute force: when the probe and
+//! every local start come back empty *and* [`Strategy::Solver`] is in the
+//! list, Z3 is asked. It settles a contradiction in milliseconds where brute
+//! force would spend its whole budget, and only it can return
+//! [`Infeasibility::Proved`]. What it answers `unknown` on — anything
+//! transcendental, anything past its limit — is exactly what brute force then
+//! spends the budget on. Without a solver in the list the probe hands straight
+//! to brute force, and an empty search is simply [`Infeasibility::NotFound`].
 
 pub(crate) mod classify;
 #[cfg(feature = "gpu")]
@@ -51,6 +58,7 @@ pub(crate) mod classify;
 pub mod gpu;
 pub(crate) mod incidence;
 pub(crate) mod interval;
+mod local;
 mod progress;
 pub(crate) mod sampling;
 #[cfg(feature = "gpu")]
@@ -135,6 +143,10 @@ pub(crate) struct Ladder {
     sampler: Option<RandomSampler>,
     /// Fills whatever sampling left short of a batch, from the points in hand.
     walker: Option<HitAndRunWalker>,
+    /// The stream a local solve draws its starts from, when
+    /// [`Strategy::LocalSolve`] is configured. Runs once, on the opening,
+    /// after the probe and before any solver.
+    local: Option<Xoshiro256PlusPlus>,
     /// The solver's resource limit, when [`Strategy::Solver`] is configured.
     /// Not a strategy object: the solver needs the whole system to emit a
     /// document, and it runs once, on the opening, rather than per batch.
@@ -151,6 +163,7 @@ impl std::fmt::Debug for Ladder {
         f.debug_struct("Ladder")
             .field("sampler", &self.sampler.is_some())
             .field("walker", &self.walker.is_some())
+            .field("local", &self.local.is_some())
             .field("solver", &self.solver)
             .field("logic", &self.logic)
             .finish()
@@ -168,6 +181,7 @@ impl Ladder {
         let mut ladder = Self {
             sampler: None,
             walker: None,
+            local: None,
             solver: None,
             logic,
         };
@@ -190,6 +204,7 @@ impl Ladder {
                     ladder.sampler = Some(sampler);
                 }
                 Strategy::HitAndRun => ladder.walker = Some(HitAndRunWalker::new(stream)),
+                Strategy::LocalSolve => ladder.local = Some(stream),
             }
         }
         ladder
@@ -510,6 +525,21 @@ fn open(
         return Ok((Opening::Satisfied, progress));
     }
 
+    // A local solve before any solver: finding one point is an optimisation,
+    // and a local method does it where a decision procedure spends minutes
+    // per query. A seed found here is as single-component as a witness, so it
+    // takes the same road to coverage.
+    if let Some(rng) = &mut ladder.local
+        && let Some(point) = local::seed(problem, rng, cancel)
+    {
+        progress = progress.extend(vec![point]);
+        if let Some(limit) = ladder.solver {
+            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
+            progress = progress.extend(gaps);
+        }
+        return Ok((Opening::Satisfied, progress));
+    }
+
     let unexpressed = match ladder.solver {
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
@@ -578,7 +608,7 @@ fn keep_filling(
 ) {
     let mut barren = 0;
     while !stop.load(Ordering::Relaxed) {
-        let (batch, next) = next_batch(problem, ladder, progress, BATCH_SIZE);
+        let (batch, next) = next_batch(problem, ladder, progress, BATCH_SIZE, stop);
         progress = next;
         if batch.is_empty() {
             barren += 1;
@@ -618,6 +648,7 @@ fn next_batch(
     ladder: &mut Ladder,
     mut progress: Progress,
     count: usize,
+    stop: &AtomicBool,
 ) -> (Vec<Point>, Progress) {
     let mut points = Vec::new();
     if let Some(sampler) = &mut ladder.sampler {
@@ -628,7 +659,7 @@ fn next_batch(
     if points.len() < count
         && let Some(walker) = &mut ladder.walker
     {
-        let walked = walker.extend(problem, progress.points(), count - points.len());
+        let walked = walker.extend(problem, progress.points(), count - points.len(), stop);
         let walked: Vec<Point> = walked
             .into_iter()
             .filter(|point| problem.is_feasible(point, 0.0))
@@ -682,10 +713,11 @@ mod tests {
         }
     }
 
-    /// The order of escalation: probe, solver, brute force. With no budget at
-    /// all a region Z3 can express is still found, because Z3 goes first;
-    /// a region Z3 answers `unknown` on — a transcendental — is found anyway,
-    /// because what it cannot decide is handed to brute force.
+    /// The order of escalation: probe, local solve, solver, brute force. With
+    /// no budget at all a region the seeders can reach is still found, because
+    /// they go first; a region the solver answers `unknown` on — a
+    /// transcendental — is found anyway, because what it cannot decide is
+    /// handed to brute force.
     #[pollster::test]
     async fn the_solver_goes_first_and_brute_force_takes_what_it_cannot_decide() {
         let by_solver = ConstraintSolver::new()

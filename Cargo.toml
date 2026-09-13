@@ -9,6 +9,10 @@ license = "Apache-2.0"
 antlr-rust-runtime = "0.34"
 anyhow = "1.0"
 askama = "0.16"
+# The local solve that finds the search's first point: COBYLA, derivative-free,
+# with nonlinear inequality constraints in babel's own `<= 0` convention. Pure
+# Rust, no C toolchain, which is the whole reason it and not `nlopt`.
+basin = "1.11"
 faer = { version = "0.24.4", default-features = false, features = ["std"] }
 futures-channel = "0.3.34"
 pollster = { version = "1.0.1", optional = true }

@@ -140,12 +140,26 @@ pub enum Strategy {
     /// Converges to the uniform distribution, but needs a feasible point to
     /// start from and crosses between disconnected pieces only by luck.
     HitAndRun,
-    /// Ask the SMT solver for a first point when the probe found none. The
-    /// only strategy that can *prove* a region empty. Asked *before* brute
-    /// force, not after: a contradiction or an equality ribbon is settled in
-    /// milliseconds where brute force would spend its whole budget, and what
-    /// the solver answers `unknown` on — anything transcendental — is handed
-    /// to brute force with the constraints it could not express.
+    /// A local solve for a first point when the probe found none: COBYLA,
+    /// derivative-free, from the box centre and a few seeded starts, driving
+    /// the worst residual down until a point is judged feasible. Finding one
+    /// point of a nonlinear system is an ordinary constrained optimisation,
+    /// and a local method does it in seconds at two hundred variables where
+    /// the solver spends minutes per query and brute force cannot find a
+    /// region a millionth of its box. It cannot prove a region empty; a start
+    /// that finds nothing only says the basin it fell into held nothing.
+    /// Deterministic: a fixed evaluation count per start, and the same seed
+    /// gives the same starts.
+    LocalSolve,
+    /// Ask the SMT solver for a first point when the probe and the local
+    /// solves found none. The only strategy that can *prove* a region empty,
+    /// and since the local solve exists that is its role: it is reached when
+    /// there is nothing to find, which is when a proof is what is wanted.
+    /// Asked *before* brute force, not after: a contradiction or an equality
+    /// ribbon is settled in milliseconds where brute force would spend its
+    /// whole budget, and what the solver answers `unknown` on — anything
+    /// transcendental — is handed to brute force with the constraints it
+    /// could not express.
     ///
     /// The one a test leaves out when it must measure sampling alone: Z3
     /// answers `x1 > 0.999999` instantly, which would make a time-to-first-hit
@@ -155,18 +169,23 @@ pub enum Strategy {
 }
 
 /// What production uses: plain sampling, the walker for whatever it leaves
-/// short, and the solver for a first point where neither can find one.
+/// short, a local solve for a first point where sampling finds none, and the
+/// solver to prove the region empty where the local solves find none either.
 ///
 /// The strategies are partitioned by role in [`Ladder::new`] rather than by
 /// position, so the order here is cosmetic. The actual order of escalation is
-/// fixed by [`open`]: probe, then solver, then brute force, then the walker
-/// from whatever seed those produced.
+/// fixed by [`open`]: probe, then local solve, then solver, then brute force,
+/// then the walker from whatever seed those produced.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
 /// copy of this list living in the test suite is a copy that goes stale, and did.
 #[doc(hidden)]
-pub const DEFAULT_STRATEGIES: &[Strategy] =
-    &[Strategy::BruteSquad, Strategy::HitAndRun, Strategy::Solver];
+pub const DEFAULT_STRATEGIES: &[Strategy] = &[
+    Strategy::BruteSquad,
+    Strategy::LocalSolve,
+    Strategy::HitAndRun,
+    Strategy::Solver,
+];
 
 /// Candidates the brute-force search proposes before giving up, unless
 /// [`ConstraintSolver::with_proposal_budget`] says otherwise.
