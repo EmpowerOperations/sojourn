@@ -231,15 +231,19 @@ pub(crate) enum Opening {
     Unproven { unexpressed: Vec<usize> },
 }
 
-/// How many solver calls a search spends looking for pieces of its region that
-/// it has not reached.
+/// How many solver calls a search may spend looking for pieces of its region
+/// that it has not reached.
 ///
 /// Also the *resolution* of the search: [`cover_gaps`] halves its reach on every
-/// unsatisfiable answer, so the budget sets how fine it gets before giving up —
+/// unsatisfiable answer, so the count sets how fine it gets before giving up —
 /// sixteen halvings take a unit box down to about `1.5e-5`. That doubles as the
 /// floor nothing else has to supply. Below it lies the failure this whole thing
 /// exists to avoid, where the solver answers with a point a hair from one it
 /// already gave us.
+///
+/// A count, not the budget. The budget is the solver limit, spent across the
+/// whole stage in the solver's own units — see [`cover_gaps`] — and on a
+/// problem the solver finds hard it is what ends the stage, long before this.
 ///
 /// At zero this is the behaviour before it existed: one seed, every chain
 /// starting from it.
@@ -282,6 +286,25 @@ const GAP_QUERIES: usize = 16;
 /// Everything returned has been judged: [`smt::adjusted`] nudges a boundary
 /// witness and answers only with a point that passes `is_feasible`, so a bad
 /// one costs a solver call and never a wrong point.
+///
+/// # The stage has one budget, in the solver's units
+///
+/// `limit` is the budget for the *whole* stage — one seed query's worth of
+/// insurance, which is what the caller's solver limit already means for a
+/// query — not for each of up to [`GAP_QUERIES`] calls. Each query is given
+/// what remains as its own limit, so none can overrun the stage, and what it
+/// reports spent ([`smt::Answer::spent`]) comes off the top. The stage ends
+/// when the budget does, and at the first `unknown`: that query consumed its
+/// allowance, and the next would be the same document with a weaker
+/// exclusion, which is not a cheaper question. Either way the coverage risk is
+/// logged rather than hidden. A limit of zero is the caller's "no limit" and
+/// stays so; the count and the per-call ceiling still bound the stage.
+///
+/// Why units and not seconds: the 20-segment stepped beam (Artemis's
+/// `e06`, `tests/regression_fixture.rs`) spends the full default limit on one
+/// gap query at 115 s, and sixteen of those before `solve` returned was the
+/// 3.7 CPU-hours the report came with — for a region sampling had in hand in
+/// under a second. In units the same budget is the same work on any machine.
 fn cover_gaps(
     problem: &ConstraintSystem,
     logic: &SmtLogic,
@@ -304,6 +327,9 @@ fn cover_gaps(
     let mut avoid: Vec<Point> = found.iter().cloned().collect();
     let mut seeds = Vec::new();
 
+    let unlimited = limit == 0;
+    let mut remaining = limit;
+    let mut cut_short = false;
     for _ in 0..GAP_QUERIES {
         // Guards a subnormal reach halving its way to zero, and a NaN from a
         // non-finite box, which no amount of looking closer will fix. A
@@ -312,21 +338,48 @@ fn cover_gaps(
         if !reach.is_finite() || reach <= 0.0 || cancel.is_requested() {
             break;
         }
-        let Ok(smt::Verdict::Seed { point, .. }) =
-            smt::seed_away_from(problem, logic, limit, &avoid, reach, cancel)
+        if !unlimited && remaining == 0 {
+            cut_short = true;
+            break;
+        }
+        let Ok(answer) = smt::seed_away_from(problem, logic, remaining, &avoid, reach, cancel)
         else {
-            // Unsat, undecidable, or the solver failed. Nothing is out this far;
-            // look closer.
+            // The solver failed. Nothing is out this far; look closer.
             reach /= 2.0;
             continue;
         };
-
-        // Avoided whether or not it survives repair: the solver has told us
-        // about this piece, and asking again would be told the same thing.
-        avoid.push(point.clone());
-        if let Some(seed) = smt::adjusted(problem, point) {
-            seeds.push(seed);
+        remaining = remaining.saturating_sub(answer.spent);
+        match answer.verdict {
+            smt::Verdict::Seed { point, .. } => {
+                // Avoided whether or not it survives repair: the solver has
+                // told us about this piece, and asking again would be told the
+                // same thing.
+                avoid.push(point.clone());
+                if let Some(seed) = smt::adjusted(problem, point) {
+                    seeds.push(seed);
+                }
+            }
+            smt::Verdict::Impossible { .. } => {
+                // Nothing is out this far; look closer.
+                reach /= 2.0;
+            }
+            smt::Verdict::Inconclusive { .. } => {
+                // Undecided within its allowance. A weaker exclusion is not a
+                // cheaper question, so the stage ends here.
+                cut_short = true;
+                break;
+            }
         }
+    }
+
+    if cut_short {
+        tracing::warn!(
+            seeds = seeds.len(),
+            spent = limit - remaining,
+            limit,
+            reach,
+            "gap coverage cut short; components beyond the seeds in hand may be missed"
+        );
     }
 
     seeds
@@ -461,7 +514,8 @@ fn open(
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
         None => (0..problem.constraints.len()).collect(),
-        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel)? {
+        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel)?.verdict
+        {
             smt::Verdict::Impossible { blamed } => {
                 return Ok((Opening::Impossible { blamed }, progress));
             }

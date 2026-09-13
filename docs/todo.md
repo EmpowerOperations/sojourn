@@ -2228,6 +2228,44 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       a missing checkpoint. Where one such hole was found there will be more: this list is
       where they go, and `tests/torture_tests.rs` is where the crate proves it survives them.
 
+- [x] **Gap coverage is budgeted in Z3's own units; the stepped beam census returns.**
+      *2026-09-12.* Artemis's `e06-stepped-beam-20` (`tests/regression_fixture.rs`): 40
+      variables, 41 constraints, one a `sum` over every segment, and `solve` ran 3.7 CPU-hours
+      without returning. Not a Z3 hole. Sampling had the region in under a second; what did not
+      return was `cover_gaps`, which on the satisfied path asked up to sixteen gap queries
+      before `solve` returned, each with the whole solver limit, an `unknown` merely halving
+      the reach and asking again. Measured: one plain query on the n = 10 document is `sat` in
+      15 s having spent 295k rlimit units; n = 20 `sat` in 47 s; an n = 20 gap query spends
+      the full 3,000,000 and answers `unknown` at 115 s. Sixteen of those, leashed at 480 s
+      each, is the hours. Now the backend reports what a call spent (`smt::Reply::spent`, from
+      `rlimit count` in the solver's statistics, reported after an `unknown` too), the stage
+      treats the limit as its *whole* budget, hands each query the remainder, and stops at
+      zero or at the first `unknown` — a weaker exclusion is not a cheaper question — with a
+      `warn` that coverage was cut short. n = 20 now opens in 109 s and delivers 256 points at
+      137 s; n = 10, where the fixture is pinned because it fits the standard test bound, in
+      about 35 s; n = 5 is unchanged. Two things learned on the way. **A unit is not a number of
+      microseconds:** eight on the problems the leash ceiling was calibrated on, about forty on
+      the beam, which is why the ceiling is only ever the last resort against a hung process
+      and budgets are kept in units — the same work on any machine, and deterministic. **A
+      smaller solver limit is not a shortcut here:** below the ~1.2M units the seed query
+      needs, the opening falls through to the brute squad's billion proposals, which on a
+      system with a 20-term `sum` per candidate is longer than the query it replaced. The
+      brute-force budget is a count of proposals, not of work, and that mismatch is its own
+      entry waiting to be written.
+
+- [ ] **Concurrent coverage: start the walker from the first hit, cover gaps beside it.**
+      Settled in discussion on 2026-09-12 as the follow-up to the budget above. Cases: (A)
+      sampling carries — coverage is already skipped; (B) the solver finds the seed and the
+      walker carries — today it waits for coverage, up to one limit's worth of Z3, before a
+      point flows; (C) a second component exists that hit-and-run cannot reach — coverage is
+      what finds it. Running coverage concurrently and merging a new component's seed by
+      burning a chain in under the frozen preconditioner makes B pay nothing, and C gains its
+      component later rather than never. The price is exact and worth writing down before it
+      is paid: in case C the census becomes a function of *when* the seed arrived relative to
+      the walker's batches, so the same seed gives different streams on different runs, which
+      the two-run oracle in `cvg_benchmarks` and Artemis's same-seed test both rest on. In A
+      and B the output is identical either way. To be chosen, not drifted into.
+
       The split that made it work: **one-shot and ongoing are different asynchronies.** "Crack the
       first point" has a completion and belongs to a `Future`; "keep filling between requests" has
       none and belongs to a worker. Trying to make one `Future` carry both is why it previously fit

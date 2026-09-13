@@ -235,3 +235,99 @@ mod repair_lands_too_close_at_a_vertex {
         Ok(())
     }
 }
+
+/// Artemis, 2026-09-11, `e06-stepped-beam-20`. The stepped cantilever
+/// (Vanderplaats 1984; OASIS `Samples/PowerShell/Stepped Beam 100` for the
+/// constants and box), `n` segments: `b1..bn in [1, 5]`, `h1..hn in [5, 100]`;
+/// per segment a bending-stress limit and the aspect ratio `h_i <= 20 b_i`;
+/// one tip-deflection limit coupling every segment. Feasible fraction of the
+/// box by Monte Carlo: `5e-4` at `n = 5`, below `5e-6` at `n = 20`. The region
+/// is easy to construct a point in — the all-max corner is feasible.
+///
+/// At `n = 5` the census took 264 ms; at `n = 20` it ran 3.7 CPU-hours
+/// without returning. Sampling found the region in under a second either
+/// way; what did not return was gap coverage, up to sixteen Z3 queries before
+/// `solve` returns, each given the whole solver limit and the n = 20
+/// document taking the full 3,000,000 units (115 s) to answer `unknown`.
+/// The stage now has one budget in Z3's own units and stops at the first
+/// `unknown`; see `cover_gaps` in `src/cvg/mod.rs`.
+mod census_does_not_return_on_the_20_segment_beam {
+    use super::*;
+    use anyhow::anyhow;
+
+    fn stepped_beam(n: usize) -> anyhow::Result<ConstraintSystem> {
+        const P: f64 = 50000.0;
+        const E: f64 = 2.0e7;
+        const L: f64 = 500.0;
+        const SIG: f64 = 14000.0;
+        const YMX: f64 = 2.54;
+        const ASPECT: f64 = 20.0;
+        #[expect(clippy::cast_precision_loss, reason = "a segment count is small")]
+        let l = L / n as f64;
+        let mut vars: Vec<InputVariable> = (1..=n)
+            .map(|i| InputVariable::new(format!("b{i}"), 1.0, 5.0))
+            .collect();
+        vars.extend((1..=n).map(|i| InputVariable::new(format!("h{i}"), 5.0, 100.0)));
+        let mut constraints = Vec::with_capacity(2 * n + 1);
+        for i in 1..=n {
+            #[expect(clippy::cast_precision_loss, reason = "a segment index is small")]
+            let m = P * (L + l - i as f64 * l);
+            constraints.push(format!(
+                "(0.5 * {m} * h{i}) / (b{i} * (h{i}^3) / 12) / {SIG} - 1 < 0"
+            ));
+        }
+        for i in 1..=n {
+            constraints.push(format!("h{i} - {ASPECT} * b{i} < 0"));
+        }
+        let inertia = format!("(var[i] * (var[i + {n}]^3) / 12)");
+        let local = format!(
+            "sum(1, {n}, i -> 0.5 * {P} * {l} * {l} * ({L} - i * {l} + 2 * {l} / 3) / ({E} * {inertia}))"
+        );
+        let slope = format!(
+            "sum(1, {n}, i -> {P} * {l} * ({L} + 0.5 * {l} - i * {l}) / ({E} * {inertia}) * {l} * ({n} - i))"
+        );
+        constraints.push(format!("({local} + {slope}) / {YMX} - 1 < 0"));
+        Ok(ConstraintSystem::new(vars, constraints)?)
+    }
+
+    /// How many of `count` points the census hands back for the `n`-segment
+    /// beam, at the default solver limit — the one Artemis ran. No wall clock
+    /// of its own: nextest's slow-timeout is the bound that turns a census
+    /// that does not return into a failure with a name.
+    ///
+    /// The regression is pinned at `n = 10`, where it reproduced — the census
+    /// did not return within that bound before the coverage budget existed,
+    /// and returns in about 35 s with it — rather than at Artemis's `n = 20`,
+    /// where the honest answer is slow rather than absent: the one gap query
+    /// the budget affords spends its 3,000,000 units in about 110 s and the
+    /// walker's 256 points take another 30, for 137 s measured on 2026-09-12.
+    /// A test that needs its own timeout is a test at the wrong size.
+    async fn census(n: usize, count: usize) -> anyhow::Result<usize> {
+        let verdict = ConstraintSolver::new()
+            .with_seed(0)
+            .solve(&stepped_beam(n)?)
+            .await?;
+        match verdict {
+            Satisfiability::Satisfied { mut region } => Ok(region.take(count).ncols()),
+            Satisfiability::Unsatisfiable { because } => {
+                Err(anyhow!("n={n}: the beam is not empty, yet: {because}"))
+            }
+        }
+    }
+
+    #[pollster::test]
+    async fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
+        assert_eq!(census(5, 256).await?, 256);
+        Ok(())
+    }
+
+    #[pollster::test]
+    async fn the_10_segment_beam_census_returns() -> anyhow::Result<()> {
+        assert_eq!(
+            census(10, 256).await?,
+            256,
+            "the region is not empty (b = 5, h = 100 is feasible)"
+        );
+        Ok(())
+    }
+}

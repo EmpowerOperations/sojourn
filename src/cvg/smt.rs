@@ -67,6 +67,22 @@ pub(crate) enum Outcome {
     Unknown,
 }
 
+/// What a solver had to say, and what it cost to say it.
+///
+/// `spent` is in the backend's own resource units — the same units `limit`
+/// is given in — and is reported whether or not the call finished, so a
+/// caller asking several questions against one budget can keep honest
+/// accounts. Not wall clock: a unit is a fixed amount of the solver's work,
+/// and the same budget answers the same way on a slower machine. A backend
+/// that cannot report reports zero; a call that had to be abandoned reports
+/// its whole allowance, since nothing better is known and a budget must not
+/// be credited for work that never came back.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Reply {
+    pub(crate) outcome: Outcome,
+    pub(crate) spent: u32,
+}
+
 /// Somewhere to send an SMT-LIB2 document.
 ///
 /// A trait because the deployment story and the theory support pull in opposite
@@ -88,9 +104,10 @@ pub(crate) trait SmtBackend {
     /// Transport and process failures. A solver *concluding* `unknown` is an
     /// [`Outcome`], not an error.
     /// `limit` is a resource limit in the backend's own units; zero is none.
-    /// `cancel` is the caller's way of saying "never mind" mid-call, which a
-    /// backend answers with [`Outcome::Unknown`].
-    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Outcome>;
+    /// The [`Reply`] says what the call spent in those units. `cancel` is the
+    /// caller's way of saying "never mind" mid-call, which a backend answers
+    /// with [`Outcome::Unknown`].
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Reply>;
 }
 
 /// **dReal** — the best theory fit, and the reason this trait exists.
@@ -122,7 +139,7 @@ impl SmtBackend for DRealBackend {
         "dreal"
     }
 
-    fn solve(&self, _document: &str, _limit: u32, _cancel: &Cancellation<'_>) -> Result<Outcome> {
+    fn solve(&self, _document: &str, _limit: u32, _cancel: &Cancellation<'_>) -> Result<Reply> {
         unimplemented!(
             "dReal backend: spawn {} with --precision {}, write the document to \
              stdin, parse `delta-sat`/`unsat` and the witness box from stdout",
@@ -166,6 +183,14 @@ const Z3_STACK: usize = 8 << 20;
 /// never under a minute, eight minutes at the default limit. A limit of zero
 /// is "no limit", and no limit must not mean hung, so it gets an hour.
 ///
+/// The eight seconds is not a property of a unit, which is why the margin is
+/// twenty and not two: a unit is a fixed amount of Z3's work, and what that
+/// work costs in seconds is the problem's. On the nonlinear 20-segment beam
+/// (`tests/regression_fixture.rs`) the default limit is spent in 115 s,
+/// about forty microseconds a unit against the eight this was measured at.
+/// The ceiling is the last resort against a hung process and never the
+/// budget; budgets are in units, where [`Reply::spent`] keeps the accounts.
+///
 /// [`DEFAULT_SOLVER_LIMIT`]: crate::DEFAULT_SOLVER_LIMIT
 fn ceiling(limit: u32) -> Duration {
     const SECONDS_PER_MILLION: f64 = 8.0;
@@ -207,12 +232,12 @@ impl Interruptible {
 /// `None` is "abandoned": the worker is still running and nothing more will
 /// be heard from it. A worker that died is an error rather than a hang.
 fn await_answer(
-    answers: &mpsc::Receiver<Result<Outcome>>,
+    answers: &mpsc::Receiver<Result<Reply>>,
     cancel: &Cancellation<'_>,
     interrupt: impl FnOnce(),
     ceiling: Duration,
     grace: Duration,
-) -> Option<Result<Outcome>> {
+) -> Option<Result<Reply>> {
     const POLL: Duration = Duration::from_millis(10);
 
     let started = Instant::now();
@@ -254,7 +279,7 @@ impl SmtBackend for Z3Backend {
     /// The release channel is what makes the interrupt sound: the worker keeps
     /// its context alive until this function returns, so an interrupt can never
     /// reach a context that a worker finishing at the same moment has freed.
-    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Outcome> {
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Reply> {
         let (send_context, context) = mpsc::channel();
         let (send_answer, answers) = mpsc::channel();
         let (release, hold) = mpsc::channel::<()>();
@@ -292,13 +317,16 @@ impl SmtBackend for Z3Backend {
                 "Z3 ignored the interrupt; its thread is abandoned and keeps running"
             );
             tracing::debug!(document = %document, "the document Z3 would not stop on");
-            Ok(Outcome::Unknown)
+            Ok(Reply {
+                outcome: Outcome::Unknown,
+                spent: limit,
+            })
         })
     }
 }
 
 /// One call to Z3, on the calling thread, with the thread-local context.
-fn solve_on_this_thread(document: &str, limit: u32) -> Result<Outcome> {
+fn solve_on_this_thread(document: &str, limit: u32) -> Result<Reply> {
     let solver = z3::Solver::new();
     // `rlimit` is Z3's own count of the work it has done, in units of its
     // choosing; it makes the call give up with `unknown` deterministically,
@@ -323,15 +351,29 @@ fn solve_on_this_thread(document: &str, limit: u32) -> Result<Outcome> {
         );
     }
 
-    match solver.check() {
-        z3::SatResult::Unsat => Ok(Outcome::Unsat {
+    let result = solver.check();
+    // Z3's own count of the work it did, in the units `rlimit` is set in —
+    // reported after an `unknown` too, which is what lets a caller budget a
+    // series of calls rather than each one.
+    let spent = match solver.get_statistics().value("rlimit count") {
+        Some(z3::StatisticsValue::UInt(count)) => count,
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a count Z3 reports as a double is still a count, and saturating is the honest rounding"
+        )]
+        Some(z3::StatisticsValue::Double(count)) => count.max(0.0) as u32,
+        None => 0,
+    };
+    let outcome = match result {
+        z3::SatResult::Unsat => Outcome::Unsat {
             blamed: solver
                 .get_unsat_core()
                 .iter()
                 .filter_map(|term| smtlib::core_index(&term.to_string()))
                 .collect(),
-        }),
-        z3::SatResult::Unknown => Ok(Outcome::Unknown),
+        },
+        z3::SatResult::Unknown => Outcome::Unknown,
         z3::SatResult::Sat => {
             let Some(model) = solver.get_model() else {
                 bail!("Z3 answered sat but produced no model");
@@ -389,9 +431,17 @@ fn solve_on_this_thread(document: &str, limit: u32) -> Result<Outcome> {
                 };
                 values.push((declaration.name(), value));
             }
-            Ok(Outcome::Sat(values))
+            Outcome::Sat(values)
         }
-    }
+    };
+    Ok(Reply { outcome, spent })
+}
+
+/// What a solver had to say about a pool that sampling could not crack, and
+/// what it spent saying it — [`Reply::spent`], in the solver's own units.
+pub(crate) struct Answer {
+    pub(crate) verdict: Verdict,
+    pub(crate) spent: u32,
 }
 
 /// What a solver had to say about a pool that sampling could not crack.
@@ -506,7 +556,7 @@ pub(crate) fn escalate_for_seed(
     logic: &SmtLogic,
     limit: u32,
     cancel: &Cancellation<'_>,
-) -> Result<Verdict> {
+) -> Result<Answer> {
     seed_away_from(problem, logic, limit, &[], 0.0, cancel)
 }
 
@@ -537,7 +587,7 @@ pub(crate) fn seed_away_from(
     avoid: &[Point],
     reach: f64,
     cancel: &Cancellation<'_>,
-) -> Result<Verdict> {
+) -> Result<Answer> {
     let inputs = problem.variables();
     let written = problem
         .constraints
@@ -546,7 +596,8 @@ pub(crate) fn seed_away_from(
     let document = smtlib::emit_away_from(inputs, written, logic, avoid, reach);
     let unexpressed = document.untranslated;
 
-    Ok(match Z3Backend.solve(&document.text, limit, cancel)? {
+    let Reply { outcome, spent } = Z3Backend.solve(&document.text, limit, cancel)?;
+    let verdict = match outcome {
         Outcome::Unsat { blamed } if unexpressed.is_empty() => Verdict::Impossible { blamed },
 
         // "Nothing satisfies the constraints we wrote down" is a much weaker
@@ -570,7 +621,8 @@ pub(crate) fn seed_away_from(
                 .collect(),
             unexpressed,
         },
-    })
+    };
+    Ok(Answer { verdict, spent })
 }
 
 #[cfg(test)]
@@ -667,11 +719,16 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let outcome = Z3Backend
+        let reply = Z3Backend
             .solve(&document.text, 30_000, &Cancellation::never())
             .expect("a parseable document");
         let took = started.elapsed();
-        assert_eq!(outcome, Outcome::Unknown, "{outcome:?}");
+        assert_eq!(reply.outcome, Outcome::Unknown, "{reply:?}");
+        assert!(
+            reply.spent >= 30_000,
+            "a call that hit its limit should report at least the limit spent, not {}",
+            reply.spent
+        );
         assert!(
             took < std::time::Duration::from_secs(5),
             "thirty thousand units took {took:?}; the limit is not being applied"
@@ -712,13 +769,13 @@ mod tests {
             drop(receiver);
         });
         let started = Instant::now();
-        let outcome = Z3Backend
+        let reply = Z3Backend
             .solve(&document.text, 0, &Cancellation::watching(&sender))
             .expect("a parseable document");
         let took = started.elapsed();
         timer.join().expect("the timer thread joins");
 
-        assert_eq!(outcome, Outcome::Unknown, "{outcome:?}");
+        assert_eq!(reply.outcome, Outcome::Unknown, "{reply:?}");
         assert!(
             took < Duration::from_millis(200) + INTERRUPT_GRACE,
             "cancelled at 200ms and answered after {took:?}; the interrupt did not land"
@@ -732,7 +789,7 @@ mod tests {
     /// crash static teardown after `main` has returned.
     #[test]
     fn an_unanswered_interrupt_is_abandoned_after_the_grace() {
-        let (sender, answers) = mpsc::channel::<Result<Outcome>>();
+        let (sender, answers) = mpsc::channel::<Result<Reply>>();
         let interrupts = std::cell::Cell::new(0_u32);
         let started = Instant::now();
         let answer = await_answer(
@@ -756,7 +813,7 @@ mod tests {
     /// A worker that dies is an error, not a hang and not an abandonment.
     #[test]
     fn a_dead_worker_is_an_error_rather_than_a_wait() {
-        let (sender, answers) = mpsc::channel::<Result<Outcome>>();
+        let (sender, answers) = mpsc::channel::<Result<Reply>>();
         drop(sender);
         let answer = await_answer(
             &answers,
@@ -855,6 +912,7 @@ mod tests {
 
             Z3Backend
                 .solve(&document.text, 0, &Cancellation::never())
+                .map(|reply| reply.outcome)
                 .unwrap_or_else(|e| {
                     panic!(
                         "Z3 rejected the document for {source:?}: {e}\n{}",
@@ -924,7 +982,8 @@ mod tests {
         assert_eq!(
             Z3Backend
                 .solve(&narrow, 0, &Cancellation::never())
-                .expect("sin parses"),
+                .expect("sin parses")
+                .outcome,
             Outcome::Unknown,
             "Z3 has learned to decide narrow trigonometry"
         );
@@ -938,7 +997,8 @@ mod tests {
         assert!(matches!(
             Z3Backend
                 .solve(&root, 0, &Cancellation::never())
-                .expect("^ parses"),
+                .expect("^ parses")
+                .outcome,
             Outcome::Sat(_)
         ));
     }
@@ -956,6 +1016,7 @@ mod tests {
         let Outcome::Sat(values) = Z3Backend
             .solve(document, 0, &Cancellation::never())
             .expect("solves")
+            .outcome
         else {
             panic!("a pinned value should be satisfiable");
         };
@@ -975,14 +1036,18 @@ mod tests {
         // a decimal — asking Z3 about `pi` hands back something symbolic, which
         // used to take the worker thread down with it. Skipping the variable
         // leaves it at its lower bound and lets the pool filter the point.
-        let outcome = Z3Backend
+        let reply = Z3Backend
             .solve(
                 "(declare-const x Real)(assert (> x pi))",
                 0,
                 &Cancellation::never(),
             )
             .expect("pi parses");
-        assert!(matches!(outcome, Outcome::Sat(_)));
+        assert!(matches!(reply.outcome, Outcome::Sat(_)));
+        assert!(
+            reply.spent > 0,
+            "a finished call should report the work it did"
+        );
     }
 
     #[test]
