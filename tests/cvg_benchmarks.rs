@@ -39,10 +39,8 @@ mod common;
 
 use faer::Mat;
 
-use sojourn::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
-use std::cell::Cell;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Once;
+use anyhow::Context;
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Point, Strategy};
 
 use rand::RngExt;
 use rand::SeedableRng;
@@ -59,13 +57,12 @@ const RIVAL_SEED: u64 = 0x0D_D5_0F_1E_5E;
 /// the product had already moved on from.
 use sojourn::DEFAULT_STRATEGIES as PRODUCTION;
 
-/// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
-///
-/// Fixtures are written by hand and their variables always match their
-/// constraints; a mismatch is a typo in the test, not a case under test.
-fn system(variables: Vec<InputVariable>, constraints: Vec<String>) -> ConstraintSystem {
-    ConstraintSystem::new(variables, constraints)
-        .expect("a fixture's constraints should bind to its own box")
+/// A fixture's [`ConstraintSystem`]; one that does not bind is the test's error.
+fn system(
+    variables: Vec<InputVariable>,
+    constraints: Vec<String>,
+) -> anyhow::Result<ConstraintSystem> {
+    Ok(ConstraintSystem::new(variables, constraints)?)
 }
 
 /// A sample matrix back as one `Vec<f64>` per point.
@@ -155,30 +152,31 @@ fn sources<S: AsRef<str>>(of: &[S]) -> Vec<String> {
     of.iter().map(|source| source.as_ref().to_owned()).collect()
 }
 
+/// `count` points of `problem` from a fresh solve under `seed` and
+/// `strategies`. Called for the run under test, for the unbiased reference
+/// and for the rival seed, which is why it is a function and not three
+/// copies of the builder call.
+///
+/// The CPU alone, explicitly: what brute force lands on a GPU is a function
+/// of the device as well as the seed, and a benchmark's verdict must not be.
 async fn generate(
     problem: &Problem,
     seed: u64,
     strategies: &[Strategy],
     count: usize,
-) -> Vec<Point> {
-    let solution = common::solver()
+) -> anyhow::Result<Vec<Point>> {
+    let system = system(problem.inputs.clone(), problem.constraints.clone())?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())
-        .solve(&system(problem.inputs.clone(), problem.constraints.clone()))
+        .solve(&system)
         .await
-        .unwrap_or_else(|e| panic!("{}: solving failed: {e}", problem.name));
+        .with_context(|| format!("{}: solving failed", problem.name))?;
 
-    let mut pool = match solution {
-        Satisfiability::Satisfied { region: samples } => samples,
-        Satisfiability::Unsatisfiable { because } => {
-            panic!(
-                "{}: reported unsatisfiable, blaming {because:?}",
-                problem.name
-            )
-        }
-    };
-    columns(&pool.take(count))
+    Ok(columns(&region.take(count)))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,41 +348,67 @@ fn autocorrelation_time(points: &[Point]) -> f64 {
     running.max(1.0)
 }
 
+/// One thing an oracle measured, for [`run`] to judge: what was looked at,
+/// whether it passed, and the numbers that say why. The oracles only measure;
+/// the assertion is `run`'s, once, over every seed's findings, so that a
+/// failing seed does not stop the ones after it from being measured too.
+struct Finding {
+    context: String,
+    passed: bool,
+    detail: String,
+}
+
+impl Finding {
+    fn new(context: impl Into<String>, passed: bool, detail: impl Into<String>) -> Self {
+        Self {
+            context: context.into(),
+            passed,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// The independence check, stated on its own rather than folded into a
-/// confidence interval.
+/// confidence interval, with the effective sample count it measured.
 ///
 /// Correcting the critical value keeps the KS tests honest, but on its own it
 /// would let the walker degrade indefinitely: every extra bit of correlation
-/// simply widens the threshold and nothing ever fails. This is the assertion
+/// simply widens the threshold and nothing ever fails. This is the finding
 /// that notices.
-fn assert_efficient(context: &str, points: &[Point]) -> f64 {
+fn efficiency(context: &str, points: &[Point]) -> (f64, Finding) {
     let effective = points.len() as f64 / autocorrelation_time(points);
     let efficiency = effective / points.len() as f64;
-    assert!(
+    let finding = Finding::new(
+        context,
         efficiency >= MINIMUM_EFFICIENCY,
-        "{context}: {} points are worth only {effective:.0} independent ones              ({:.1}% efficiency) — the chain is not mixing",
-        points.len(),
-        efficiency * 100.0
+        format!(
+            "{} points are worth only {effective:.0} independent ones \
+             ({:.1}% efficiency) — the chain is not mixing",
+            points.len(),
+            efficiency * 100.0
+        ),
     );
-    effective
+    (effective, finding)
 }
 
-fn assert_indistinguishable(
+fn indistinguishable(
     context: &str,
     mut sample: Vec<f64>,
     mut reference: Vec<f64>,
     effective_sample: f64,
     effective_reference: f64,
     alpha: f64,
-) {
+) -> Finding {
     let critical = ks_two_sample_critical(effective_sample, effective_reference, alpha);
-
     let statistic = ks_two_sample(&mut sample, &mut reference);
-    assert!(
+    Finding::new(
+        context,
         statistic <= critical,
-        "{context}: distributions differ (KS {statistic:.4} > {critical:.4}, \
+        format!(
+            "distributions differ (KS {statistic:.4} > {critical:.4}, \
              effective n {effective_sample:.0} and {effective_reference:.0})"
-    );
+        ),
+    )
 }
 
 /// A direction uniformly distributed on the unit sphere, by Muller's method.
@@ -439,11 +463,15 @@ fn distances_from(points: &[Point], centre: &[f64]) -> Vec<f64> {
 /// exists for the bug this walker was written to avoid: placing points uniformly
 /// in radius rather than in volume leaves marginals and projections looking
 /// plausible while the interior is over-full.
-fn assert_same_distribution(context: &str, seed: u64, sample: &[Point], reference: &[Point]) {
-    assert!(
-        !sample.is_empty() && !reference.is_empty(),
-        "{context}: nothing to compare"
-    );
+fn same_distribution(
+    context: &str,
+    seed: u64,
+    sample: &[Point],
+    reference: &[Point],
+) -> Vec<Finding> {
+    if sample.is_empty() || reference.is_empty() {
+        return vec![Finding::new(context, false, "nothing to compare")];
+    }
     let dimensions = sample[0].len();
 
     // One budget split across every test performed, so that adding a projection
@@ -453,18 +481,20 @@ fn assert_same_distribution(context: &str, seed: u64, sample: &[Point], referenc
     // Measured once per point set. Every column and every projection below is a
     // view of the same emission order, so they share one autocorrelation time —
     // and pooling is what makes that estimate stable enough to use.
-    let effective_sample = assert_efficient(&format!("{context}: sample"), sample);
-    let effective_reference = assert_efficient(&format!("{context}: reference"), reference);
+    let (effective_sample, sample_mixes) = efficiency(&format!("{context}: sample"), sample);
+    let (effective_reference, reference_mixes) =
+        efficiency(&format!("{context}: reference"), reference);
+    let mut findings = vec![sample_mixes, reference_mixes];
 
     for index in 0..dimensions {
-        assert_indistinguishable(
+        findings.push(indistinguishable(
             &format!("{context}: coordinate {index}"),
             sample.iter().map(|point| point[index]).collect(),
             reference.iter().map(|point| point[index]).collect(),
             effective_sample,
             effective_reference,
             alpha,
-        );
+        ));
     }
 
     // Seeded per replicate, so the projection directions differ between
@@ -472,14 +502,14 @@ fn assert_same_distribution(context: &str, seed: u64, sample: &[Point], referenc
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     for projection in 0..PROJECTIONS {
         let direction = unit_vector(&mut rng, dimensions);
-        assert_indistinguishable(
+        findings.push(indistinguishable(
             &format!("{context}: projection {projection}"),
             project(sample, &direction),
             project(reference, &direction),
             effective_sample,
             effective_reference,
             alpha,
-        );
+        ));
     }
 
     let centre: Vec<f64> = (0..dimensions)
@@ -487,26 +517,31 @@ fn assert_same_distribution(context: &str, seed: u64, sample: &[Point], referenc
             reference.iter().map(|point| point[index]).sum::<f64>() / reference.len() as f64
         })
         .collect();
-    assert_indistinguishable(
+    findings.push(indistinguishable(
         &format!("{context}: radial profile"),
         distances_from(sample, &centre),
         distances_from(reference, &centre),
         effective_sample,
         effective_reference,
         alpha,
-    );
+    ));
+    findings
 }
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
-async fn assert_fair(problem: &Problem, seed: u64, points: &[Point]) {
+/// What every oracle of `problem` found about `points`. The reference and
+/// rival point sets an oracle needs are generated here, which is a solve and
+/// can fail; a measurement never does.
+async fn fairness(problem: &Problem, seed: u64, points: &[Point]) -> anyhow::Result<Vec<Finding>> {
     let wanted = problem
         .target_sample_size
         .min(DISTRIBUTION_SAMPLE)
         .min(points.len());
     let sample = &points[..wanted];
+    let mut findings = Vec::new();
 
     for oracle in &problem.oracles {
         match oracle {
@@ -516,48 +551,50 @@ async fn assert_fair(problem: &Problem, seed: u64, points: &[Point]) {
                 // Measured once from the whole point set, because the
                 // correlation is the emission interleave and every coordinate
                 // shares it. Per-column it sits at the noise floor.
-                let effective = assert_efficient(&format!("{}: marginals", problem.name), points);
+                let (effective, mixes) =
+                    efficiency(&format!("{}: marginals", problem.name), points);
+                findings.push(mixes);
                 let critical = ks_critical_value(effective, alpha);
 
                 for (index, (low, high)) in intervals.iter().enumerate() {
                     let mut column: Vec<f64> = points.iter().map(|point| point[index]).collect();
-                    let context = format!(
-                        "{}: coordinate {}",
-                        problem.name, problem.inputs[index].name
-                    );
-
                     let statistic = ks_against_uniform(&mut column, *low, *high);
-                    assert!(
+                    findings.push(Finding::new(
+                        format!(
+                            "{}: coordinate {}",
+                            problem.name, problem.inputs[index].name
+                        ),
                         statistic <= critical,
-                        "{context} is not uniform over {low}..={high} \
-                         (KS {statistic:.4} > {critical:.4} at alpha {alpha:.2e}, \
-                         effective n {effective:.0} of {})",
-                        points.len()
-                    );
+                        format!(
+                            "not uniform over {low}..={high} (KS {statistic:.4} > {critical:.4} \
+                             at alpha {alpha:.2e}, effective n {effective:.0} of {})",
+                            points.len()
+                        ),
+                    ));
                 }
             }
 
             Oracle::MatchesReferenceSampler => {
-                let reference = generate(problem, seed, REFERENCE, wanted).await;
-                assert_same_distribution(
+                let reference = generate(problem, seed, REFERENCE, wanted).await?;
+                findings.extend(same_distribution(
                     &format!("{} vs unbiased rejection sampling", problem.name),
                     seed,
                     sample,
                     &reference,
-                );
+                ));
             }
 
             Oracle::RunsAgree => {
                 // The rival is offset from this replicate's seed rather than
                 // fixed, so ten replicates are ten independent *pairs* — a
                 // fixed rival would hold half of every comparison constant.
-                let rival = generate(problem, seed ^ RIVAL_SEED, PRODUCTION, wanted).await;
-                assert_same_distribution(
+                let rival = generate(problem, seed ^ RIVAL_SEED, PRODUCTION, wanted).await?;
+                findings.extend(same_distribution(
                     &format!("{} across two seeds", problem.name),
                     seed,
                     sample,
                     &rival,
-                );
+                ));
             }
 
             Oracle::DisjointBands(bands) => {
@@ -566,15 +603,16 @@ async fn assert_fair(problem: &Problem, seed: u64, points: &[Point]) {
                         .iter()
                         .filter(|point| (*low..=*high).contains(&point[0]))
                         .count();
-                    assert!(
+                    findings.push(Finding::new(
+                        problem.name,
                         hits > 0,
-                        "{}: found nothing in the band {low}..={high}",
-                        problem.name
-                    );
+                        format!("found nothing in the band {low}..={high}"),
+                    ));
                 }
             }
         }
     }
+    Ok(findings)
 }
 
 /// Every problem, on every seed.
@@ -596,136 +634,98 @@ fn seed_for(replicate: usize) -> u64 {
     SEED ^ (replicate as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-thread_local! {
-    static CAPTURING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Captures a replicate's panic message rather than printing it.
-///
-/// A failing replicate is then reported once, by [`run`]'s summary, instead of
-/// ten times interleaved with backtrace notes.
-///
-/// **The hook delegates unless `CAPTURING` is set**, and that is not a detail:
-/// the first version captured unconditionally, which swallowed `run`'s own
-/// summary panic and left the test failing with no message at all. The flag is
-/// thread-local, so a hook installed once per process stays correct however
-/// many tests share it.
-fn capture_panics() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let inherited = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !CAPTURING.with(Cell::get) {
-                inherited(info);
-            }
-        }));
-    });
-}
-
 /// Runs `problem` on [`REPLICATES`] seeds and requires **all** of them to pass.
 ///
 /// Replicates are independent trials rather than one long run, so a failure
-/// names the seed that produced it and can be reproduced on its own.
-fn run(problem: Problem) {
-    capture_panics();
-
+/// names the seed that produced it and can be reproduced on its own. Every
+/// seed is generated and measured before anything is asserted, so a failing
+/// seed does not hide the ones after it, and the one assertion below lists
+/// each failure on a line of its own.
+async fn run(problem: Problem) -> anyhow::Result<()> {
     let mut failures: Vec<String> = Vec::new();
+    let mut failed_seeds = 0;
     for replicate in 0..REPLICATES {
         let seed = seed_for(replicate);
-        // `attempt` is driven here rather than awaited, so that a failed
-        // assertion inside it unwinds into `catch_unwind` and the remaining
-        // seeds still run. Nothing it awaits depends on an outer executor.
-        CAPTURING.with(|flag| flag.set(true));
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            pollster::block_on(attempt(&problem, seed));
-        }));
-        CAPTURING.with(|flag| flag.set(false));
-        if let Err(payload) = outcome {
-            failures.push(format!("  seed {seed:#018x}: {}", message_of(&payload)));
+        let points = generate(&problem, seed, PRODUCTION, problem.target_sample_size).await?;
+        let mut findings = Vec::new();
+
+        // 1. everything returned is feasible
+        for point in &points {
+            let bindings: Vec<(&str, f64)> = problem
+                .inputs
+                .iter()
+                .map(|v| v.name.as_str())
+                .zip(point.iter().copied())
+                .collect();
+            for constraint in &problem.constraints {
+                let residual = common::eval_one(constraint, &bindings)
+                    .with_context(|| format!("{}: evaluation failed", problem.name))?;
+                findings.push(Finding::new(
+                    problem.name,
+                    residual <= 1e-12,
+                    format!("{point:?} fails {constraint:?} (residual {residual})"),
+                ));
+            }
+        }
+
+        // 2. the requested number of points came back
+        findings.push(Finding::new(
+            problem.name,
+            points.len() == problem.target_sample_size,
+            format!(
+                "generated {} of {} requested",
+                points.len(),
+                problem.target_sample_size
+            ),
+        ));
+
+        // 3. no duplicates — a stalled chain emitting one point over and over
+        //    would sail through the feasibility check otherwise, and stalling
+        //    is the walker's characteristic failure
+        let mut seen: Vec<&Point> = Vec::new();
+        for point in &points {
+            findings.push(Finding::new(
+                problem.name,
+                !seen.contains(&point),
+                format!("duplicate point {point:?}"),
+            ));
+            seen.push(point);
+        }
+
+        // 4. the points are spread the way the region says they should be
+        findings.extend(fairness(&problem, seed, &points).await?);
+
+        let failed: Vec<String> = findings
+            .iter()
+            .filter(|finding| !finding.passed)
+            .map(|finding| {
+                format!(
+                    "  seed {seed:#018x}: {}: {}",
+                    finding.context, finding.detail
+                )
+            })
+            .collect();
+        if !failed.is_empty() {
+            failed_seeds += 1;
+            failures.extend(failed);
         }
     }
 
     assert!(
         failures.is_empty(),
-        "{}: {} of {REPLICATES} seeds failed\n{}",
+        "{}: {failed_seeds} of {REPLICATES} seeds failed\n{}",
         problem.name,
-        failures.len(),
         failures.join("\n")
     );
-}
-
-/// The text an assertion failed with, on one line.
-///
-/// A panic payload is the message itself, where the hook's `info` would also
-/// carry the file and line — and those wrap, which turns a ten-seed summary
-/// into thirty lines. Whitespace runs are collapsed for the same reason: an
-/// assertion message written across several source lines should still read as
-/// one entry in a list.
-fn message_of(payload: &Box<dyn std::any::Any + Send>) -> String {
-    let raw = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("panicked without a message");
-    raw.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-async fn attempt(problem: &Problem, seed: u64) {
-    let points = generate(problem, seed, PRODUCTION, problem.target_sample_size).await;
-
-    // 1. everything returned is feasible
-    for point in &points {
-        let bindings: Vec<(&str, f64)> = problem
-            .inputs
-            .iter()
-            .map(|v| v.name.as_str())
-            .zip(point.iter().copied())
-            .collect();
-        for constraint in &problem.constraints {
-            let residual = common::eval_one(constraint, &bindings)
-                .unwrap_or_else(|e| panic!("{}: evaluation failed: {e}", problem.name));
-            assert!(
-                residual <= 1e-12,
-                "{}: {point:?} fails {:?} (residual {residual})",
-                problem.name,
-                constraint
-            );
-        }
-    }
-
-    // 2. the requested number of points came back
-    assert_eq!(
-        points.len(),
-        problem.target_sample_size,
-        "{}: generated {} of {} requested",
-        problem.name,
-        points.len(),
-        problem.target_sample_size
-    );
-
-    // 3. no duplicates — a stalled chain emitting one point over and over would
-    //    sail through the feasibility check otherwise, and stalling is the
-    //    walker's characteristic failure
-    let mut seen: Vec<&Point> = Vec::new();
-    for point in &points {
-        assert!(
-            !seen.contains(&point),
-            "{}: duplicate point {point:?}",
-            problem.name
-        );
-        seen.push(point);
-    }
-
-    // 4. the points are spread the way the region says they should be
-    assert_fair(problem, seed, &points).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // The problems
 // ---------------------------------------------------------------------------
 
-#[test]
-fn sanity_check() {
+#[pollster::test]
+async fn sanity_check() -> anyhow::Result<()> {
     // Half the box, and the half is a box itself — so the marginal must be
     // uniform on 0..=1, and the reference sampler reaches it easily. The one
     // problem where every oracle applies at once.
@@ -740,11 +740,12 @@ fn sanity_check() {
             Oracle::MatchesReferenceSampler,
             Oracle::RunsAgree,
         ],
-    });
+    })
+    .await
 }
 
-#[test]
-fn braindead_inequalities() {
+#[pollster::test]
+async fn braindead_inequalities() -> anyhow::Result<()> {
     // Five variables in the unit cube under three loose inequalities. The region
     // is a polytope, not a box, so the marginals are not uniform and there is no
     // absolute claim to make — but rejection sampling reaches it comfortably, so
@@ -762,11 +763,12 @@ fn braindead_inequalities() {
         target_sample_size: 5_000,
         seeds: Vec::new(),
         oracles: vec![Oracle::MatchesReferenceSampler],
-    });
+    })
+    .await
 }
 
-#[test]
-fn top_corner_200d() {
+#[pollster::test]
+async fn top_corner_200d() -> anyhow::Result<()> {
     // 200 variables in 10..11, each required above 10.5. The feasible region is
     // 0.5^200 of the box, so rejection sampling cannot reach it and there is no
     // reference to compare against — but the region *is* a box, so the absolute
@@ -788,11 +790,12 @@ fn top_corner_200d() {
         target_sample_size: 200,
         seeds: vec![vec![10.75; 200]],
         oracles: vec![Oracle::UniformMarginals(vec![(10.5, 11.0); 200])],
-    });
+    })
+    .await
 }
 
-#[test]
-fn top_corner_200d_as_equalities() {
+#[pollster::test]
+async fn top_corner_200d_as_equalities() -> anyhow::Result<()> {
     // The same problem written as 200 *equalities* rather than 200 inequalities,
     // which is the shape the surface-then-band split produces by construction
     // and the one nothing else in this file covers.
@@ -830,11 +833,12 @@ fn top_corner_200d_as_equalities() {
         target_sample_size: 200,
         seeds: vec![vec![10.75; 200]],
         oracles: vec![Oracle::UniformMarginals(vec![(10.55, 10.95); 200])],
-    });
+    })
+    .await
 }
 
-#[test]
-fn tough_single_var() {
+#[pollster::test]
+async fn tough_single_var() -> anyhow::Result<()> {
     // The crescent between two phase-shifted sine waves. Narrow, curved, and
     // nowhere near a box — but rejection sampling clears it, so it tests whether
     // the walker follows a curved region honestly rather than cutting corners.
@@ -845,11 +849,12 @@ fn tough_single_var() {
         target_sample_size: 1_000,
         seeds: Vec::new(),
         oracles: vec![Oracle::MatchesReferenceSampler],
-    });
+    })
+    .await
 }
 
-#[test]
-fn p118() {
+#[pollster::test]
+async fn p118() -> anyhow::Result<()> {
     // Hock-Schittkowski 118: fifteen variables, twenty-nine coupled linear
     // inequalities forming a narrow polytope. No closed form and no reachable
     // reference, so agreement between two independently seeded runs is the only
@@ -904,7 +909,8 @@ fn p118() {
             1.0, 45.0, 15.0, 6.0, 39.0, 20.0, 11.0, 35.0, 25.0, 16.0, 40.0, 30.0, 20.0, 46.0, 35.0,
         ]],
         oracles: vec![Oracle::RunsAgree],
-    });
+    })
+    .await
 }
 
 /// Equality with a shrinking tolerance — the series showing where rejection
@@ -914,7 +920,7 @@ fn p118() {
 /// That disjointness is the point. A chain reaches another component only if a
 /// first draw happens to land in it, and that stops happening once the
 /// components are small — which is what separates the walker from the sampler.
-fn parabolic_roots(offset: &str, width: f64, extra: Vec<Oracle>) {
+async fn parabolic_roots(offset: &str, width: f64, extra: Vec<Oracle>) -> anyhow::Result<()> {
     let mut oracles = vec![Oracle::DisjointBands(vec![
         (-2.0 - width, -2.0 + width),
         (1.0 - width, 1.0 + width),
@@ -928,29 +934,30 @@ fn parabolic_roots(offset: &str, width: f64, extra: Vec<Oracle>) {
         target_sample_size: 20_000,
         seeds: vec![vec![-2.0]],
         oracles,
-    });
+    })
+    .await
 }
 
-#[test]
-fn parabolic_roots_wide() {
-    parabolic_roots("1.0", 1.0, vec![Oracle::MatchesReferenceSampler]);
+#[pollster::test]
+async fn parabolic_roots_wide() -> anyhow::Result<()> {
+    parabolic_roots("1.0", 1.0, vec![Oracle::MatchesReferenceSampler]).await
 }
 
-#[test]
-fn parabolic_roots_narrowing() {
-    parabolic_roots("0.1", 0.1, vec![Oracle::MatchesReferenceSampler]);
+#[pollster::test]
+async fn parabolic_roots_narrowing() -> anyhow::Result<()> {
+    parabolic_roots("0.1", 0.1, vec![Oracle::MatchesReferenceSampler]).await
 }
 
-#[test]
-fn parabolic_roots_narrow() {
+#[pollster::test]
+async fn parabolic_roots_narrow() -> anyhow::Result<()> {
     // Unbiased rejection sampling manages only a few hundred points here, too few
     // to compare against, so band coverage is what is left.
-    parabolic_roots("0.001", 0.001, Vec::new());
+    parabolic_roots("0.001", 0.001, Vec::new()).await
 }
 
-#[test]
-fn parabolic_roots_ribbon() {
-    parabolic_roots("0.00001", 0.00001, Vec::new());
+#[pollster::test]
+async fn parabolic_roots_ribbon() -> anyhow::Result<()> {
+    parabolic_roots("0.00001", 0.00001, Vec::new()).await
 }
 
 // ---------------------------------------------------------------------------

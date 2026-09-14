@@ -46,8 +46,6 @@
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
-
 use super::{Cancellation, smtlib};
 use crate::solve::SmtLogic;
 use crate::{ConstraintSystem, Point};
@@ -107,7 +105,7 @@ pub(crate) trait SmtBackend {
     /// The [`Reply`] says what the call spent in those units. `cancel` is the
     /// caller's way of saying "never mind" mid-call, which a backend answers
     /// with [`Outcome::Unknown`].
-    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Reply>;
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Reply;
 }
 
 /// **dReal** — the best theory fit, and the reason this trait exists.
@@ -139,7 +137,7 @@ impl SmtBackend for DRealBackend {
         "dreal"
     }
 
-    fn solve(&self, _document: &str, _limit: u32, _cancel: &Cancellation<'_>) -> Result<Reply> {
+    fn solve(&self, _document: &str, _limit: u32, _cancel: &Cancellation<'_>) -> Reply {
         unimplemented!(
             "dReal backend: spawn {} with --precision {}, write the document to \
              stdin, parse `delta-sat`/`unsat` and the witness box from stdout",
@@ -230,14 +228,16 @@ impl Interruptible {
 /// unanswered for the grace period.
 ///
 /// `None` is "abandoned": the worker is still running and nothing more will
-/// be heard from it. A worker that died is an error rather than a hang.
+/// be heard from it. A worker that died took its answer with it, so its panic
+/// is resumed here on the caller's thread rather than reported as a hang.
 fn await_answer(
-    answers: &mpsc::Receiver<Result<Reply>>,
+    answers: &mpsc::Receiver<Reply>,
+    worker: std::thread::JoinHandle<()>,
     cancel: &Cancellation<'_>,
     interrupt: impl FnOnce(),
     ceiling: Duration,
     grace: Duration,
-) -> Option<Result<Reply>> {
+) -> Option<Reply> {
     const POLL: Duration = Duration::from_millis(10);
 
     let started = Instant::now();
@@ -246,9 +246,10 @@ fn await_answer(
     loop {
         match answers.recv_timeout(POLL) {
             Ok(answer) => return Some(answer),
-            Err(RecvTimeoutError::Disconnected) => {
-                return Some(Err(anyhow!("the Z3 thread died without answering")));
-            }
+            Err(RecvTimeoutError::Disconnected) => match worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => unreachable!("the Z3 thread holds its sender until it has answered"),
+            },
             Err(RecvTimeoutError::Timeout) => {}
         }
         match interrupted_at {
@@ -279,12 +280,12 @@ impl SmtBackend for Z3Backend {
     /// The release channel is what makes the interrupt sound: the worker keeps
     /// its context alive until this function returns, so an interrupt can never
     /// reach a context that a worker finishing at the same moment has freed.
-    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Reply> {
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Reply {
         let (send_context, context) = mpsc::channel();
         let (send_answer, answers) = mpsc::channel();
         let (release, hold) = mpsc::channel::<()>();
         let text = document.to_owned();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("sojourn-z3".to_owned())
             .stack_size(Z3_STACK)
             .spawn(move || {
@@ -294,14 +295,19 @@ impl SmtBackend for Z3Backend {
                 let _ = send_answer.send(solve_on_this_thread(&text, limit));
                 // Errors when the caller has returned, which is the point.
                 let _ = hold.recv();
-            })?;
+            })
+            .expect("the host can spawn a thread for Z3");
         let Ok(handle) = context.recv() else {
-            bail!("the Z3 thread died before it made a context");
+            match worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => unreachable!("the Z3 thread sends its context before anything else"),
+            }
         };
 
         let started = Instant::now();
         let answer = await_answer(
             &answers,
+            worker,
             cancel,
             || handle.interrupt(),
             ceiling(limit),
@@ -317,16 +323,16 @@ impl SmtBackend for Z3Backend {
                 "Z3 ignored the interrupt; its thread is abandoned and keeps running"
             );
             tracing::debug!(document = %document, "the document Z3 would not stop on");
-            Ok(Reply {
+            Reply {
                 outcome: Outcome::Unknown,
                 spent: limit,
-            })
+            }
         })
     }
 }
 
 /// One call to Z3, on the calling thread, with the thread-local context.
-fn solve_on_this_thread(document: &str, limit: u32) -> Result<Reply> {
+fn solve_on_this_thread(document: &str, limit: u32) -> Reply {
     let solver = z3::Solver::new();
     // `rlimit` is Z3's own count of the work it has done, in units of its
     // choosing; it makes the call give up with `unknown` deterministically,
@@ -343,10 +349,11 @@ fn solve_on_this_thread(document: &str, limit: u32) -> Result<Reply> {
     // "solved it". Checking the assertions actually arrived is the only
     // defence available, and it is worth more than it looks.
     if solver.get_assertions().is_empty() {
-        bail!(
-            "Z3 parsed no assertions from a {}-byte document. \
-                 `Solver::from_string` reports a syntax error by silently \
-                 accepting nothing, so treat this as one.",
+        tracing::error!(document = %document, "the document Z3 parsed nothing from");
+        panic!(
+            "Z3 parsed no assertions from a {}-byte document: `Solver::from_string` reports a \
+             syntax error by silently accepting nothing, so this is an emitter bug — the \
+             document is in the trace",
             document.len()
         );
     }
@@ -376,7 +383,8 @@ fn solve_on_this_thread(document: &str, limit: u32) -> Result<Reply> {
         z3::SatResult::Unknown => Outcome::Unknown,
         z3::SatResult::Sat => {
             let Some(model) = solver.get_model() else {
-                bail!("Z3 answered sat but produced no model");
+                tracing::error!(document = %document, "the document Z3 answered sat on without a model");
+                panic!("Z3 answered sat but produced no model; the document is in the trace");
             };
 
             let mut values = Vec::new();
@@ -434,7 +442,7 @@ fn solve_on_this_thread(document: &str, limit: u32) -> Result<Reply> {
             Outcome::Sat(values)
         }
     };
-    Ok(Reply { outcome, spent })
+    Reply { outcome, spent }
 }
 
 /// What a solver had to say about a pool that sampling could not crack, and
@@ -546,7 +554,7 @@ fn ulps(value: f64, count: u32) -> f64 {
 ///
 /// Sampling coming up empty does not prove a region is empty; only a solver can
 /// say that, which is why this is the one path able to produce
-/// [`super::Satisfiability::Unsatisfiable`].
+/// [`Infeasibility::Proved`](crate::Infeasibility::Proved).
 ///
 /// # Errors
 /// Transport and process failures. A solver *concluding* something — including
@@ -556,7 +564,7 @@ pub(crate) fn escalate_for_seed(
     logic: &SmtLogic,
     limit: u32,
     cancel: &Cancellation<'_>,
-) -> Result<Answer> {
+) -> Answer {
     seed_away_from(problem, logic, limit, &[], 0.0, cancel)
 }
 
@@ -575,7 +583,7 @@ pub(crate) fn escalate_for_seed(
 /// away from what is held — which is either "the region is covered" or "`reach`
 /// is too large", and the caller distinguishes them by shrinking `reach` and
 /// asking again. Reporting it as
-/// [`Satisfiability::Unsatisfiable`](super::Satisfiability::Unsatisfiable)
+/// [`Infeasibility::Proved`](crate::Infeasibility::Proved)
 /// would be badly wrong.
 ///
 /// # Errors
@@ -587,7 +595,7 @@ pub(crate) fn seed_away_from(
     avoid: &[Point],
     reach: f64,
     cancel: &Cancellation<'_>,
-) -> Result<Answer> {
+) -> Answer {
     let inputs = problem.variables();
     let written = problem
         .constraints
@@ -596,7 +604,7 @@ pub(crate) fn seed_away_from(
     let document = smtlib::emit_away_from(inputs, written, logic, avoid, reach);
     let unexpressed = document.untranslated;
 
-    let Reply { outcome, spent } = Z3Backend.solve(&document.text, limit, cancel)?;
+    let Reply { outcome, spent } = Z3Backend.solve(&document.text, limit, cancel);
     let verdict = match outcome {
         Outcome::Unsat { blamed } if unexpressed.is_empty() => Verdict::Impossible { blamed },
 
@@ -622,7 +630,7 @@ pub(crate) fn seed_away_from(
             unexpressed,
         },
     };
-    Ok(Answer { verdict, spent })
+    Answer { verdict, spent }
 }
 
 #[cfg(test)]
@@ -719,9 +727,7 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let reply = Z3Backend
-            .solve(&document.text, 30_000, &Cancellation::never())
-            .expect("a parseable document");
+        let reply = Z3Backend.solve(&document.text, 30_000, &Cancellation::never());
         let took = started.elapsed();
         assert_eq!(reply.outcome, Outcome::Unknown, "{reply:?}");
         assert!(
@@ -762,16 +768,13 @@ mod tests {
             0.0,
         );
 
-        let (sender, receiver) =
-            futures_channel::oneshot::channel::<Result<super::super::Opening>>();
+        let (sender, receiver) = futures_channel::oneshot::channel::<super::super::Opening>();
         let timer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             drop(receiver);
         });
         let started = Instant::now();
-        let reply = Z3Backend
-            .solve(&document.text, 0, &Cancellation::watching(&sender))
-            .expect("a parseable document");
+        let reply = Z3Backend.solve(&document.text, 0, &Cancellation::watching(&sender));
         let took = started.elapsed();
         timer.join().expect("the timer thread joins");
 
@@ -789,18 +792,25 @@ mod tests {
     /// crash static teardown after `main` has returned.
     #[test]
     fn an_unanswered_interrupt_is_abandoned_after_the_grace() {
-        let (sender, answers) = mpsc::channel::<Result<Reply>>();
+        let (sender, answers) = mpsc::channel::<Reply>();
+        // A worker that holds its sender and never answers, until released.
+        let (release, hold) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _sender = sender;
+            let _ = hold.recv();
+        });
         let interrupts = std::cell::Cell::new(0_u32);
         let started = Instant::now();
         let answer = await_answer(
             &answers,
+            worker,
             &Cancellation::never(),
             || interrupts.set(interrupts.get() + 1),
             Duration::from_millis(100),
             Duration::from_millis(200),
         );
         let took = started.elapsed();
-        drop(sender);
+        drop(release);
 
         assert!(answer.is_none(), "{answer:?}");
         assert_eq!(interrupts.get(), 1, "the interrupt is sent exactly once");
@@ -810,19 +820,26 @@ mod tests {
         );
     }
 
-    /// A worker that dies is an error, not a hang and not an abandonment.
+    /// A worker that dies is its own panic on the caller's thread, not a hang
+    /// and not an abandonment.
     #[test]
-    fn a_dead_worker_is_an_error_rather_than_a_wait() {
-        let (sender, answers) = mpsc::channel::<Result<Reply>>();
-        drop(sender);
+    #[should_panic(expected = "the worker fell over")]
+    fn a_dead_worker_is_its_panic_rather_than_a_wait() {
+        let (sender, answers) = mpsc::channel::<Reply>();
+        let worker = std::thread::spawn(move || {
+            let _sender = sender;
+            panic!("the worker fell over");
+        });
         let answer = await_answer(
             &answers,
+            worker,
             &Cancellation::never(),
             || panic!("nothing to interrupt"),
             Duration::from_secs(60),
             Duration::from_secs(60),
         );
-        assert!(matches!(answer, Some(Err(_))), "{answer:?}");
+        // Not reached: the disconnected channel resumes the worker's panic.
+        drop(answer);
     }
 
     /// The ceiling is far past honest work and never absent.
@@ -910,15 +927,8 @@ mod tests {
                 "{source:?} is not meant to be beyond the emitter"
             );
 
-            Z3Backend
-                .solve(&document.text, 0, &Cancellation::never())
-                .map(|reply| reply.outcome)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Z3 rejected the document for {source:?}: {e}\n{}",
-                        document.text
-                    )
-                });
+            // The parse guard must not fire on a document the emitter wrote.
+            drop(Z3Backend.solve(&document.text, 0, &Cancellation::never()));
 
             // Z3 stopping partway is not an error, just a shorter document.
             let written = document.text.matches("(assert ").count();
@@ -954,22 +964,17 @@ mod tests {
     fn z3_still_cannot_help_with_transcendentals() {
         let declare = "(declare-const x Real)(declare-const y Real)";
 
-        // Names Z3's parser does not know. An `Err` here is the emitter's
-        // refusal being vindicated rather than a failure.
+        // Names Z3's parser does not know: it takes no assertion from a
+        // document using one, which is the emitter's refusal vindicated.
         for unknown_name in [
             "(> (ln x) 2.0)",
             "(> (log x) 2.0)",
             "(> (exp x) 2.0)",
             "(= (sqrt x) 3.0)",
         ] {
-            assert!(
-                Z3Backend
-                    .solve(
-                        &format!("{declare}(assert {unknown_name})"),
-                        0,
-                        &Cancellation::never()
-                    )
-                    .is_err(),
+            assert_eq!(
+                assertions_taken(&format!("{declare}(assert {unknown_name})")),
+                0,
                 "Z3 has learned {unknown_name} — the emitter could now emit it"
             );
         }
@@ -980,10 +985,7 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 3.0)))(assert (= y (sin x)))(assert (> y 0.99))"
         );
         assert_eq!(
-            Z3Backend
-                .solve(&narrow, 0, &Cancellation::never())
-                .expect("sin parses")
-                .outcome,
+            Z3Backend.solve(&narrow, 0, &Cancellation::never()).outcome,
             Outcome::Unknown,
             "Z3 has learned to decide narrow trigonometry"
         );
@@ -995,10 +997,7 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 100.0)))(assert (= y (^ x 0.5)))(assert (> y 3.0))"
         );
         assert!(matches!(
-            Z3Backend
-                .solve(&root, 0, &Cancellation::never())
-                .expect("^ parses")
-                .outcome,
+            Z3Backend.solve(&root, 0, &Cancellation::never()).outcome,
             Outcome::Sat(_)
         ));
     }
@@ -1013,10 +1012,7 @@ mod tests {
         let document = "(declare-const x Real)
                         (assert (= x (/ 1.0 98765432109876543210987.0)))
 ";
-        let Outcome::Sat(values) = Z3Backend
-            .solve(document, 0, &Cancellation::never())
-            .expect("solves")
-            .outcome
+        let Outcome::Sat(values) = Z3Backend.solve(document, 0, &Cancellation::never()).outcome
         else {
             panic!("a pinned value should be satisfiable");
         };
@@ -1036,13 +1032,11 @@ mod tests {
         // a decimal — asking Z3 about `pi` hands back something symbolic, which
         // used to take the worker thread down with it. Skipping the variable
         // leaves it at its lower bound and lets the pool filter the point.
-        let reply = Z3Backend
-            .solve(
-                "(declare-const x Real)(assert (> x pi))",
-                0,
-                &Cancellation::never(),
-            )
-            .expect("pi parses");
+        let reply = Z3Backend.solve(
+            "(declare-const x Real)(assert (> x pi))",
+            0,
+            &Cancellation::never(),
+        );
         assert!(matches!(reply.outcome, Outcome::Sat(_)));
         assert!(
             reply.spent > 0,
@@ -1051,6 +1045,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "parsed no assertions")]
     fn the_parse_guard_actually_catches_a_bad_document() {
         // The guard above is the whole reason the previous test means anything,
         // so it needs its own proof that it fires.
@@ -1058,13 +1053,11 @@ mod tests {
 (declare-const x Real)
 (assert (this is not smtlib))
 ";
-        assert!(
-            Z3Backend.solve(broken, 0, &Cancellation::never()).is_err(),
-            "a malformed document was accepted"
-        );
+        drop(Z3Backend.solve(broken, 0, &Cancellation::never()));
     }
 
     #[test]
+    #[should_panic(expected = "parsed no assertions")]
     fn a_parse_error_anywhere_loses_the_whole_document() {
         // This decides whether the non-empty guard in `solve` is *sufficient*.
         // The worry was a malformed tail: earlier assertions parse, the solver
@@ -1085,11 +1078,7 @@ mod tests {
             0,
             "Z3 kept some assertions from a document with a syntax error in it"
         );
-        assert!(
-            Z3Backend
-                .solve(truncated, 0, &Cancellation::never())
-                .is_err(),
-            "the guard let a partially-parsed document through"
-        );
+        // And the guard fires on it, which is the `should_panic`.
+        drop(Z3Backend.solve(truncated, 0, &Cancellation::never()));
     }
 }

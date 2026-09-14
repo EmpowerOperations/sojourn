@@ -10,14 +10,12 @@
 //! it. The verdicts say what a search concluded, and whether that was a proof
 //! or a shrug. The engine itself is `cvg`.
 
-use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
-use anyhow::{Result, anyhow};
 use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -29,36 +27,21 @@ use crate::cvg::{CHANNEL_CAPACITY, Ladder, Opening};
 use crate::repair::RepairError;
 use crate::{ConstraintRef, ConstraintSystem, Point};
 
-/// What a search concluded.
-///
-/// Two arms, not three. Z3's `sat`/`unsat`/`unknown` never reaches here: an
-/// `unknown` that still yielded a point is [`Satisfied`](Satisfiability::Satisfied)
-/// like any other, and one that yielded nothing is
-/// [`Unsatisfiable`](Satisfiability::Unsatisfiable) with
-/// [`Infeasibility::NotFound`] saying so. The trichotomy is a property of one
-/// strategy and a caller can do nothing with it.
-///
-/// **`Satisfied` means at least one sample is already in hand.** That invariant
-/// is what makes the two arms sufficient — there is no "probably fine, ask
-/// later" state to represent.
-#[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "produced once per solve and moved once; the region carries its system, and boxing it would cost every caller a deref for a few hundred bytes"
-)]
-pub enum Satisfiability {
-    Satisfied { region: FeasibleRegion },
-    Unsatisfiable { because: Infeasibility },
-}
-
 /// Why no sample was produced — and whether that is a proof or a shrug.
+///
+/// The one way [`solve`](crate::solve) fails to return a region: there is
+/// none to return, or none could be found. Everything else that can go wrong
+/// in a search — a thread that cannot be spawned, a solver that dies, a
+/// document the solver cannot parse — is a bug in this crate or a failure of
+/// the host, and is a panic, raised on the calling thread.
 ///
 /// Kept as two variants rather than a `proved: bool` because they are different
 /// sentences to whoever reads the result. *"Your constraints conflict, here are
 /// the three involved"* sends someone to rewrite a formulation. *"We found
 /// nothing"* sends them to widen a tolerance or wait longer. A flag invites
 /// code that ignores it and says the first when it means the second.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Infeasibility {
     /// A solver proved no point exists, and these are the constraints its proof
     /// used.
@@ -80,7 +63,8 @@ pub enum Infeasibility {
 
 /// The sentence each arm is: a conflict names the constraints in it, and a
 /// shrug says what was tried and, when some constraint was beyond every
-/// solver, which.
+/// solver, which. `Display` by hand because the shrug's second sentence is
+/// conditional; the `Error` impl is derived on it.
 impl std::fmt::Display for Infeasibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let listed = |constraints: &[ConstraintRef]| {
@@ -304,18 +288,14 @@ impl std::fmt::Display for SmtLogic {
 /// needs the problem, and so is checked in [`ConstraintSolver::solve`].
 ///
 /// ```no_run
-/// # use sojourn::{ConstraintSystem, InputVariable, Satisfiability};
+/// # use sojourn::{ConstraintSystem, InputVariable};
 /// # async fn example() -> anyhow::Result<()> {
-/// let system = ConstraintSystem::new(
-///     vec![InputVariable::new("x", -1.0, 1.0)],
-///     vec![sojourn::parse("x > 0")?],
-/// )?;
+/// let system = ConstraintSystem::new(vec![InputVariable::new("x", -1.0, 1.0)], ["x > 0"])?;
 ///
-/// if let Satisfiability::Satisfied { mut region } = system.solve().await? {
-///     // One column per sample, one row per variable — an input matrix as it
-///     // stands, no transpose.
-///     let batch = region.take(1_000);
-/// }
+/// let mut region = sojourn::solve(&system).await?;
+/// // One column per sample, one row per variable — an input matrix as it
+/// // stands, no transpose.
+/// let batch = region.take(1_000);
 /// # Ok(())
 /// # }
 /// ```
@@ -550,9 +530,16 @@ impl ConstraintSolver {
     /// synchronous by design. Recorded in `docs/todo.md`.
     ///
     /// # Errors
-    /// Anything that went wrong, as opposed to anything that was concluded. An
-    /// unsatisfiable problem is a [`Satisfiability`], not an error.
-    pub async fn solve(self, system: &ConstraintSystem) -> Result<Satisfiability> {
+    /// There is no region: the constraints were proved to conflict, or nothing
+    /// could be found and no solver could prove anything — [`Infeasibility`]
+    /// says which and names the constraints involved. Nothing else is an
+    /// error; see [`Infeasibility`] for what is a panic instead.
+    ///
+    /// # Panics
+    /// If the search thread panics, with its panic: the worker's payload is
+    /// resumed here rather than caught, so a bug in the engine is a panic on
+    /// the calling thread like any other.
+    pub async fn solve(self, system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
         // The worker owns a clone and the handle another: the thread needs
         // `'static`, and the handle answers for the region after the search,
         // which is where repair lives. A system is tapes and two small graphs,
@@ -578,9 +565,14 @@ impl ConstraintSolver {
             );
         });
 
-        let verdict = opening
-            .await
-            .map_err(|_| anyhow!("the search thread ended without reporting a verdict"))??;
+        let Ok(verdict) = opening.await else {
+            // The worker dropped its end without reporting, which only a
+            // panic does: join it and raise that panic here, payload intact.
+            match worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => unreachable!("the search thread returned without reporting a verdict"),
+            }
+        };
 
         // Built even for an unsatisfiable problem, which does not keep it: its
         // `Drop` is what joins the worker.
@@ -591,7 +583,6 @@ impl ConstraintSolver {
             worker: Some(worker),
             stop,
             exhausted: false,
-            failure: None,
         };
 
         let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
@@ -601,21 +592,17 @@ impl ConstraintSolver {
                 .collect()
         };
 
-        Ok(match verdict {
+        match verdict {
             // The region is dropped on both unsatisfiable paths, and its `Drop`
             // is what joins the worker.
-            Opening::Satisfied => Satisfiability::Satisfied { region },
-            Opening::Impossible { blamed } => Satisfiability::Unsatisfiable {
-                because: Infeasibility::Proved {
-                    blamed: name_all(blamed),
-                },
-            },
-            Opening::Unproven { unexpressed } => Satisfiability::Unsatisfiable {
-                because: Infeasibility::NotFound {
-                    unexpressed: name_all(unexpressed),
-                },
-            },
-        })
+            Opening::Satisfied => Ok(region),
+            Opening::Impossible { blamed } => Err(Infeasibility::Proved {
+                blamed: name_all(blamed),
+            }),
+            Opening::Unproven { unexpressed } => Err(Infeasibility::NotFound {
+                unexpressed: name_all(unexpressed),
+            }),
+        }
     }
 }
 
@@ -625,13 +612,11 @@ pub enum Status {
     /// Still producing, or at least still trying.
     Filling,
     /// The worker finished. There will be no more points, ever.
-    Exhausted,
-    /// The worker panicked, and this is what with.
     ///
-    /// Separate from [`Status::Exhausted`] on purpose: "no more points exist"
-    /// and "we broke" are different facts, and folding the second into the first
-    /// would hide a defect behind a legitimate-looking state.
-    Failed(String),
+    /// Only ever a legitimate end: a worker that *panicked* is not exhausted,
+    /// its panic is resumed on the caller's thread by the `take` that finds
+    /// it, so "no more points exist" and "we broke" can never be confused.
+    Exhausted,
 }
 
 /// A solved region: the system a search found feasible points in, being
@@ -656,7 +641,6 @@ pub struct FeasibleRegion {
     /// Set once the channel disconnects. The worker is gone and no amount of
     /// waiting will produce more.
     exhausted: bool,
-    failure: Option<String>,
 }
 
 impl std::fmt::Debug for FeasibleRegion {
@@ -737,14 +721,15 @@ impl FeasibleRegion {
     /// a spin; making this `async` honestly means an async-aware channel, which
     /// is a change to the worker and not to this signature. Use
     /// [`try_take`](Self::try_take) from a context that must not block.
+    ///
+    /// # Panics
+    /// With the worker's panic, if it panicked: a bug in the engine is raised
+    /// here, on the caller's thread, rather than reported as an end.
     pub fn take(&mut self, count: usize) -> Mat<f64> {
         while self.buffer.len() < count && !self.exhausted {
             match self.batches.recv() {
                 Ok(batch) => self.buffer.extend(batch),
-                Err(_) => {
-                    self.exhausted = true;
-                    self.failure = self.worker.take().and_then(reap);
-                }
+                Err(_) => self.exhausted = self.worker_finished(),
             }
         }
         self.drain(count)
@@ -754,19 +739,32 @@ impl FeasibleRegion {
     ///
     /// Named `try_take` and not `poll`: `poll` is the async primitive, and a
     /// method by that name on a type callers `await` around would read as one.
+    ///
+    /// # Panics
+    /// As [`take`](Self::take).
     pub fn try_take(&mut self, count: usize) -> Mat<f64> {
         while self.buffer.len() < count {
             match self.batches.try_recv() {
                 Ok(batch) => self.buffer.extend(batch),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.exhausted = true;
-                    self.failure = self.worker.take().and_then(reap);
+                    self.exhausted = self.worker_finished();
                     break;
                 }
             }
         }
         self.drain(count)
+    }
+
+    /// Joins the worker once its channel has closed: `true` when it ended, a
+    /// resumed panic when it panicked. Idempotent, since the handle is taken.
+    fn worker_finished(&mut self) -> bool {
+        if let Some(handle) = self.worker.take()
+            && let Err(payload) = handle.join()
+        {
+            std::panic::resume_unwind(payload);
+        }
+        true
     }
 
     /// How many samples can be had right now without waiting.
@@ -801,11 +799,11 @@ impl FeasibleRegion {
     }
 
     #[must_use]
-    pub fn status(&self) -> Status {
-        match (&self.failure, self.exhausted) {
-            (Some(panic), _) => Status::Failed(panic.clone()),
-            (None, true) => Status::Exhausted,
-            (None, false) => Status::Filling,
+    pub const fn status(&self) -> Status {
+        if self.exhausted {
+            Status::Exhausted
+        } else {
+            Status::Filling
         }
     }
 }
@@ -826,22 +824,6 @@ impl Drop for FeasibleRegion {
             drop(handle.join());
         }
     }
-}
-
-/// Collects a finished worker, describing a panic if it left one.
-///
-/// Takes the handle by value so that the caller does the storing — the failure
-/// travels back as a return value rather than being written to a field from in
-/// here.
-fn reap(handle: JoinHandle<()>) -> Option<String> {
-    let payload: Box<dyn Any> = handle.join().err()?;
-    Some(
-        payload
-            .downcast_ref::<&str>()
-            .map(|text| (*text).to_owned())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "worker panicked".to_owned()),
-    )
 }
 
 #[cfg(test)]

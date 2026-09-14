@@ -7,9 +7,7 @@
 
 mod common;
 
-use sojourn::{
-    ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, Status, Strategy,
-};
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Status, Strategy};
 
 /// Artemis, 2026-09-11. `x1 == x2 + 1 +/- 0.01` over `[-32.768, 32.768]^20`:
 /// a 0.02-wide slab in a 65.5-wide box, one driven variable, the rest free.
@@ -24,7 +22,6 @@ use sojourn::{
 /// no route now: every batch is sampled first and walked for the rest.
 mod a_lucky_probe_must_not_strand_the_sampling_route {
     use super::*;
-    use anyhow::anyhow;
 
     const DIM: usize = 20;
     const HALF_WIDTH: f64 = 32.768;
@@ -38,38 +35,39 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
         Ok(ConstraintSystem::new(inputs, [SLAB])?)
     }
 
-    async fn points_from(seed: u64) -> anyhow::Result<(usize, Status)> {
-        let verdict = ConstraintSolver::new()
-            .with_seed(seed)
-            .solve(&system()?)
-            .await?;
-        let mut region = match verdict {
-            Satisfiability::Satisfied { region } => region,
-            Satisfiability::Unsatisfiable { because } => {
-                return Err(anyhow!("seed {seed}: unsatisfiable: {because}"));
-            }
-        };
-        let got = region.take(WANTED).ncols();
-        Ok((got, region.status()))
-    }
-
     #[pollster::test]
     async fn seed_2_streams_the_whole_request() -> anyhow::Result<()> {
-        let (got, status) = points_from(2).await?;
+        let mut region = ConstraintSolver::new()
+            .with_seed(2)
+            .solve(&system()?)
+            .await?;
+        let got = region.take(WANTED).ncols();
+
         assert_eq!(
-            got, WANTED,
-            "seed 2 delivered {got} of {WANTED} and ended in {status:?}; a connected slab \
-             with points in hand should never exhaust"
+            got,
+            WANTED,
+            "seed 2 delivered {got} of {WANTED} and ended in {:?}; a connected slab \
+             with points in hand should never exhaust",
+            region.status()
         );
-        assert_eq!(status, Status::Filling);
+        assert_eq!(region.status(), Status::Filling);
         Ok(())
     }
 
     #[pollster::test]
     async fn every_other_seed_streams_the_same_slab() -> anyhow::Result<()> {
         for seed in (0..10u64).filter(|s| *s != 2) {
-            let (got, status) = points_from(seed).await?;
-            assert_eq!(got, WANTED, "seed {seed} ended early in {status:?}");
+            let mut region = ConstraintSolver::new()
+                .with_seed(seed)
+                .solve(&system()?)
+                .await?;
+            let got = region.take(WANTED).ncols();
+            assert_eq!(
+                got,
+                WANTED,
+                "seed {seed} ended early in {:?}",
+                region.status()
+            );
         }
         Ok(())
     }
@@ -152,15 +150,13 @@ mod repair_lands_too_close_at_a_vertex {
         match ConstraintSolver::new()
             .with_seed(0x50_50_1E_5E_ED)
             .solve(&system()?)
-            .await?
+            .await
         {
-            Satisfiability::Satisfied { mut region } => {
+            Ok(mut region) => {
                 let anchors = region.take(256);
                 Ok((region, anchors))
             }
-            Satisfiability::Unsatisfiable { because } => {
-                Err(anyhow!("the spring is unsatisfiable: {because}"))
-            }
+            Err(error) => Err(anyhow!("the spring should be satisfiable: {error}")),
         }
     }
 
@@ -258,12 +254,20 @@ mod repair_lands_too_close_at_a_vertex {
 mod census_does_not_return_on_the_20_segment_beam {
     use super::*;
     use crate::common::stepped_beam;
-    use anyhow::anyhow;
 
-    /// How many of `count` points the census hands back for the `n`-segment
-    /// beam, at the default solver limit — the one Artemis ran. No wall clock
-    /// of its own: nextest's slow-timeout is the bound that turns a census
-    /// that does not return into a failure with a name.
+    #[pollster::test]
+    async fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
+        let mut region = ConstraintSolver::new()
+            .with_seed(0)
+            .solve(&stepped_beam(5)?)
+            .await?;
+        assert_eq!(region.take(256).ncols(), 256);
+        Ok(())
+    }
+
+    /// At the default solver limit — the one Artemis ran. No wall clock of
+    /// its own: nextest's slow-timeout is the bound that turns a census that
+    /// does not return into a failure with a name.
     ///
     /// The regression is pinned at `n = 10`, where it reproduced — the census
     /// did not return within that bound before the coverage budget existed,
@@ -272,32 +276,13 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// the budget affords spends its 3,000,000 units in about 110 s and the
     /// walker's 256 points take another 30, for 137 s measured on 2026-09-12.
     /// A test that needs its own timeout is a test at the wrong size.
-    async fn census(n: usize, count: usize) -> anyhow::Result<usize> {
-        let verdict = ConstraintSolver::new()
-            .with_seed(0)
-            .solve(&stepped_beam(n)?)
-            .await?;
-        match verdict {
-            Satisfiability::Satisfied { mut region } => Ok(region.take(count).ncols()),
-            Satisfiability::Unsatisfiable { because } => {
-                Err(anyhow!("n={n}: the beam is not empty, yet: {because}"))
-            }
-        }
-    }
-
-    #[pollster::test]
-    async fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
-        assert_eq!(census(5, 256).await?, 256);
-        Ok(())
-    }
-
     #[pollster::test]
     async fn the_10_segment_beam_census_returns() -> anyhow::Result<()> {
-        assert_eq!(
-            census(10, 256).await?,
-            256,
-            "the region is not empty (b = 5, h = 100 is feasible)"
-        );
+        let mut region = ConstraintSolver::new()
+            .with_seed(0)
+            .solve(&stepped_beam(10)?)
+            .await?;
+        assert_eq!(region.take(256).ncols(), 256);
         Ok(())
     }
 
@@ -323,9 +308,9 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// 95 s before the first one, so this test asks for the opening alone.
     #[pollster::test]
     async fn the_100_segment_beam_opens_by_local_solve() -> anyhow::Result<()> {
-        let verdict = without_the_solver().solve(&stepped_beam(100)?).await?;
+        let verdict = without_the_solver().solve(&stepped_beam(100)?).await;
         assert!(
-            matches!(verdict, Satisfiability::Satisfied { .. }),
+            verdict.is_ok(),
             "the beam is not empty (b = 5, h = 100 is feasible), yet: {verdict:?}"
         );
         Ok(())
@@ -335,10 +320,7 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// then 256 walked points — about 35 s at thirty segments.
     #[pollster::test]
     async fn the_30_segment_beam_census_returns_from_a_local_seed() -> anyhow::Result<()> {
-        let verdict = without_the_solver().solve(&stepped_beam(30)?).await?;
-        let Satisfiability::Satisfied { mut region } = verdict else {
-            return Err(anyhow!("the beam is not empty, yet: {verdict:?}"));
-        };
+        let mut region = without_the_solver().solve(&stepped_beam(30)?).await?;
         assert_eq!(region.take(256).ncols(), 256);
         Ok(())
     }

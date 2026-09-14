@@ -61,24 +61,23 @@ pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     sojourn::DEFAULT_PROPOSAL_BUDGET
 };
 
-/// The GPU's brute-force budget a pool test runs with: a hundred million
-/// under debug — a tenth of a second on an iGPU, and the marshalling around
-/// each dispatch is what a debug build is slow at — and the default in
-/// release.
-#[cfg(feature = "gpu")]
-pub const GPU_PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
-    100_000_000
-} else {
-    sojourn::DEFAULT_GPU_PROPOSAL_BUDGET
-};
-
-/// A solver with the test-sized budgets applied. Every pool test that does
-/// not exist to measure the defaults starts from this.
-pub fn solver() -> sojourn::ConstraintSolver {
-    let solver = sojourn::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
-    #[cfg(feature = "gpu")]
-    let solver = solver.with_gpu_proposal_budget(GPU_PROPOSAL_BUDGET);
-    solver
+/// Which instruction set the crate's tile kernels run on here, and how many
+/// `f64` lanes that is: `("pulp::x86::v3::V3", 4)` on an AVX2 machine,
+/// `("pulp::Scalar", 1)` without one. For the ledgers' host file.
+///
+/// Asked of `pulp` directly rather than of the crate: the crate dispatches
+/// through the same `Arch::new()` and gets the same answer, and a test-only
+/// probe is not something the crate should export.
+fn simd_isa() -> (&'static str, usize) {
+    struct Probe;
+    impl pulp::WithSimd for Probe {
+        type Output = (&'static str, usize);
+        #[inline(always)]
+        fn with_simd<S: pulp::Simd>(self, _: S) -> Self::Output {
+            (std::any::type_name::<S>(), S::F64_LANES)
+        }
+    }
+    pulp::Arch::new().dispatch(Probe)
 }
 
 /// Evaluations between clock reads. Amortises `Instant::now`, which is not free
@@ -251,7 +250,7 @@ pub fn describe_host() -> bool {
             |v| v.trim().trim_start_matches("rustc ").to_owned(),
         );
 
-    let (isa, lanes) = sojourn::simd_isa();
+    let (isa, lanes) = simd_isa();
     #[cfg(feature = "gpu")]
     let gpu = sojourn::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
     #[cfg(not(feature = "gpu"))]

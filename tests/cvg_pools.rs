@@ -30,15 +30,21 @@ use faer::Mat;
 
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::{ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status};
+use sojourn::{ConstraintSolver, ConstraintSystem, Infeasibility, InputVariable, Status};
 
-/// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
-///
-/// Fixtures are written by hand and their variables always match their
-/// constraints; a mismatch is a typo in the test, not a case under test.
-fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> ConstraintSystem {
-    ConstraintSystem::new(variables, constraints.iter().copied())
-        .expect("a fixture's constraints should bind to its own box")
+/// A fixture's [`ConstraintSystem`]; one that does not bind is the test's error.
+fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> anyhow::Result<ConstraintSystem> {
+    Ok(ConstraintSystem::new(
+        variables,
+        constraints.iter().copied(),
+    )?)
+}
+
+fn variables(specs: &[(&str, f64, f64)]) -> Vec<InputVariable> {
+    specs
+        .iter()
+        .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
+        .collect()
 }
 
 /// A sample matrix back as one `Vec<f64>` per point.
@@ -64,39 +70,19 @@ const SEED: u64 = 0x50_50_1E_5E_ED;
 
 const REQUESTED: usize = 10;
 
-/// Ask for ten points; require ten, all feasible.
-async fn assert_generates(variables: &[(&str, f64, f64)], sources: &[&str]) {
-    let inputs: Vec<InputVariable> = variables
-        .iter()
-        .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
-        .collect();
-
-    let solution = common::solver()
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(inputs.clone(), sources))
-        .await
-        .expect("solving should not fail");
-
-    let mut pool = match solution {
-        Satisfiability::Satisfied { region: samples } => samples,
-        Satisfiability::Unsatisfiable { because } => {
-            panic!("reported unsatisfiable: {because:?}")
-        }
-    };
-
-    let points = columns(&pool.take(REQUESTED));
-
+/// The oracle the corpus tests share: ten points came back, every one inside
+/// the box, every one satisfying every source — re-checked independently of
+/// the pool, which filters its own output, and a test that trusts the thing
+/// it is testing is not a test.
+fn assert_ten_feasible(system: &ConstraintSystem, sources: &[&str], points: &[Vec<f64>]) {
     assert_eq!(
         points.len(),
         REQUESTED,
         "wanted {REQUESTED} points, got {}",
         points.len()
     );
-
-    // Re-check independently of the pool: it filters its own output, and a test
-    // that trusts the thing it is testing is not a test.
-    for point in &points {
-        for (variable, value) in inputs.iter().zip(point) {
+    for point in points {
+        for (variable, value) in system.variables().iter().zip(point) {
             assert!(
                 variable.contains(*value),
                 "{} = {value} is outside {}..={}",
@@ -105,7 +91,8 @@ async fn assert_generates(variables: &[(&str, f64, f64)], sources: &[&str]) {
                 variable.upper_bound
             );
         }
-        let bindings: Vec<(&str, f64)> = inputs
+        let bindings: Vec<(&str, f64)> = system
+            .variables()
             .iter()
             .map(|v| v.name.as_str())
             .zip(point.iter().copied())
@@ -150,22 +137,21 @@ async fn assert_generates(variables: &[(&str, f64, f64)], sources: &[&str]) {
 /// because the region has no closed form and rejection sampling cannot reach it
 /// to serve as a reference.
 #[pollster::test]
-async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so() {
+async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
+-> anyhow::Result<()> {
     let source = "y == sin(x) +/- 0.000001";
     let inputs = vec![
         InputVariable::new("x", -1.0, 1.0),
         InputVariable::new("y", -1.0, 1.0),
     ];
 
-    let solution = common::solver()
+    let mut pool = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(inputs.clone(), &[source]))
+        .solve(&system(inputs.clone(), &[source])?)
         .await
         .expect("solving should not fail");
-
-    let Satisfiability::Satisfied { region: mut pool } = solution else {
-        panic!("a sine band is reachable by walking, so this should be satisfiable");
-    };
 
     // The points are real. Checked here rather than trusted, because the pool
     // filtering its own output is the thing under test: the emitter never put
@@ -178,6 +164,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
         let residual = common::eval_one(source, &bindings).expect("evaluation should not fail");
         assert!(residual <= 0.0, "{point:?} does not satisfy {source:?}");
     }
+    Ok(())
 }
 
 // ------------------------------------------------ the background worker
@@ -195,22 +182,24 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 /// express — so the solver cannot rule the region out and the pool is left
 /// genuinely searching for something that is not there.
 #[pollster::test]
-async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() {
-    let solution = common::solver()
+async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() -> anyhow::Result<()>
+{
+    let verdict = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system(
             vec![InputVariable::new("x1", 0.0, 10.0)],
             &["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"],
-        ))
-        .await
-        .expect("solving should not fail");
+        )?)
+        .await;
 
-    let mut pool = match solution {
-        Satisfiability::Satisfied { region: samples } => samples,
-        Satisfiability::Unsatisfiable { because } => {
-            // Also a fine answer, and it would mean the emitter grew `%`.
+    let mut pool = match verdict {
+        Ok(region) => region,
+        // Also a fine answer, and it would mean the emitter grew `%`.
+        Err(because) => {
             assert!(matches!(because, Infeasibility::Proved { ref blamed } if !blamed.is_empty()));
-            return;
+            return Ok(());
         }
     };
 
@@ -226,6 +215,7 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
         Status::Exhausted,
         "the pool is still calling itself busy"
     );
+    Ok(())
 }
 
 /// Dropping a pool has to join its worker, and the join has to not deadlock.
@@ -238,8 +228,10 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
 /// on a loaded CI box, and the timeout in `.config/nextest.toml` already turns a
 /// genuine hang into a legible failure.
 #[pollster::test]
-async fn dropping_a_pool_mid_fill_does_not_deadlock() {
-    let solution = common::solver()
+async fn dropping_a_pool_mid_fill_does_not_deadlock() -> anyhow::Result<()> {
+    let mut pool = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system(
             vec![
@@ -247,19 +239,16 @@ async fn dropping_a_pool_mid_fill_does_not_deadlock() {
                 InputVariable::new("x2", 0.0, 10.0),
             ],
             &["x1 < x2"],
-        ))
+        )?)
         .await
         .expect("solving should not fail");
-
-    let Satisfiability::Satisfied { region: mut pool } = solution else {
-        panic!("a wide-open region should be satisfiable");
-    };
 
     // Take one batch's worth and leave the worker mid-stride, most likely parked
     // against a full channel, which is the case that deadlocks if `Drop` waits
     // without draining.
     assert!(!columns(&pool.take(1)).is_empty());
     drop(pool);
+    Ok(())
 }
 
 /// Points arrive in the same order however the worker happened to be scheduled.
@@ -269,10 +258,12 @@ async fn dropping_a_pool_mid_fill_does_not_deadlock() {
 /// *sequence* does not. If this ever fails, every seeded expectation in the
 /// suite is resting on luck.
 #[pollster::test]
-async fn the_same_seed_delivers_the_same_points() {
+async fn the_same_seed_delivers_the_same_points() -> anyhow::Result<()> {
     let mut runs = Vec::new();
     for _ in 0..2 {
-        let solution = common::solver()
+        let mut pool = ConstraintSolver::new()
+            .with_proposal_budget(common::PROPOSAL_BUDGET)
+            .with_gpu(false)
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .solve(&system(
                 vec![
@@ -280,38 +271,36 @@ async fn the_same_seed_delivers_the_same_points() {
                     InputVariable::new("x2", 0.0, 10.0),
                 ],
                 &["x1 < x2"],
-            ))
+            )?)
             .await
             .expect("solving should not fail");
-
-        let Satisfiability::Satisfied { region: mut pool } = solution else {
-            panic!("a wide-open region should be satisfiable");
-        };
         runs.push(columns(&pool.take(500)));
     }
 
     assert_eq!(runs[0].len(), 500);
     assert_eq!(runs[0], runs[1], "the same seed produced different points");
+    Ok(())
 }
 
 // ------------------------------------------- only a solver can say this
 
 #[pollster::test]
-async fn contradictory_constraints_are_reported_as_unsatisfiable() {
+async fn contradictory_constraints_are_reported_as_unsatisfiable() -> anyhow::Result<()> {
     // `x > 8` and `x < 2` cannot both hold. Sampling cannot tell that apart from
     // "I did not find one" — it looks identical from the outside — so this is
     // the one path in the whole crate that can produce `Unsatisfiable`, and it
     // exists only because a solver is wired up.
-    let solution = common::solver()
+    let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             &["x > 8", "x < 2"],
-        ))
-        .await
-        .expect("solving should not fail");
+        )?)
+        .await;
 
-    let Satisfiability::Unsatisfiable { because } = solution else {
+    let Err(because) = solution else {
         panic!("expected Unsatisfiable, got {solution:?}");
     };
 
@@ -324,101 +313,234 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() {
     let mut sources: Vec<&str> = blamed.iter().map(|c| c.source.as_str()).collect();
     sources.sort_unstable();
     assert_eq!(sources, vec!["x < 2", "x > 8"]);
+    Ok(())
+}
+
+/// The mistake a user actually makes: three constraints that describe a
+/// region, and a fourth with its comparison backwards. Each holds on its own
+/// and the four together hold nothing, which sampling cannot distinguish from
+/// bad luck and a local solve cannot distinguish from a bad start. What a
+/// user needs back is the *set* that conflicts, so they know which line to
+/// look at — which is the unsat core, and the one thing only a solver gives.
+/// Measured 2026-09-13: Z3 blames exactly `x1 < 3`, `x2 > 5`, `x1 > x2`, and
+/// the message reads "no point satisfies these constraints together:
+/// `x1 < 3`, `x2 > 5`, `x1 > x2`". This is the test the question "does Z3
+/// earn its build" is answered against; see `docs/todo.md`.
+#[pollster::test]
+async fn a_backwards_comparison_is_blamed_together_with_what_it_contradicts() -> anyhow::Result<()>
+{
+    let system = system(
+        vec![
+            InputVariable::new("x1", 0.0, 10.0),
+            InputVariable::new("x2", 0.0, 10.0),
+        ],
+        &[
+            "x1 < 3",
+            "x2 > 5",
+            "x1 + x2 < 20",
+            // Meant `x1 < x2`, and every one of the three above agrees with
+            // that; this one contradicts the first two.
+            "x1 > x2",
+        ],
+    )?;
+    let verdict = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await;
+
+    let Err(because) = verdict else {
+        panic!("expected Unsatisfiable, got {verdict:?}");
+    };
+    let Infeasibility::Proved { blamed } = &because else {
+        panic!("a linear contradiction should be proved, not merely unfound: {because}");
+    };
+
+    let sources: Vec<&str> = blamed.iter().map(|c| c.source.as_str()).collect();
+    assert!(
+        sources.contains(&"x1 > x2"),
+        "the backwards comparison should be in the blame: {sources:?}"
+    );
+    assert!(
+        !sources.contains(&"x1 + x2 < 20"),
+        "a constraint that takes no part in the contradiction should not be blamed: {sources:?}"
+    );
+    // What the user reads.
+    assert_eq!(
+        because.to_string(),
+        format!(
+            "no point satisfies these constraints together: {}",
+            sources
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    );
+    Ok(())
 }
 
 #[pollster::test]
-async fn a_satisfiable_problem_is_not_blamed_on_anything() {
+async fn a_satisfiable_problem_is_not_blamed_on_anything() -> anyhow::Result<()> {
     // The other half of the above: the machinery has to stay quiet when there is
     // nothing wrong, or an `Unsatisfiable` means nothing.
-    let solution = common::solver()
+    let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             &["x > 8", "x < 9"],
-        ))
-        .await
-        .expect("solving should not fail");
-    assert!(
-        matches!(solution, Satisfiability::Satisfied { .. }),
-        "got {solution:?}"
-    );
+        )?)
+        .await;
+    assert!(solution.is_ok(), "got {solution:?}");
+    Ok(())
 }
 
 // ------------------------------------------------- samplable: inequalities
 
 #[pollster::test]
-async fn power_with_variable_as_exponent() {
+async fn power_with_variable_as_exponent() -> anyhow::Result<()> {
     // 2^x5 < 20 means x5 < log2(20) ~ 4.32, so ~43% of the range.
     // The JVM comment reads "nope, Z3 wont reason about real-exponents" —
     // rejection sampling has no such trouble.
-    assert_generates(&[("x5", 0.0, 10.0)], &["20 > 2^x5"]).await;
+    let sources = &["20 > 2^x5"];
+    let system = system(variables(&[("x5", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn a_deeply_transcendental_constraint() {
+async fn a_deeply_transcendental_constraint() -> anyhow::Result<()> {
     // `x1 > sin(ln(cos(2.1^x1)))`. Feasible for x1 below about 0.61, where
     // cos(2.1^x1) is still positive. The JVM name for this was "should simply
     // drop provided expression" — it could not transcode it at all.
-    assert_generates(
-        &[("x1", 0.0, 1.0), ("x2", 0.0, 1.0)],
-        &["x1 > sin(ln(cos(2.1^x1)))"],
-    )
-    .await;
+    let sources = &["x1 > sin(ln(cos(2.1^x1)))"];
+    let system = system(variables(&[("x1", 0.0, 1.0), ("x2", 0.0, 1.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn sine_over_multiple_periods() {
+async fn sine_over_multiple_periods() -> anyhow::Result<()> {
     // Ported with its assertion *inverted*. The JVM version asserted the
     // infeasible results were `isNotEmpty()`, pinning the fact that its
     // Taylor-series `sin` produced points that did not satisfy the constraint.
     // A correct pool returns feasible points.
-    assert_generates(
-        &[
+    let sources = &["y > sin(theta)"];
+    let system = system(
+        variables(&[
             ("theta", std::f64::consts::PI, std::f64::consts::PI * 3.0),
             ("y", -1.0, 1.0),
-        ],
-        &["y > sin(theta)"],
-    )
-    .await;
+        ]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn a_simple_inequality() {
+async fn a_simple_inequality() -> anyhow::Result<()> {
     // Ours, not the fixture's: the simplest possible two-variable constraint,
     // here so that a failure everywhere else has something trivial to be
     // contrasted against.
-    assert_generates(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)], &["x1 < x2"]).await;
+    let sources = &["x1 < x2"];
+    let system = system(variables(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn logarithms() {
+async fn logarithms() -> anyhow::Result<()> {
     // `2 < ln(x1)` is `x1 > e^2`, about 26% of the range. The JVM case has two
     // further constraints commented out — `x4 == log(4) +/- 0.0001` and
     // `x6 > log(2.0, x5)` — so those are left out here too rather than invented.
     // `x2` is declared and unused, exactly as over there: a schema may be wider
     // than the constraints that reference it.
-    assert_generates(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)], &["2 < ln(x1)"]).await;
+    let sources = &["2 < ln(x1)"];
+    let system = system(variables(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn modulo_with_a_symbolic_divisor() {
+async fn modulo_with_a_symbolic_divisor() -> anyhow::Result<()> {
     // `10 % x1` where the divisor is the variable. Note `x1 = 0` gives NaN, and
     // a NaN residual is not a pass — so this also pins that the pool rejects
     // rather than propagates it.
-    assert_generates(&[("x1", 0.0, 10.0)], &["3 > 10 % x1"]).await;
+    let sources = &["3 > 10 % x1"];
+    let system = system(variables(&[("x1", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn equality_with_a_loose_tolerance() {
+async fn equality_with_a_loose_tolerance() -> anyhow::Result<()> {
     // The tolerance is what decides whether an equality is samplable. At
     // `+/- 0.1` on a 2x2 square the band is about 9.75% of the area, so this
     // goes green while every other equality case in this file does not — the
     // difference is measure, not kind.
-    assert_generates(
-        &[("x1", -1.0, 1.0), ("x2", -1.0, 1.0)],
-        &["x1 == x2 +/- 0.1"],
-    )
-    .await;
+    let sources = &["x1 == x2 +/- 0.1"];
+    let system = system(variables(&[("x1", -1.0, 1.0), ("x2", -1.0, 1.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[expect(
@@ -428,140 +550,232 @@ async fn equality_with_a_loose_tolerance() {
          where sin(3.14) is 0.0016 and sin(pi) is zero"
 )]
 #[pollster::test]
-async fn sine_below_zero() {
+async fn sine_below_zero() -> anyhow::Result<()> {
     // Half the range of x1. `y` is unused by the constraint.
-    assert_generates(&[("x1", -3.14, 3.14), ("y", 0.9, 1.0)], &["sin(x1) <= 0"]).await;
+    let sources = &["sin(x1) <= 0"];
+    let system = system(variables(&[("x1", -3.14, 3.14), ("y", 0.9, 1.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 // ------------------------------ needs a solver: equality with tolerance
 
 #[pollster::test]
-async fn simple_arithmetic() {
-    assert_generates(
-        &[
+async fn simple_arithmetic() -> anyhow::Result<()> {
+    // Was `x2 == x1 + 1/2*x2 - x3/x4`, which is the same set written
+    // circularly and is now refused at construction — see
+    // `SystemError::Cyclic`. Rearranged rather than dropped, so the
+    // fixture still exercises what it was ported for.
+    let sources = &["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.00001"];
+    let system = system(
+        variables(&[
             ("x1", 0.0, 1.0),
             ("x2", 0.0, 1.0),
             ("x3", 0.0, 1.0),
             ("x4", 0.0, 1.0),
-        ],
-        // Was `x2 == x1 + 1/2*x2 - x3/x4`, which is the same set written
-        // circularly and is now refused at construction — see
-        // `SystemError::Cyclic`. Rearranged rather than dropped, so the
-        // fixture still exercises what it was ported for.
-        &["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.00001"],
-    )
-    .await;
+        ]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn roots() {
-    assert_generates(
-        &[
+async fn roots() -> anyhow::Result<()> {
+    let sources = &["x1 == sqrt(x2) +/- 0.0001", "x3 == cbrt(x4) +/- 0.0001"];
+    let system = system(
+        variables(&[
             ("x1", 0.0, 10.0),
             ("x2", 0.0, 10.0),
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
-        ],
-        &["x1 == sqrt(x2) +/- 0.0001", "x3 == cbrt(x4) +/- 0.0001"],
-    )
-    .await;
+        ]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn power() {
-    assert_generates(
-        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &["x1 == x2^3 +/- 0.0001"],
-    )
-    .await;
+async fn power() -> anyhow::Result<()> {
+    let sources = &["x1 == x2^3 +/- 0.0001"];
+    let system = system(variables(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn absolute_value() {
+async fn absolute_value() -> anyhow::Result<()> {
     // Three variables, each pinned to a magnitude from a different side of zero:
     // x1 from the positive range, x2 from the negative, x3 from a range that
     // excludes the answer's sign entirely. Bands of a thousandth in ranges of
     // one, so about two parts in a billion once combined.
-    assert_generates(
-        &[("x1", 0.0, 1.0), ("x2", -1.0, 0.0), ("x3", -2.0, -1.0)],
-        &[
-            "abs(x1) == 1 +/- 0.001",
-            "abs(x2) == 1 +/- 0.001",
-            "abs(x3) == 1.5 +/- 0.001",
-        ],
-    )
-    .await;
+    let sources = &[
+        "abs(x1) == 1 +/- 0.001",
+        "abs(x2) == 1 +/- 0.001",
+        "abs(x3) == 1.5 +/- 0.001",
+    ];
+    let system = system(
+        variables(&[("x1", 0.0, 1.0), ("x2", -1.0, 0.0), ("x3", -2.0, -1.0)]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn modulo() {
+async fn modulo() -> anyhow::Result<()> {
     // Two constraints of different shapes, as the JVM case had them.
     // `x1 % 3.0 >= 2` alone is samplable — a third of the range — but
     // `x3 == x4 % 4.5 +/- 0.0001` is a curve of width 0.0002, and a test is only
     // as green as its hardest constraint. Kept together rather than split, so
     // that what goes green when the solver lands is the case as written.
-    assert_generates(
-        &[
+    let sources = &["x1 % 3.0 >= 2", "x3 == x4 % 4.5 +/- 0.0001"];
+    let system = system(
+        variables(&[
             ("x1", 0.0, 10.0),
             ("x2", 0.0, 10.0),
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
-        ],
-        &["x1 % 3.0 >= 2", "x3 == x4 % 4.5 +/- 0.0001"],
-    )
-    .await;
+        ]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn constants() {
+async fn constants() -> anyhow::Result<()> {
     // Two bands 0.002 wide in a 10x10 box: about four parts in a hundred
     // million. Sampling is not going to stumble onto pi.
-    assert_generates(
-        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"],
-    )
-    .await;
+    let sources = &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"];
+    let system = system(variables(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn signum() {
+async fn signum() -> anyhow::Result<()> {
     // `sgn` is a step, so x2 has to land within 0.001 of exactly -1 or +1 — two
     // slivers of a range four wide. Also the only place `sgn` meets a pool, and
     // worth having for that alone: Java's `Math.signum` and Rust's `f64::signum`
     // disagree about zero and NaN.
-    assert_generates(
-        &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0)],
-        &["x2 == sgn(x1) +/- 0.001"],
-    )
-    .await;
+    let sources = &["x2 == sgn(x1) +/- 0.001"];
+    let system = system(variables(&[("x1", -1.0, 1.0), ("x2", -2.0, 2.0)]), sources)?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn dynamic_variable_lookup() {
+async fn dynamic_variable_lookup() -> anyhow::Result<()> {
     // The only exercise of `var[i]` under a pool anywhere in the suite. Red for
     // its measure rather than its subject — but it still proves the indexed form
     // compiles, binds against a schema, and evaluates through the pool, which is
     // the part that would otherwise go untested until a solver arrived.
-    assert_generates(
-        &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)],
-        &[
-            "1.5 == var[1] + var[2] +/- 0.001",
-            "1.5 == var[2] - var[3] +/- 0.001",
-        ],
-    )
-    .await;
+    let sources = &[
+        "1.5 == var[1] + var[2] +/- 0.001",
+        "1.5 == var[2] - var[3] +/- 0.001",
+    ];
+    let system = system(
+        variables(&[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }
 
 #[pollster::test]
-async fn ceiling_and_floor() {
-    assert_generates(
-        &[
+async fn ceiling_and_floor() -> anyhow::Result<()> {
+    let sources = &["x1 > floor(x2)", "x3 > ceil(x4) + floor(x4)"];
+    let system = system(
+        variables(&[
             ("x1", 0.0, 10.0),
             ("x2", 0.0, 10.0),
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
-        ],
-        &["x1 > floor(x2)", "x3 > ceil(x4) + floor(x4)"],
-    )
-    .await;
+        ]),
+        sources,
+    )?;
+    let mut region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)
+        .await?;
+    let points = columns(&region.take(REQUESTED));
+
+    assert_ten_feasible(&system, sources, &points);
+    Ok(())
 }

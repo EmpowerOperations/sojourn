@@ -2989,6 +2989,7 @@ dependencies = [
  "pulp",
  "rand 0.10.2",
  "sysinfo",
+ "thiserror 2.0.20",
  "tracing",
  "wgpu",
  "z3",

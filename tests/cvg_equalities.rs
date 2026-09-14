@@ -46,7 +46,7 @@ mod common;
 use faer::Mat;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, SystemError};
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, SystemError};
 
 /// Pinned so a failure is reproducible, and the same value the other cvg suites
 /// use so a point seen in one is the point seen in another.
@@ -124,18 +124,11 @@ async fn assert_explores(case: Case<'_>) {
     let system = ConstraintSystem::new(inputs.clone(), case.sources.iter().copied())
         .expect("a fixture's constraints should bind to its own box");
 
-    let solution = ConstraintSolver::new()
+    let mut pool = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system)
         .await
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", case.what));
-
-    let mut pool = match solution {
-        Satisfiability::Satisfied { region: samples } => samples,
-        Satisfiability::Unsatisfiable { because } => {
-            panic!("{}: reported unsatisfiable, blaming {because:?}", case.what)
-        }
-    };
 
     let points = columns(&pool.take(case.wanted));
     let mut complaints: Vec<String> = Vec::new();
@@ -407,7 +400,7 @@ async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
 /// lost but the implicitness.
 ///
 /// It is also not a claim of emptiness. `sin(x) == x/2` has three solutions and
-/// `x == x*x + 2` is an ordinary quadratic, so `Satisfiability::Unsatisfiable`
+/// `x == x*x + 2` is an ordinary quadratic, so `SolveError::Unsatisfiable`
 /// would be false. `SystemError` is the shape for "we will not try".
 #[pollster::test]
 async fn an_implicit_equality_is_refused_by_name() {
@@ -588,13 +581,8 @@ async fn both_arms_of_a_product_receive_points() {
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system)
         .await
-        .expect("solving should not fail");
-    let Satisfiability::Satisfied {
-        region: mut samples,
-    } = solution
-    else {
-        panic!("a cross through the origin is satisfiable");
-    };
+        .expect("a cross through the origin is satisfiable");
+    let mut samples = solution;
 
     let points = columns(&samples.take(400));
     let on_arm = |axis: usize| {
@@ -781,16 +769,16 @@ async fn the_tolerance_floor_is_where_it_was_left() {
         let system = ConstraintSystem::new(inputs.clone(), [source.as_str()])
             .expect("the fixture should bind to its own box");
 
-        let solution = ConstraintSolver::new()
+        // An `Err` here is the region being empty or unfound at this
+        // tolerance, which is the case being searched for; anything else a
+        // solve can fail with is a bug and would be, at any tolerance.
+        let Ok(mut pool) = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .solve(&system)
             .await
-            .unwrap_or_else(|e| panic!("solving {source:?} failed: {e}"));
-
-        let Satisfiability::Satisfied { region: samples } = solution else {
+        else {
             break;
         };
-        let mut pool = samples;
         let points = columns(&pool.take(100));
 
         let feasible = points.iter().all(|point| {

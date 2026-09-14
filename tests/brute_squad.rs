@@ -105,8 +105,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 use sojourn::CompiledExpression;
 use sojourn::{
-    ConstraintSolver, ConstraintSystem, DEFAULT_STRATEGIES, Infeasibility, InputVariable,
-    Satisfiability, Strategy,
+    ConstraintSolver, ConstraintSystem, DEFAULT_STRATEGIES, Infeasibility, InputVariable, Strategy,
 };
 
 use common::{profile_label, throughput};
@@ -225,8 +224,6 @@ enum Outcome {
     GaveUp(Duration, Infeasibility),
     /// The budget ran out with the pool still searching.
     TimedOut(Duration),
-    /// Solving failed, as distinct from concluding anything.
-    Error(anyhow::Error),
 }
 
 impl fmt::Display for Outcome {
@@ -237,7 +234,6 @@ impl fmt::Display for Outcome {
                 write!(f, "gave up after {elapsed:.1?} ({because:?})")
             }
             Outcome::TimedOut(budget) => write!(f, "timed out at {budget:.1?}"),
-            Outcome::Error(error) => write!(f, "failed: {error}"),
         }
     }
 }
@@ -260,9 +256,7 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
 
     loop {
         match future.as_mut().poll(&mut context) {
-            Poll::Ready(Ok(Satisfiability::Satisfied {
-                region: mut samples,
-            })) => {
+            Poll::Ready(Ok(mut samples)) => {
                 let elapsed = start.elapsed();
 
                 // `Satisfied` promises a point is already in hand; make it
@@ -290,10 +284,9 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
                 }
                 return Outcome::Found(elapsed);
             }
-            Poll::Ready(Ok(Satisfiability::Unsatisfiable { because })) => {
+            Poll::Ready(Err(because)) => {
                 return Outcome::GaveUp(start.elapsed(), because);
             }
-            Poll::Ready(Err(error)) => return Outcome::Error(error),
             Poll::Pending if start.elapsed() >= budget => return Outcome::TimedOut(budget),
             Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
         }
@@ -312,7 +305,6 @@ fn first_hit(family: Family, p: f64, budget: Duration) {
         match outcome {
             Outcome::Found(_) => hits += 1,
             Outcome::GaveUp(..) | Outcome::TimedOut(_) => misses += 1,
-            Outcome::Error(error) => panic!("{family:?} at p = {p:e}: solving failed: {error}"),
         }
         if hits == 2 {
             return;
@@ -360,17 +352,16 @@ fn sampling_only_is_the_default_ladder_minus_the_seeders() {
 fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = ["x1 > 2.0".to_owned()];
     let verdict = pollster::block_on(
-        common::solver()
+        ConstraintSolver::new()
+            .with_proposal_budget(common::PROPOSAL_BUDGET)
+            .with_gpu(false)
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
             .solve(&system(&constraints)),
-    )
-    .expect("solving should not fail");
+    );
 
     match verdict {
-        Satisfiability::Unsatisfiable {
-            because: Infeasibility::NotFound { unexpressed },
-        } => {
+        Err(Infeasibility::NotFound { unexpressed }) => {
             let sources: Vec<&str> = unexpressed.iter().map(|c| c.source.as_str()).collect();
             assert_eq!(
                 sources,

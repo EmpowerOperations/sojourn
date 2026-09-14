@@ -71,7 +71,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 
-use anyhow::Result;
 use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -235,7 +234,7 @@ impl Ladder {
 /// constraint *indices* rather than expressions so the worker never needs a copy
 /// of them.
 pub(crate) enum Opening {
-    /// At least one sample is in hand. The invariant `Satisfiability::Satisfied`
+    /// At least one sample is in hand. The invariant a returned `FeasibleRegion`
     /// rests on, and the reason Z3's `unknown` need not surface: an `unknown`
     /// that still produced a point arrives here like any other success.
     Satisfied,
@@ -357,12 +356,7 @@ fn cover_gaps(
             cut_short = true;
             break;
         }
-        let Ok(answer) = smt::seed_away_from(problem, logic, remaining, &avoid, reach, cancel)
-        else {
-            // The solver failed. Nothing is out this far; look closer.
-            reach /= 2.0;
-            continue;
-        };
+        let answer = smt::seed_away_from(problem, logic, remaining, &avoid, reach, cancel);
         remaining = remaining.saturating_sub(answer.spent);
         match answer.verdict {
             smt::Verdict::Seed { point, .. } => {
@@ -406,11 +400,11 @@ fn cover_gaps(
 /// Dropping the `ConstraintSolver::solve` future drops the receiving
 /// end of the opening channel, and the sending end can see that. Brute force
 /// asks between batches, and a solver call asks while it waits on Z3.
-pub(crate) struct Cancellation<'a>(Option<&'a oneshot::Sender<Result<Opening>>>);
+pub(crate) struct Cancellation<'a>(Option<&'a oneshot::Sender<Opening>>);
 
 impl Cancellation<'_> {
     /// Requested once the receiving end of `opening` is gone.
-    pub(crate) const fn watching(opening: &oneshot::Sender<Result<Opening>>) -> Cancellation<'_> {
+    pub(crate) const fn watching(opening: &oneshot::Sender<Opening>) -> Cancellation<'_> {
         Cancellation(Some(opening))
     }
 
@@ -431,7 +425,7 @@ pub(crate) fn serve(
     problem: &ConstraintSystem,
     mut ladder: Ladder,
     known: Vec<Point>,
-    opening: oneshot::Sender<Result<Opening>>,
+    opening: oneshot::Sender<Opening>,
     batches: &SyncSender<Vec<Point>>,
     stop: &AtomicBool,
 ) {
@@ -443,13 +437,7 @@ pub(crate) fn serve(
     let progress = Progress::empty().extend(known);
     let cancel = Cancellation::watching(&opening);
 
-    let (verdict, progress) = match open(problem, &mut ladder, progress, &cancel) {
-        Ok((verdict, progress)) => (verdict, progress),
-        Err(error) => {
-            drop(opening.send(Err(error)));
-            return;
-        }
-    };
+    let (verdict, progress) = open(problem, &mut ladder, progress, &cancel);
     if cancel.is_requested() {
         // The caller dropped the future mid-search. There is nobody to report
         // to, and brute force stopped for exactly that reason.
@@ -463,7 +451,7 @@ pub(crate) fn serve(
     );
 
     let deliverable = matches!(verdict, Opening::Satisfied);
-    if opening.send(Ok(verdict)).is_err() || !deliverable {
+    if opening.send(verdict).is_err() || !deliverable {
         // Either the caller gave up before we answered, or there is nothing to
         // deliver. Dropping `batches` on the way out is what tells the pool it
         // is exhausted rather than merely slow.
@@ -490,13 +478,13 @@ pub(crate) fn serve(
 /// anything past its resource limit — is exactly what brute force is for.
 ///
 /// `Satisfied` means at least one feasible point is in hand, which is what
-/// [`Satisfiability::Satisfied`] promises.
+/// a returned [`FeasibleRegion`](crate::FeasibleRegion) promises.
 fn open(
     problem: &ConstraintSystem,
     ladder: &mut Ladder,
     progress: Progress,
     cancel: &Cancellation<'_>,
-) -> Result<(Opening, Progress)> {
+) -> (Opening, Progress) {
     let (mut progress, walker_will_carry) = match &mut ladder.sampler {
         Some(sampler) => {
             let probe = sampler.probe(problem);
@@ -522,7 +510,7 @@ fn open(
             let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
             progress = progress.extend(gaps);
         }
-        return Ok((Opening::Satisfied, progress));
+        return (Opening::Satisfied, progress);
     }
 
     // A local solve before any solver: finding one point is an optimisation,
@@ -537,39 +525,41 @@ fn open(
             let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
             progress = progress.extend(gaps);
         }
-        return Ok((Opening::Satisfied, progress));
+        return (Opening::Satisfied, progress);
     }
 
     let unexpressed = match ladder.solver {
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
         None => (0..problem.constraints.len()).collect(),
-        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel)?.verdict
-        {
-            smt::Verdict::Impossible { blamed } => {
-                return Ok((Opening::Impossible { blamed }, progress));
-            }
-            smt::Verdict::Inconclusive { unexpressed } => unexpressed,
-            smt::Verdict::Seed { point, unexpressed } => {
-                // The witness is exact in real arithmetic and need not be in
-                // `f64`. Repairing beats discarding: the solver call that found
-                // it is the expensive part, and the miss is in the last place.
-                // A seed is not a sample either: it satisfies whatever could
-                // be expressed, and it is judged against *everything*; if it
-                // does not survive that, brute force still gets its turn.
-                progress = progress.extend(smt::adjusted(problem, point).into_iter().collect());
-
-                // With a point in hand the search knows one piece of its region,
-                // so now ask the solver about the rest of the box. A region in
-                // several pieces gets a seed in more than one of them here or
-                // nowhere: a chain cannot cross between them afterwards.
-                if !progress.is_empty() {
-                    let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-                    progress = progress.extend(gaps);
+        Some(limit) => {
+            match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel).verdict {
+                smt::Verdict::Impossible { blamed } => {
+                    return (Opening::Impossible { blamed }, progress);
                 }
-                unexpressed
+                smt::Verdict::Inconclusive { unexpressed } => unexpressed,
+                smt::Verdict::Seed { point, unexpressed } => {
+                    // The witness is exact in real arithmetic and need not be in
+                    // `f64`. Repairing beats discarding: the solver call that found
+                    // it is the expensive part, and the miss is in the last place.
+                    // A seed is not a sample either: it satisfies whatever could
+                    // be expressed, and it is judged against *everything*; if it
+                    // does not survive that, brute force still gets its turn.
+                    progress = progress.extend(smt::adjusted(problem, point).into_iter().collect());
+
+                    // With a point in hand the search knows one piece of its region,
+                    // so now ask the solver about the rest of the box. A region in
+                    // several pieces gets a seed in more than one of them here or
+                    // nowhere: a chain cannot cross between them afterwards.
+                    if !progress.is_empty() {
+                        let gaps =
+                            cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
+                        progress = progress.extend(gaps);
+                    }
+                    unexpressed
+                }
             }
-        },
+        }
     };
 
     if progress.is_empty()
@@ -584,11 +574,11 @@ fn open(
         progress = progress.absorb(trial);
     }
 
-    Ok(if progress.is_empty() {
+    if progress.is_empty() {
         (Opening::Unproven { unexpressed }, progress)
     } else {
         (Opening::Satisfied, progress)
-    })
+    }
 }
 
 /// The steady state: one batch per trip through the channel until the caller
@@ -675,7 +665,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::{ConstraintSolver, Infeasibility, InputVariable, Satisfiability};
+    use crate::{ConstraintSolver, Infeasibility, InputVariable};
 
     /// A region one millionth of its box: the probe misses, brute force
     /// lands a seed, the walker delivers from it.
@@ -693,15 +683,9 @@ mod tests {
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_threads(2)
             .solve(&one_in_a_million())
-            .await
-            .expect("nothing should go wrong");
+            .await;
 
-        let Satisfiability::Satisfied {
-            region: mut samples,
-        } = verdict
-        else {
-            panic!("brute force should have found the region: {verdict:?}");
-        };
+        let mut samples = verdict.expect("brute force should have found the region");
         let delivered = samples.take(10);
         assert_eq!(delivered.ncols(), 10);
         for column in 0..10 {
@@ -724,10 +708,9 @@ mod tests {
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_proposal_budget(0)
             .solve(&one_in_a_million())
-            .await
-            .expect("nothing should go wrong");
+            .await;
         assert!(
-            matches!(by_solver, Satisfiability::Satisfied { .. }),
+            by_solver.is_ok(),
             "Z3 should have seeded the region with no brute force at all: {by_solver:?}"
         );
 
@@ -744,14 +727,9 @@ mod tests {
             .with_proposal_budget(1_000_000)
             .with_threads(2)
             .solve(&transcendental)
-            .await
-            .expect("nothing should go wrong");
-        let Satisfiability::Satisfied {
-            region: mut samples,
-        } = by_brute_force
-        else {
-            panic!("brute force should have taken over from Z3's `unknown`: {by_brute_force:?}");
-        };
+            .await;
+        let mut samples =
+            by_brute_force.expect("brute force should have taken over from Z3's `unknown`");
         let delivered = samples.take(5);
         assert_eq!(delivered.ncols(), 5);
         for column in 0..5 {
@@ -789,16 +767,10 @@ mod tests {
             .with_proposal_budget(0)
             .with_gpu(false)
             .solve(&hard)
-            .await
-            .expect("nothing should go wrong");
+            .await;
         let took = started.elapsed();
         assert!(
-            matches!(
-                verdict,
-                Satisfiability::Unsatisfiable {
-                    because: Infeasibility::NotFound { .. }
-                }
-            ),
+            matches!(verdict, Err(Infeasibility::NotFound { .. })),
             "{verdict:?}"
         );
         assert!(took < std::time::Duration::from_secs(10), "{took:?}");
@@ -814,16 +786,10 @@ mod tests {
             .with_proposal_budget(0)
             .with_gpu(false)
             .solve(&one_in_a_million())
-            .await
-            .expect("nothing should go wrong");
+            .await;
 
         assert!(
-            matches!(
-                verdict,
-                Satisfiability::Unsatisfiable {
-                    because: Infeasibility::NotFound { .. }
-                }
-            ),
+            matches!(verdict, Err(Infeasibility::NotFound { .. })),
             "{verdict:?}"
         );
     }

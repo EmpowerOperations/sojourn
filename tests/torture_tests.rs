@@ -16,11 +16,10 @@
 
 mod common;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use faer::Mat;
 use sojourn::{
-    ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable,
-    Satisfiability, Strategy,
+    ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable, Strategy,
 };
 
 /// Same value the other cvg suites use, so a point seen in one is the point
@@ -64,19 +63,22 @@ fn in_box(system: &ConstraintSystem, point: &[f64]) -> bool {
         .all(|(variable, value)| (variable.lower_bound..=variable.upper_bound).contains(value))
 }
 
+/// The solver every fixture here starts from: the test-sized budget, the CPU
+/// alone so the verdict is a function of the seed, and the seed.
 fn solver() -> ConstraintSolver {
-    common::solver().with_seed(SEED)
+    ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_seed(SEED)
 }
 
 /// The region a solve returns, which is where `repair` lives. The fixture
 /// below hands it its own anchor, so the census is not what is being tested.
-fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
-    match pollster::block_on(solver().solve(system))? {
-        Satisfiability::Satisfied { region } => Ok(region),
-        Satisfiability::Unsatisfiable { because } => {
-            Err(anyhow!("the fixture is unsatisfiable: {because}"))
-        }
-    }
+async fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
+    solver()
+        .solve(system)
+        .await
+        .context("the fixture should be satisfiable")
 }
 
 /// A curve `x1^1.234 + x2^1.234 == 5` thickened to a band a hundredth wide in
@@ -92,16 +94,10 @@ async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
     )?;
-    let verdict = solver()
+    let mut samples = solver()
         .solve(&system)
         .await
-        .context("solve does not error")?;
-    let Satisfiability::Satisfied {
-        region: mut samples,
-    } = verdict
-    else {
-        panic!("a curve that sampling can reach was reported {verdict:?}");
-    };
+        .context("a curve that sampling can reach should be found")?;
 
     let points = samples.take(WANTED);
     assert_eq!(points.ncols(), WANTED, "the stream ended early");
@@ -128,12 +124,9 @@ async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()
 async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
     let source = "x1^1.234 > 1000000";
     let system = system(&[("x1", 0.0, 10.0)], &[source])?;
-    let verdict = solver()
-        .solve(&system)
-        .await
-        .context("solve does not error")?;
+    let verdict = solver().solve(&system).await;
 
-    let Satisfiability::Unsatisfiable { because } = verdict else {
+    let Err(because) = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
     };
     let sentence = because.to_string();
@@ -159,14 +152,11 @@ async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
     )?;
-    let verdict = solver()
+    let mut region = solver()
         .with_strategies(vec![Strategy::LocalSolve, Strategy::HitAndRun])
         .solve(&system)
         .await
-        .context("solve does not error")?;
-    let Satisfiability::Satisfied { mut region } = verdict else {
-        return Err(anyhow!("the band is not empty, yet: {verdict:?}"));
-    };
+        .context("the band is not empty")?;
     let points = region.take(4);
     assert_eq!(
         points.ncols(),
@@ -188,8 +178,8 @@ async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
 /// The clearance has to come from the chord too, since no slice can say where
 /// the wall is to step off it: the landing is backed off along the chord
 /// until the axis neighbours pass.
-#[test]
-fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
+#[pollster::test]
+async fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     const CLEARANCE: f64 = 1e-3;
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
@@ -197,7 +187,7 @@ fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     )?;
     let anchors = Mat::from_fn(2, 1, |_, _| 0.0);
 
-    let region = region(&system)?;
+    let region = region(&system).await?;
     let repaired = region
         .repair(anchors.as_ref(), &[9.0, 9.0], CLEARANCE)
         .context("the origin is feasible, so something is reachable")?;

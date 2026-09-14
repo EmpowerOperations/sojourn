@@ -23,12 +23,9 @@
 
 use faer::MatRef;
 
-use anyhow::Result;
-
 use crate::cvg::classify;
 use crate::cvg::incidence::{ConstraintId, Incidence, Row};
 use crate::diagnostics::CompilationFailure;
-use crate::solve::{ConstraintSolver, Satisfiability};
 use crate::{Ast, CompiledExpression, Schema};
 
 /// A point in the input space, one value per variable in declaration order.
@@ -156,7 +153,7 @@ impl Constraint {
 /// together, as in a system of equations.
 ///
 /// Construction is where a constraint naming an undeclared variable is caught,
-/// which is what leaves [`solve`](ConstraintSystem::solve)'s `Result` about the
+/// which is what leaves [`solve`](crate::solve)'s `Result` about the
 /// search and nothing else.
 #[derive(Debug, Clone)]
 pub struct ConstraintSystem {
@@ -178,10 +175,11 @@ pub struct ConstraintSystem {
 }
 
 /// A system that does not hold together.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SystemError {
     /// A constraint's text is not a babel expression. Carries every problem the
     /// parser found, with spans, the way [`compile`](crate::compile) would.
+    #[error("constraint {constraint} did not parse: {failure}")]
     Unparsable {
         constraint: ConstraintRef,
         failure: CompilationFailure,
@@ -189,12 +187,14 @@ pub enum SystemError {
     /// A constraint names a variable the box does not declare. It could never be
     /// satisfied, and saying so once beats saying it on every evaluation — which
     /// is what the JVM implementation did.
+    #[error("constraint {constraint} references {} which is not an input variable", .missing.join(", "))]
     Unbound {
         constraint: ConstraintRef,
         missing: Vec<String>,
     },
     /// A scalar expression where a constraint was wanted. It has no `<= 0`
     /// reading, so asserting one would invent a constraint nobody wrote.
+    #[error("{constraint} is a scalar expression, not a constraint: it has no truth value")]
     NotAConstraint { constraint: ConstraintRef },
     /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4` — a variable named on both sides,
     /// so the equality is *implicit* in it: no reading of it yields `v = ...`.
@@ -202,7 +202,7 @@ pub enum SystemError {
     ///
     /// **A refusal, not a claim that nothing satisfies it.** `sin(x) == x/2` has
     /// three solutions and `x == x*x + 2` is an ordinary quadratic, so
-    /// [`Satisfiability::Unsatisfiable`] would be saying something false. What is
+    /// [`Infeasibility::Proved`](crate::Infeasibility::Proved) would be saying something false. What is
     /// true is that nothing here can *drive* such a variable, and a search that
     /// cannot drive it falls back on whatever the sampler manages — which reads
     /// as a capability rather than the gap it is.
@@ -219,6 +219,9 @@ pub enum SystemError {
     /// Refused at construction because the alternative is worse: a solver call
     /// and several thousand samples before answering `NotFound`, which tells a
     /// caller nothing about what to change.
+    #[error(
+        "constraint {constraint} is implicit in {variable}: it names {variable} on both sides,          so nothing can solve it for {variable} without rearranging it first. Write {variable}          on one side only - `a == b + a/2` is `a/2 - b == 0`"
+    )]
     Implicit {
         constraint: ConstraintRef,
         variable: String,
@@ -228,6 +231,9 @@ pub enum SystemError {
     /// Settled the moment a box was declared, and reported here rather than
     /// once per evaluation as `ProblemKind::DynamicIndexOutOfBounds` — which is
     /// where it used to surface, and is a runtime answer to a static question.
+    #[error(
+        "constraint {constraint} reads var[{requested}], and the box declares {available} variable(s)"
+    )]
     SubscriptOutOfRange {
         constraint: ConstraintRef,
         /// The one-based index the source asked for.
@@ -236,49 +242,6 @@ pub enum SystemError {
         available: usize,
     },
 }
-
-impl std::fmt::Display for SystemError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unparsable {
-                constraint,
-                failure,
-            } => write!(f, "constraint {constraint} did not parse: {failure}"),
-            Self::Unbound {
-                constraint,
-                missing,
-            } => write!(
-                f,
-                "constraint {constraint} references {} which is not an input variable",
-                missing.join(", ")
-            ),
-            Self::NotAConstraint { constraint } => write!(
-                f,
-                "{constraint} is a scalar expression, not a constraint: it has no truth value"
-            ),
-            Self::SubscriptOutOfRange {
-                constraint,
-                requested,
-                available,
-            } => write!(
-                f,
-                "constraint {constraint} reads var[{requested}], and the box                  declares {available} variable(s)"
-            ),
-            Self::Implicit {
-                constraint,
-                variable,
-            } => write!(
-                f,
-                "constraint {constraint} is implicit in {variable}: it names \
-                 {variable} on both sides, so nothing can solve it for \
-                 {variable} without rearranging it first. Write {variable} on \
-                 one side only - `a == b + a/2` is `a/2 - b == 0`"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SystemError {}
 
 impl ConstraintSystem {
     /// Parses every constraint, checks that each is one, and that each binds
@@ -399,19 +362,6 @@ impl ConstraintSystem {
         self.constraints
             .iter()
             .map(|constraint| constraint.written.source())
-    }
-
-    /// Searches for feasible samples with the default strategies.
-    ///
-    /// Sugar for [`ConstraintSolver::new().solve(&system)`](ConstraintSolver::solve).
-    /// Reach for the builder when the randomness or the strategy list has to be
-    /// pinned, which is mostly tests.
-    ///
-    /// # Errors
-    /// Anything that went *wrong*, as opposed to anything that was *concluded*.
-    /// An unsatisfiable system is a [`Satisfiability`], not an error.
-    pub async fn solve(&self) -> Result<Satisfiability> {
-        ConstraintSolver::new().solve(self).await
     }
 
     /// Whether a point is inside the box and satisfies every constraint, with

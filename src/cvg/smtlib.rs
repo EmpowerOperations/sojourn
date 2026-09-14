@@ -1014,9 +1014,7 @@ mod tests {
         let preamble = format!("{}\n", prelude());
         for (claim, should_hold) in claims {
             let document = format!("(set-logic QF_NIRA)\n{preamble}(assert {claim})\n");
-            let reply = Z3Backend
-                .solve(&document, 0, &crate::cvg::Cancellation::never())
-                .unwrap_or_else(|e| panic!("Z3 rejected {claim}: {e}"));
+            let reply = Z3Backend.solve(&document, 0, &crate::cvg::Cancellation::never());
 
             let held = matches!(reply.outcome, Outcome::Sat(_));
             assert_eq!(

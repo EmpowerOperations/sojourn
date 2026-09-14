@@ -2294,6 +2294,43 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       dependencies and their bundled build, and answering `NotFound` where `Proved` was; a
       propagation-based emptiness check with blame covers the contradictions users actually
       write (`x > 8 ∧ x < 2`, a bound an equality cannot meet).
+      *2026-09-13: the tests that reach `Proved` today are three, all in `tests/cvg_pools.rs`:
+      `contradictory_constraints_are_reported_as_unsatisfiable` (`x > 8 ∧ x < 2`),
+      `a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking` (`x % 3 >= 2 ∧
+      x % 3 <= 1`, which accepts `Proved` or `Exhausted`), and the new
+      `a_backwards_comparison_is_blamed_together_with_what_it_contradicts`: the user's typo,
+      `x1 < 3`, `x2 > 5`, `x1 + x2 < 20`, `x1 > x2`, where Z3's core blames exactly the three
+      that conflict and leaves the innocent fourth out. That last one is the bar: whatever
+      replaces Z3 has to return that set, not just "empty". All three are linear, so
+      propagation with blame would clear the bar; the open question is only whether a real
+      problem exists where it would not.*
+
+- [ ] **Hanging is the worst failure mode; a `panic!` beats a spin.** Three hedges were
+      considered on 2026-09-13 against bugs not yet written; none is adopted here, and the
+      third is a discipline recorded in `AGENTS.md`.
+      1. *Classify every loop as a budget or an invariant, and guard the invariants with a cap
+         that panics.* Rejected: it depends on the author correctly deciding a loop is safe,
+         which is exactly the judgement that fails when it fails.
+      2. *A heartbeat the worker bumps in every loop and a watchdog on the handle side:*
+         `take_within(Duration)`, a `Drop` that joins with a deadline and abandons the thread
+         with an error-level trace when it passes (the Z3 leash's shape), and
+         `Status::Failed("no progress for 30 s in <stage>")`. Converts unknown future hangs into
+         a fact the caller can read, changes no result. Practical, not yet committed to: the
+         `&& ticker.tick_and_check()` in every loop predicate may make the code structurally
+         worse, and it is not clear the crate has a loop that needs it — every loop in the
+         engine today is bounded by a named count or a finite set (`GAP_QUERIES`,
+         `SHRINK_LIMIT`, `CLAMP_SWEEPS`, `CHORD_BITS`, `LANDING_LADDER`, `ADJUST_SWEEPS`, the
+         starts and evaluations of the local solve, burn-in and thinning by dimension, the
+         proposal budget; `classify::plan`'s ordering consumes a finite set; `narrow` is a
+         single pass by design). The two places the failure mode actually lives are foreign
+         code (Z3, leashed; COBYLA, budgeted per evaluation but not per iteration) and the
+         handle waiting on the worker (`take` unbounded, `Drop` joins unconditionally — the
+         burn-in that ignored the stop flag was found by exactly that).
+      3. *Every foreign call and every API with a remote chance of combinatorial explosion gets
+         a resource limit, or failing that a wall-clock ceiling set so conservatively that
+         hitting it means a bug, and hitting it panics rather than waits.* Adopted as a
+         discipline; the leash on Z3 is the model, and COBYLA's callback is the one place
+         today that lacks it.
 
 - [ ] **Concurrent coverage: start the walker from the first hit, cover gaps beside it.**
       Settled in discussion on 2026-09-12 as the follow-up to the budget above. Cases: (A)

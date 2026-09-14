@@ -7,7 +7,6 @@ license = "Apache-2.0"
 
 [dependencies]
 antlr-rust-runtime = "0.34"
-anyhow = "1.0"
 askama = "0.16"
 # The local solve that finds the search's first point: COBYLA, derivative-free,
 # with nonlinear inequality constraints in babel's own `<= 0` convention. Pure
@@ -25,6 +24,9 @@ rand = "0.10"
 # Diagnosis, not logging. The pool silently falls back to sampling whenever the
 # solver cannot be given a constraint, and without this there is no way for a
 # caller to learn that happened or why. Compiles to nothing without a subscriber.
+# One way of spelling an error: `SolveError` derives its `Display` and its
+# `From<io::Error>` rather than hand-writing them.
+thiserror = "2.0"
 tracing = "0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "vulkan", "dx12", "metal"], optional = true }
 z3 = { version = "0.21.0", features = ["bundled"] }
@@ -37,6 +39,7 @@ z3-sys = { version = "0.13.0", default-features = false }
 antlr-rust-codegen = "0.34"
 
 [dev-dependencies]
+anyhow = "1.0"
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = { version = "1.0.1", features = ["macro"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }

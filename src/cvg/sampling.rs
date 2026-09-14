@@ -478,6 +478,7 @@ mod brute_force_tests {
     use std::time::{Duration, Instant};
 
     use futures_channel::oneshot;
+
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
@@ -494,8 +495,8 @@ mod brute_force_tests {
         source: &str,
         budget: u64,
         threads: usize,
-        receiver: oneshot::Receiver<anyhow::Result<Opening>>,
-        sender: &oneshot::Sender<anyhow::Result<Opening>>,
+        receiver: oneshot::Receiver<Opening>,
+        sender: &oneshot::Sender<Opening>,
     ) -> (Trial, usize) {
         let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
         let mut sampler = RandomSampler::new(
@@ -568,7 +569,7 @@ mod brute_force_tests {
     /// the budget.
     #[test]
     fn an_abandoned_search_stops_within_a_round() {
-        let (sender, receiver) = oneshot::channel::<anyhow::Result<Opening>>();
+        let (sender, receiver) = oneshot::channel::<Opening>();
         let started = Instant::now();
         let trial = std::thread::scope(|scope| {
             scope.spawn(move || {

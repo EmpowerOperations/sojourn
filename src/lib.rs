@@ -1,5 +1,36 @@
 //! Sojourn — constrained random vector generation over a small expression language, babel.
 //!
+//! Declare a box and the constraints over it, solve, and take samples:
+//!
+//! ```no_run
+//! use sojourn::{ConstraintSystem, InputVariable};
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let system = ConstraintSystem::new(
+//!     vec![InputVariable::new("x", -2.0, 2.0), InputVariable::new("y", -2.0, 2.0)],
+//!     ["x^2 + y^2 < 1", "x + y > 0.5"],
+//! )?;
+//!
+//! // The defaults. For anything else — a pinned seed, a budget, a strategy
+//! // list — build the solver yourself: `ConstraintSolver::new().with_seed(42)
+//! // .solve(&system)`. Either way the system is borrowed; the search takes a
+//! // copy, and this handle keeps its own.
+//! let mut region = sojourn::solve(&system).await?;
+//!
+//! // One column per sample, one row per variable, in the order declared;
+//! // `take` waits for them, `try_take` does not.
+//! let samples = region.take(256);
+//!
+//! // A point that is not a sample, brought onto the region near where it
+//! // was, `1e-12` box widths inside every wall, anchored on the samples.
+//! let repaired = region.repair(samples.as_ref(), &[1.5, 1.5], 1e-12)?;
+//! # let _ = repaired;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! One expression can also be compiled and evaluated over a batch on its own:
+//!
 //! ```ignore
 //! let compiled = sojourn::compile("x1 + x2 > 20 - x3^2", &["x1", "x2", "x3"])?;
 //!
@@ -32,12 +63,12 @@ mod solve;
 mod system;
 
 pub(crate) use eval::Schema;
-pub use eval::{CompiledExpression, compile, simd_isa};
+pub use eval::{CompiledExpression, compile};
 pub(crate) use frontend::{Ast, parse};
 pub use repair::RepairError;
 pub use solve::{
     ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_SOLVER_LIMIT,
-    FeasibleRegion, GPU_VARIABLE, Infeasibility, Satisfiability, SmtLogic, Status,
+    FeasibleRegion, GPU_VARIABLE, Infeasibility, SmtLogic, Status,
 };
 pub use system::{ConstraintRef, ConstraintSystem, InputVariable, Point, SystemError};
 
@@ -59,4 +90,8 @@ pub use solve::{DEFAULT_STRATEGIES, Strategy};
 #[must_use]
 pub fn is_legal_variable_name(name: &str) -> bool {
     !name.is_empty() && frontend::parses_as_variable(name)
+}
+
+pub async fn solve(system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
+    ConstraintSolver::new().solve(system).await
 }

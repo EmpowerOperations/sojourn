@@ -372,8 +372,7 @@ mod tests {
     #[test]
     fn a_cancelled_search_does_not_start() {
         let system = system(vec![InputVariable::new("x", 0.0, 10.0)], &["x > 8"]);
-        let (sender, receiver) =
-            futures_channel::oneshot::channel::<anyhow::Result<super::super::Opening>>();
+        let (sender, receiver) = futures_channel::oneshot::channel::<super::super::Opening>();
         drop(receiver);
         assert!(seed(&system, &mut rng(), &Cancellation::watching(&sender)).is_none());
     }

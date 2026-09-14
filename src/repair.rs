@@ -149,36 +149,22 @@ const CHORD_BITS: usize = 60;
 const LANDING_LADDER: u32 = 20;
 
 /// Why [`FeasibleRegion::repair`](crate::FeasibleRegion::repair) could not answer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RepairError {
     /// Nothing feasible was reached: clamping could not land, and no anchor
     /// among the nearest few was feasible. Between two bands with no anchor to
     /// bisect toward, no interval says which way to go.
+    #[error("no feasible point was reached: clamping could not land and no anchor was feasible")]
     Stranded,
     /// A feasible point was reached, but nowhere with the clearance asked for:
     /// the feasible room there is narrower than twice the clearance. `nearest`
     /// is that point, feasible by the plain oracle, in case it is better than
     /// nothing; a smaller clearance is the usual answer.
+    #[error(
+        "a feasible point was reached but none with clearance {clearance}; the feasible room is          narrower than the clearance asked for, so try a smaller one"
+    )]
     Cramped { nearest: Point, clearance: f64 },
 }
-
-impl std::fmt::Display for RepairError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Stranded => write!(
-                f,
-                "no feasible point was reached: clamping could not land and no anchor was feasible"
-            ),
-            Self::Cramped { clearance, .. } => write!(
-                f,
-                "a feasible point was reached but none with clearance {clearance}; the feasible \
-                 room is narrower than the clearance asked for, so try a smaller one"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RepairError {}
 
 /// A point that satisfies `system` with `clearance` to spare, near `point`,
 /// the same every time. The contract — anchors, clearance, the guarantees,

@@ -71,6 +71,22 @@ starts as a failing test in `tests/` (integration, public API) or a
 `#[cfg(test)]` module beside the code (unit). Red tests are acceptable on a
 feature branch; tests that fail to *compile* are not — that is an incomplete API.
 
+**A `panic!` beats a spin.** A hang is the worst failure mode this crate has —
+the 20-segment beam ran 3.7 CPU-hours without returning before anyone knew why —
+so every foreign call, and every API of ours with even a remote chance of
+combinatorial explosion or exponential backoff, carries a budget that ends it:
+a resource limit in the callee's own units where one exists (`rlimit` for Z3,
+an evaluation count for COBYLA), and otherwise a wall-clock ceiling set so
+conservatively that reaching it means a bug, not a slow case — the five-sigma
+use. Reaching it must fail loudly (an error, a `tracing::error!` and
+abandonment, a `panic!`) and never wait. `smt::Z3Backend::solve` is the model:
+rlimit first, a ceiling twenty times past honest work, interrupt, grace,
+abandon-and-report. A budget is a count and decides the answer deterministically;
+a ceiling is a watchdog and only decides that something is broken. Keep them
+distinct, and never let a ceiling become the thing that decides a result.
+The full inventory of the engine's loops and the hedges considered is in
+`docs/todo.md` under "Hanging is the worst failure mode".
+
 **Call functions by their module.** Import modules and types; call functions
 qualified — `eval::bind(..)`, `cvg::serve(..)`, `ast::to_index(..)` — rather
 than importing the bare name. A four-letter verb says nothing about which part

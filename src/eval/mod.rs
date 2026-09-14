@@ -17,23 +17,6 @@ mod tape;
 mod tile;
 pub(crate) mod wgsl;
 
-/// Which instruction set the tile kernels run on here, and how many `f64`
-/// lanes that is: `("pulp::x86::v3::V3", 4)` on an AVX2 machine,
-/// `("pulp::Scalar", 1)` without one. For the benchmark ledgers' host file.
-#[doc(hidden)]
-#[must_use]
-pub fn simd_isa() -> (&'static str, usize) {
-    struct Probe;
-    impl pulp::WithSimd for Probe {
-        type Output = (&'static str, usize);
-        #[inline(always)]
-        fn with_simd<S: pulp::Simd>(self, _: S) -> Self::Output {
-            (std::any::type_name::<S>(), S::F64_LANES)
-        }
-    }
-    pulp::Arch::new().dispatch(Probe)
-}
-
 use std::collections::BTreeSet;
 
 use faer::{Col, MatRef};
