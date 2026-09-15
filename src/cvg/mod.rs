@@ -5,15 +5,15 @@
 //! reasonably evenly.
 //!
 //! Lives inside babel rather than alongside it so that [`crate::ast`] can stay
-//! private — the SMT-LIB2 emitter is an internal function over the AST, not a
-//! published consumer of it.
+//! private — interval narrowing walks the AST, as an internal function over
+//! it rather than a published consumer of it.
 //!
 //! # Strategy
 //!
 //! Finding the *first* feasible point is the hard part, and for a tight region
-//! it needs a solver. Once there, cheap strategies cover the space quickly. That
-//! is why `ConstraintSolver::solve` is the expensive, awaitable call and
-//! `FeasibleRegion::take` is not.
+//! it needs a local solve or a bisection. Once there, cheap strategies cover
+//! the space quickly. That is why `ConstraintSolver::solve` is the expensive,
+//! awaitable call and `FeasibleRegion::take` is not.
 //!
 //! This module is the engine. The types a caller holds — the system, the
 //! solver, the samples handle, the verdicts — are defined at the crate root
@@ -23,8 +23,8 @@
 //!
 //! * **Uniform rejection sampling** — the brute squad — *probes*, and on a
 //!   region it reaches often enough it simply delivers: unbiased by
-//!   construction, no burn-in, no chain. Where the probe lands nothing and the
-//!   solver could not settle it, the same sampler keeps proposing on every
+//!   construction, no burn-in, no chain. Where the probe lands nothing and
+//!   nothing else settled it, the same sampler keeps proposing on every
 //!   core, for a proposal budget, until one batch lands: a region a millionth
 //!   or a hundred-millionth of its box is a matter of milliseconds to seconds,
 //!   and the seed it finds is what the walker starts from.
@@ -32,25 +32,27 @@
 //!   converges to the uniform distribution over the region, so what a caller
 //!   receives is governed by the strategy with a guarantee. It cannot start
 //!   without a feasible point, and a seed comes from the probe's own hits,
-//!   from the local solve, from the solver, or from brute force.
+//!   from the local solve, from a bisection's leaves, or from brute force.
 //! * **The local solve** ([`local`]) *seeds* where the probe found nothing:
 //!   COBYLA from the box centre and a few seeded starts, stopped at the first
 //!   point the oracle judges feasible. Finding one point of a nonlinear system
 //!   is an ordinary constrained optimisation, and a local method does it in
-//!   milliseconds at two hundred variables where a decision procedure spends
-//!   minutes per query and brute force cannot find a region a millionth of its
-//!   box. It cannot prove anything: a start that finds nothing says only that
-//!   its basin held nothing.
-//!
-//! None of those can prove a region *empty*. That is the solver's job, and it
-//! comes after the local solve and *before* brute force: when the probe and
-//! every local start come back empty *and* [`Strategy::Solver`] is in the
-//! list, Z3 is asked. It settles a contradiction in milliseconds where brute
-//! force would spend its whole budget, and only it can return
-//! [`Infeasibility::Proved`]. What it answers `unknown` on — anything
-//! transcendental, anything past its limit — is exactly what brute force then
-//! spends the budget on. Without a solver in the list the probe hands straight
-//! to brute force, and an empty search is simply [`Infeasibility::NotFound`].
+//!   milliseconds at two hundred variables where brute force cannot find a
+//!   region a millionth of its box. It cannot prove anything: a start that
+//!   finds nothing says only that its basin held nothing.
+//! * **Branch-and-prune** ([`prune`]) is the one that *proves*, and the one
+//!   that finds the *pieces*. The declared box is contracted under every
+//!   constraint before a single proposal — a plain contradiction empties a
+//!   coordinate right there, and the constraints that emptied it are the
+//!   blame in [`Infeasibility::Proved`]. When the walker will carry the
+//!   search, or nothing has been found, the box is split and pruned for a
+//!   budget of contractions, and the leaves that survive are where the
+//!   region's pieces can be: a chain cannot cross between pieces, so each is
+//!   seeded from its own leaf. What interval arithmetic cannot see — a
+//!   contradiction every box encloses a little of — is left to brute force,
+//!   and an empty search is [`Infeasibility::NotFound`], which claims
+//!   nothing. Without it in the list nothing is proved and nothing is
+//!   covered: the probe hands to the local solve and then to brute force.
 
 pub(crate) mod classify;
 #[cfg(feature = "gpu")]
@@ -58,13 +60,12 @@ pub(crate) mod classify;
 pub mod gpu;
 pub(crate) mod incidence;
 pub(crate) mod interval;
-mod local;
+pub(crate) mod local;
 mod progress;
+mod prune;
 pub(crate) mod sampling;
 #[cfg(feature = "gpu")]
 mod sieve;
-mod smt;
-mod smtlib;
 mod walking;
 
 use std::collections::VecDeque;
@@ -79,7 +80,7 @@ use progress::{Progress, Trial};
 use sampling::RandomSampler;
 use walking::HitAndRunWalker;
 
-use crate::solve::{Budgets, SmtLogic, Strategy};
+use crate::solve::{Budgets, Strategy};
 use crate::{ConstraintSystem, Point};
 
 /// The hit rate below which the walker is expected to do the delivering.
@@ -93,8 +94,8 @@ use crate::{ConstraintSystem, Point};
 ///
 /// This decides nothing about who runs — every batch is sampled first and
 /// walked for the rest, see [`next_batch`]. It decides only whether the
-/// opening spends solver calls on *coverage*: chains cannot cross between a
-/// region's pieces, so a search the walker will carry needs a seed in every
+/// opening spends its prune budget on *coverage*: chains cannot cross between
+/// a region's pieces, so a search the walker will carry needs a seed in every
 /// piece, where uniform proposals reach every piece in proportion to its
 /// measure and need no help. The probe is one batch and can misjudge the
 /// rate either way; the cost of a wrong guess here is coverage of a rare
@@ -143,18 +144,13 @@ pub(crate) struct Ladder {
     /// Fills whatever sampling left short of a batch, from the points in hand.
     walker: Option<HitAndRunWalker>,
     /// The stream a local solve draws its starts from, when
-    /// [`Strategy::LocalSolve`] is configured. Runs once, on the opening,
-    /// after the probe and before any solver.
+    /// [`Strategy::LocalSolve`] is configured. Runs on the opening, after the
+    /// probe, and again inside any leaf a bisection isolates.
     local: Option<Xoshiro256PlusPlus>,
-    /// The solver's resource limit, when [`Strategy::Solver`] is configured.
-    /// Not a strategy object: the solver needs the whole system to emit a
-    /// document, and it runs once, on the opening, rather than per batch.
-    solver: Option<u32>,
-    /// The SMT-LIB logic a document is emitted under. Carried here rather
-    /// than defaulted at the point of use, so that a document is emitted under
-    /// the logic the caller chose and not under whatever the worker thread's
-    /// environment happens to say.
-    logic: SmtLogic,
+    /// The bisection budget, in contractions, when [`Strategy::Prune`] is
+    /// configured. Not a strategy object: a contraction reads the whole
+    /// system, and it runs on the opening rather than per batch.
+    prune: Option<u32>,
 }
 
 impl std::fmt::Debug for Ladder {
@@ -163,8 +159,7 @@ impl std::fmt::Debug for Ladder {
             .field("sampler", &self.sampler.is_some())
             .field("walker", &self.walker.is_some())
             .field("local", &self.local.is_some())
-            .field("solver", &self.solver)
-            .field("logic", &self.logic)
+            .field("prune", &self.prune)
             .finish()
     }
 }
@@ -172,7 +167,6 @@ impl std::fmt::Debug for Ladder {
 impl Ladder {
     pub(crate) fn new(
         system: &ConstraintSystem,
-        logic: SmtLogic,
         mut rng: Xoshiro256PlusPlus,
         strategies: &[Strategy],
         budgets: Budgets,
@@ -181,8 +175,7 @@ impl Ladder {
             sampler: None,
             walker: None,
             local: None,
-            solver: None,
-            logic,
+            prune: None,
         };
         // Each strategy gets its own stream, derived from the one passed in and
         // drawn in list order, so that adding or removing a strategy does not
@@ -190,7 +183,7 @@ impl Ladder {
         for strategy in strategies {
             let stream = Xoshiro256PlusPlus::from_rng(&mut rng);
             match strategy {
-                Strategy::Solver => ladder.solver = Some(budgets.solver_limit),
+                Strategy::Prune => ladder.prune = Some(budgets.prune),
                 Strategy::BruteSquad => {
                     let sampler = RandomSampler::new(
                         &system.variables,
@@ -212,9 +205,9 @@ impl Ladder {
     /// Whether the walker will do most of the delivering, judged on the
     /// probe's hit rate against [`EASY_PATH_THRESHOLD`].
     ///
-    /// What the opening asks before spending solver calls on coverage. With no
-    /// walker configured the answer is no whatever the rate: there are no
-    /// chains to place, so nothing to cover for.
+    /// What the opening asks before spending its prune budget on coverage.
+    /// With no walker configured the answer is no whatever the rate: there
+    /// are no chains to place, so nothing to cover for.
     fn walker_will_carry(&self, probe: &Trial) -> bool {
         if self.walker.is_none() {
             return false;
@@ -235,162 +228,123 @@ impl Ladder {
 /// of them.
 pub(crate) enum Opening {
     /// At least one sample is in hand. The invariant a returned `FeasibleRegion`
-    /// rests on, and the reason Z3's `unknown` need not surface: an `unknown`
-    /// that still produced a point arrives here like any other success.
+    /// rests on, and the reason a bisection that ran out of budget need not
+    /// surface: a budget spent that still produced a point arrives here like
+    /// any other success.
     Satisfied,
-    /// A solver proved the region empty.
+    /// Interval reasoning proved the region empty.
     Impossible { blamed: Vec<usize> },
-    /// Nothing found and nothing proven, carrying whatever could not be
-    /// expressed — which is usually why.
+    /// Nothing found and nothing proven, carrying whatever interval reasoning
+    /// could conclude nothing from — which is often why.
     Unproven { unexpressed: Vec<usize> },
 }
 
-/// How many solver calls a search may spend looking for pieces of its region
-/// that it has not reached.
+/// How many leaves of a bisection a local solve is spent on, when nothing
+/// is in hand.
 ///
-/// Also the *resolution* of the search: [`cover_gaps`] halves its reach on every
-/// unsatisfiable answer, so the count sets how fine it gets before giving up —
-/// sixteen halvings take a unit box down to about `1.5e-5`. That doubles as the
-/// floor nothing else has to supply. Below it lies the failure this whole thing
-/// exists to avoid, where the solver answers with a point a hair from one it
-/// already gave us.
-///
-/// A count, not the budget. The budget is the solver limit, spent across the
-/// whole stage in the solver's own units — see [`cover_gaps`] — and on a
-/// problem the solver finds hard it is what ends the stage, long before this.
-///
-/// At zero this is the behaviour before it existed: one seed, every chain
-/// starting from it.
-const GAP_QUERIES: usize = 16;
+/// The leaves a bisection ends with are candidates rather than pieces: at
+/// the budget a region along a curve is a great many boxes, most of them
+/// holding the same piece, and a local solve in each would be the budget
+/// spent twice. A leaf that settled — its centre judged feasible — is a seed
+/// for free and every one is taken; the ones that did not are solved
+/// farthest-first, this many of them. Sixteen, the number of gap queries
+/// this replaced, which found every piece any fixture has.
+const GAP_SEEDS: usize = 16;
 
-/// Seeds from the parts of the region the search has not reached.
+/// Seeds from the leaves of a bisection: the pieces of the region the search
+/// has not reached.
 ///
 /// **Hit-and-run cannot discover a component it was not started in.** A chain
 /// samples the piece it began in and nothing else, so on `abs(x1) == 1 +/- 1e-9`
 /// a search that starts from one root delivers that root five hundred times and
 /// never learns the other exists. Somebody has to go looking *before* the chains
-/// are placed, and only a solver can.
+/// are placed, and a bisection is what looks: every leaf it ends with is a box
+/// the constraints could not rule out, and a piece of the region is in one of
+/// them.
 ///
-/// # Coarse to fine, because the gap is the unknown
-///
-/// Asking the solver again returns the same witness, and asking it to avoid that
-/// *point* returns one a fifth of a nanometre away — measured, on the parabola
-/// above. The exclusion has to be on the scale of the **gap between
-/// components**, which nothing knows in advance.
-///
-/// So `reach` starts at half the widest declared range — as far as it is
-/// meaningful to ask — and halves on every `unsat`. An `unsat` says only "there
-/// is nothing this far out", which is a statement about `reach` and not about
-/// the region, so the answer is to look closer. A `sat` is a genuinely new piece:
-/// it is kept, added to what the next round must avoid, and `reach` stays where
-/// it is, since a scale that just worked is the right one to try again.
-///
-/// The two directions of error are both benign. Too large wastes a call and
-/// shrinks. Too small returns something adjacent to a point already held, which
-/// is redundant rather than wrong — and the budget bottoms out well above that,
-/// which is why no floor constant appears here.
-///
-/// # Soundness
-///
-/// The constraints are untouched, so any witness is feasible for the real
-/// problem. **Only [`smt::Verdict::Seed`] is read**; an `Impossible` from an
-/// exclusion query means "nothing that far from what we hold", never that the
-/// problem is unsatisfiable.
-///
-/// Everything returned has been judged: [`smt::adjusted`] nudges a boundary
-/// witness and answers only with a point that passes `is_feasible`, so a bad
-/// one costs a solver call and never a wrong point.
-///
-/// # The stage has one budget, in the solver's units
-///
-/// `limit` is the budget for the *whole* stage — one seed query's worth of
-/// insurance, which is what the caller's solver limit already means for a
-/// query — not for each of up to [`GAP_QUERIES`] calls. Each query is given
-/// what remains as its own limit, so none can overrun the stage, and what it
-/// reports spent ([`smt::Answer::spent`]) comes off the top. The stage ends
-/// when the budget does, and at the first `unknown`: that query consumed its
-/// allowance, and the next would be the same document with a weaker
-/// exclusion, which is not a cheaper question. Either way the coverage risk is
-/// logged rather than hidden. A limit of zero is the caller's "no limit" and
-/// stays so; the count and the per-call ceiling still bound the stage.
-///
-/// Why units and not seconds: the 20-segment stepped beam (Artemis's
-/// `e06`, `tests/regression_fixture.rs`) spends the full default limit on one
-/// gap query at 115 s, and sixteen of those before `solve` returned was the
-/// 3.7 CPU-hours the report came with — for a region sampling had in hand in
-/// under a second. In units the same budget is the same work on any machine.
-fn cover_gaps(
+/// A leaf holding a point already in hand is a piece already known and is
+/// skipped. Of the rest, a settled leaf's centre is a seed as it stands, and
+/// every one is taken. An unsettled leaf gets a local solve inside its own
+/// box **only when nothing at all is in hand**: then the solve is the seed
+/// search itself and worth paying for. With a point in hand it is not. A
+/// bisection isolates a piece only where it can split enough coordinates —
+/// a budget of four thousand contractions is twelve splits, which is a
+/// piece at four dimensions and no piece at all at two hundred, where every
+/// leaf is the whole box on the other hundred and eighty-eight coordinates
+/// and a local solve in each is a failing start at two hundred variables,
+/// minutes apiece. The pieces a bisection *can* isolate settle; the ones it
+/// cannot, nothing here can find, and that is the limit recorded in
+/// `docs/todo.md`. Everything returned has been judged where it was made.
+fn cover(
     problem: &ConstraintSystem,
-    logic: &SmtLogic,
-    found: &VecDeque<Point>,
-    limit: u32,
+    leaves: Vec<prune::Leaf>,
+    held: &VecDeque<Point>,
+    local: Option<&mut Xoshiro256PlusPlus>,
     cancel: &Cancellation<'_>,
 ) -> Vec<Point> {
-    if found.is_empty() {
-        return Vec::new();
-    }
-
-    // As far out as it is meaningful to ask: any more and the exclusion covers
-    // the declared box and every answer is `unsat` by construction.
-    let mut reach = problem
-        .variables()
-        .iter()
-        .map(|input| (input.upper_bound - input.lower_bound) / 2.0)
-        .fold(0.0f64, f64::max);
-
-    let mut avoid: Vec<Point> = found.iter().cloned().collect();
-    let mut seeds = Vec::new();
-
-    let unlimited = limit == 0;
-    let mut remaining = limit;
-    let mut cut_short = false;
-    for _ in 0..GAP_QUERIES {
-        // Guards a subnormal reach halving its way to zero, and a NaN from a
-        // non-finite box, which no amount of looking closer will fix. A
-        // cancelled search would otherwise ask, and interrupt, up to sixteen
-        // more times.
-        if !reach.is_finite() || reach <= 0.0 || cancel.is_requested() {
-            break;
+    let mut seeds: Vec<Point> = Vec::new();
+    let mut unsettled: Vec<prune::Node> = Vec::new();
+    for leaf in leaves {
+        if held.iter().any(|point| leaf.node.contains(point)) {
+            continue;
         }
-        if !unlimited && remaining == 0 {
-            cut_short = true;
-            break;
-        }
-        let answer = smt::seed_away_from(problem, logic, remaining, &avoid, reach, cancel);
-        remaining = remaining.saturating_sub(answer.spent);
-        match answer.verdict {
-            smt::Verdict::Seed { point, .. } => {
-                // Avoided whether or not it survives repair: the solver has
-                // told us about this piece, and asking again would be told the
-                // same thing.
-                avoid.push(point.clone());
-                if let Some(seed) = smt::adjusted(problem, point) {
-                    seeds.push(seed);
-                }
-            }
-            smt::Verdict::Impossible { .. } => {
-                // Nothing is out this far; look closer.
-                reach /= 2.0;
-            }
-            smt::Verdict::Inconclusive { .. } => {
-                // Undecided within its allowance. A weaker exclusion is not a
-                // cheaper question, so the stage ends here.
-                cut_short = true;
-                break;
-            }
+        match leaf.settled {
+            Some(centre) => seeds.push(centre),
+            None => unsettled.push(leaf.node),
         }
     }
 
-    if cut_short {
-        tracing::warn!(
-            seeds = seeds.len(),
-            spent = limit - remaining,
-            limit,
-            reach,
-            "gap coverage cut short; components beyond the seeds in hand may be missed"
-        );
+    if held.is_empty()
+        && let Some(rng) = local
+    {
+        // Farthest-first from what is held, in the box's own coordinates,
+        // so a leaf on the far side of the region is solved before one
+        // next to a known piece — the ordering `start_chains` uses for the
+        // same reason.
+        let widths: Vec<f64> = problem
+            .variables
+            .iter()
+            .map(|variable| variable.upper_bound - variable.lower_bound)
+            .collect();
+        let distance = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter()
+                .zip(b)
+                .zip(&widths)
+                .map(|((x, y), width)| {
+                    let scaled = if *width > 0.0 { (x - y) / width } else { 0.0 };
+                    scaled * scaled
+                })
+                .sum()
+        };
+        let centre = |node: &prune::Node| -> Point {
+            node.bounds
+                .iter()
+                .map(|interval| interval.lo() + interval.width() / 2.0)
+                .collect()
+        };
+        let mut remaining = GAP_SEEDS;
+        while remaining > 0 && !unsettled.is_empty() && !cancel.is_requested() {
+            let known: Vec<&Point> = held.iter().chain(seeds.iter()).collect();
+            let farthest = (0..unsettled.len())
+                .map(|index| {
+                    let at = centre(&unsettled[index]);
+                    let nearest = known
+                        .iter()
+                        .map(|point| distance(&at, point))
+                        .fold(f64::INFINITY, f64::min);
+                    (index, nearest)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map_or(0, |(index, _)| index);
+            let node = unsettled.swap_remove(farthest);
+            remaining -= 1;
+            if let Some(seed) = local::find_initial(problem, &node.bounds, 1, rng, cancel) {
+                seeds.push(seed);
+            }
+        }
     }
 
+    tracing::info!(seeds = seeds.len(), "coverage from a bisection's leaves");
     seeds
 }
 
@@ -399,7 +353,8 @@ fn cover_gaps(
 ///
 /// Dropping the `ConstraintSolver::solve` future drops the receiving
 /// end of the opening channel, and the sending end can see that. Brute force
-/// asks between batches, and a solver call asks while it waits on Z3.
+/// asks between batches, a bisection between boxes, a local solve between
+/// evaluations.
 pub(crate) struct Cancellation<'a>(Option<&'a oneshot::Sender<Opening>>);
 
 impl Cancellation<'_> {
@@ -467,15 +422,18 @@ pub(crate) fn serve(
     keep_filling(problem, &mut ladder, progress, batches, stop);
 }
 
-/// The opening: probe, then the solver, then brute force, in that order and
-/// with no flags between them. Each rung runs only if the ones before it left
-/// nothing in hand.
+/// The opening: contract, probe, local solve, bisect, brute force, in that
+/// order and with no flags between them. Each rung runs only if the ones
+/// before it left nothing in hand — except the bisection, which also runs
+/// for coverage when the walker will carry the search.
 ///
-/// The probe is one brute-force batch, tens of microseconds, and settles most
-/// problems outright. The solver goes next because it settles a contradiction
-/// or an equality ribbon in milliseconds, where brute force would spend its
-/// whole budget, and what it answers `unknown` on — anything transcendental,
-/// anything past its resource limit — is exactly what brute force is for.
+/// The contraction is microseconds and settles a plain contradiction before
+/// a single proposal. The probe is one brute-force batch, tens of
+/// microseconds, and settles most problems outright. The local solve finds a
+/// point of a thin region in milliseconds. The bisection is what proves a
+/// contradiction the contraction alone could not see, and what finds the
+/// pieces of a region a chain cannot cross between; what it cannot decide
+/// within its budget is exactly what brute force is for.
 ///
 /// `Satisfied` means at least one feasible point is in hand, which is what
 /// a returned [`FeasibleRegion`](crate::FeasibleRegion) promises.
@@ -485,6 +443,26 @@ fn open(
     progress: Progress,
     cancel: &Cancellation<'_>,
 ) -> (Opening, Progress) {
+    // What each constraint managed to say, over the whole opening: the
+    // answer to "which constraints could nothing be concluded from".
+    let mut contributed = vec![false; problem.constraints.len()];
+    let root = match ladder.prune {
+        None => None,
+        Some(budget) => {
+            match prune::contract(problem, prune::Node::declared(problem), &mut contributed) {
+                prune::Contracted::Empty { blamed } => {
+                    assert!(
+                        progress.is_empty(),
+                        "a point in hand contradicts a proof that there is none: {:?}",
+                        progress.points()
+                    );
+                    return (Opening::Impossible { blamed }, progress);
+                }
+                prune::Contracted::Live(root) => Some((root, budget)),
+            }
+        }
+    };
+
     let (mut progress, walker_will_carry) = match &mut ladder.sampler {
         Some(sampler) => {
             let probe = sampler.probe(problem);
@@ -493,74 +471,59 @@ fn open(
         }
         None => (progress, ladder.walker.is_some()),
     };
-    // Having points settles the *verdict*, and used to end the opening here.
-    // It does not settle **coverage**: hit-and-run cannot discover a component
-    // it was not started in, so a search the walker will carry needs to know
-    // about the whole region before its chains are placed — however the points
-    // it holds were come by. A caller's hint and a brute-force seed are every
-    // bit as single-component as a solver's witness, and
-    // `parabolic_roots_ribbon` hands in one point at `x = -2` and never learns
-    // about the root at 1.
-    //
-    // A search sampling will carry is exempt, and that is not an oversight:
-    // uniform proposals reach every component in proportion to its measure, so
-    // discovery would be a solver call bought for nothing.
-    if !progress.is_empty() {
-        if walker_will_carry && let Some(limit) = ladder.solver {
-            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-            progress = progress.extend(gaps);
-        }
-        return (Opening::Satisfied, progress);
-    }
 
-    // A local solve before any solver: finding one point is an optimisation,
-    // and a local method does it where a decision procedure spends minutes
-    // per query. A seed found here is as single-component as a witness, so it
-    // takes the same road to coverage.
-    if let Some(rng) = &mut ladder.local
-        && let Some(point) = local::seed(problem, rng, cancel)
+    // A local solve before any bisection: finding one point is an
+    // optimisation, and a local method does it where a bisection of two
+    // hundred coordinates would spend its budget on the first few.
+    if progress.is_empty()
+        && let Some(rng) = &mut ladder.local
+        && let Some(point) = local::find_initial(problem, &problem.declared(), local::STARTS, rng, cancel)
     {
         progress = progress.extend(vec![point]);
-        if let Some(limit) = ladder.solver {
-            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-            progress = progress.extend(gaps);
-        }
-        return (Opening::Satisfied, progress);
     }
 
-    let unexpressed = match ladder.solver {
-        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
-        // none was put to anything that could reason about it.
-        None => (0..problem.constraints.len()).collect(),
-        Some(limit) => {
-            match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel).verdict {
-                smt::Verdict::Impossible { blamed } => {
-                    return (Opening::Impossible { blamed }, progress);
+    // Having points settles the *verdict*. It does not settle **coverage**:
+    // hit-and-run cannot discover a component it was not started in, so a
+    // search the walker will carry needs to know about the whole region
+    // before its chains are placed — however the points it holds were come
+    // by. A caller's hint and a local seed are every bit as single-component
+    // as a witness, and `parabolic_roots_ribbon` hands in one point at
+    // `x = -2` and never learns about the root at 1.
+    //
+    // A search sampling will carry is exempt, and that is not an oversight:
+    // uniform proposals reach every component in proportion to its measure,
+    // so discovery would be a budget spent for nothing.
+    if let Some((root, budget)) = root
+        && (progress.is_empty() || walker_will_carry)
+    {
+        match prune::bisect(problem, root, budget, &mut contributed, cancel) {
+            prune::Pruned::Empty { blamed } => {
+                assert!(
+                    progress.is_empty(),
+                    "a point in hand contradicts a proof that there is none: {:?}",
+                    progress.points()
+                );
+                return (Opening::Impossible { blamed }, progress);
+            }
+            prune::Pruned::Live { leaves, exhausted } => {
+                if exhausted {
+                    tracing::warn!(
+                        leaves = leaves.len(),
+                        budget,
+                        "bisection cut short; pieces beyond the seeds in hand may be missed"
+                    );
                 }
-                smt::Verdict::Inconclusive { unexpressed } => unexpressed,
-                smt::Verdict::Seed { point, unexpressed } => {
-                    // The witness is exact in real arithmetic and need not be in
-                    // `f64`. Repairing beats discarding: the solver call that found
-                    // it is the expensive part, and the miss is in the last place.
-                    // A seed is not a sample either: it satisfies whatever could
-                    // be expressed, and it is judged against *everything*; if it
-                    // does not survive that, brute force still gets its turn.
-                    progress = progress.extend(smt::adjusted(problem, point).into_iter().collect());
-
-                    // With a point in hand the search knows one piece of its region,
-                    // so now ask the solver about the rest of the box. A region in
-                    // several pieces gets a seed in more than one of them here or
-                    // nowhere: a chain cannot cross between them afterwards.
-                    if !progress.is_empty() {
-                        let gaps =
-                            cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
-                        progress = progress.extend(gaps);
-                    }
-                    unexpressed
-                }
+                let seeds = cover(
+                    problem,
+                    leaves,
+                    progress.points(),
+                    ladder.local.as_mut(),
+                    cancel,
+                );
+                progress = progress.extend(seeds);
             }
         }
-    };
+    }
 
     if progress.is_empty()
         && let Some(sampler) = &mut ladder.sampler
@@ -574,11 +537,17 @@ fn open(
         progress = progress.absorb(trial);
     }
 
-    if progress.is_empty() {
-        (Opening::Unproven { unexpressed }, progress)
-    } else {
-        (Opening::Satisfied, progress)
+    if !progress.is_empty() {
+        return (Opening::Satisfied, progress);
     }
+    // Without a contractor every constraint is "unexpressed" in the sense
+    // `NotFound` uses: none was put to anything that could reason about it.
+    let unexpressed = contributed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, said)| (!said).then_some(index))
+        .collect();
+    (Opening::Unproven { unexpressed }, progress)
 }
 
 /// The steady state: one batch per trip through the channel until the caller
@@ -697,39 +666,49 @@ mod tests {
         }
     }
 
-    /// The order of escalation: probe, local solve, solver, brute force. With
-    /// no budget at all a region the seeders can reach is still found, because
-    /// they go first; a region the solver answers `unknown` on — a
-    /// transcendental — is found anyway, because what it cannot decide is
-    /// handed to brute force.
+    /// The order of escalation: contract, probe, local solve, bisect, brute
+    /// force. With no proposal budget at all a region the seeders can reach
+    /// is still found, because they go first; a region interval reasoning
+    /// cannot settle within its budget — a computed subscript, which it
+    /// concludes nothing from — is found anyway, because what it cannot
+    /// decide is handed to brute force.
     #[pollster::test]
-    async fn the_solver_goes_first_and_brute_force_takes_what_it_cannot_decide() {
-        let by_solver = ConstraintSolver::new()
+    async fn the_seeders_go_first_and_brute_force_takes_what_they_cannot_decide() {
+        let by_seeders = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_proposal_budget(0)
             .solve(&one_in_a_million())
             .await;
         assert!(
-            by_solver.is_ok(),
-            "Z3 should have seeded the region with no brute force at all: {by_solver:?}"
+            by_seeders.is_ok(),
+            "the contraction or the local solve should have seeded the region with no brute \
+             force at all: {by_seeders:?}"
         );
 
-        // `sin` is increasing on `[0, 1]`, so this is `x1 > 0.99999` written
-        // so that no solver can be asked about it: one in a hundred thousand,
+        // `var[n]` with `n` pinned to 1 is `x1 > 0.99999` written so that
+        // nothing but the evaluator can read it: one in a hundred thousand,
         // ten expected hits in the budget below.
-        let transcendental = ConstraintSystem::new(
-            vec![InputVariable::new("x1", 0.0, 1.0)],
-            ["sin(x1) > sin(0.99999)"],
+        let opaque = ConstraintSystem::new(
+            vec![
+                InputVariable::new("x1", 0.0, 1.0),
+                InputVariable::new("n", 1.0, 1.0),
+            ],
+            ["var[n] > 0.99999"],
         )
         .expect("the fixture binds");
         let by_brute_force = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_strategies(vec![
+                Strategy::BruteSquad,
+                Strategy::HitAndRun,
+                Strategy::Prune,
+            ])
             .with_proposal_budget(1_000_000)
             .with_threads(2)
-            .solve(&transcendental)
+            .solve(&opaque)
             .await;
-        let mut samples =
-            by_brute_force.expect("brute force should have taken over from Z3's `unknown`");
+        let mut samples = by_brute_force
+            .expect("brute force should have taken over from what nothing could conclude on");
         let delivered = samples.take(5);
         assert_eq!(delivered.ncols(), 5);
         for column in 0..5 {
@@ -741,11 +720,12 @@ mod tests {
         }
     }
 
-    /// The solver limit reaches Z3 through the builder: an instance Z3 would
-    /// grind on comes back `NotFound` promptly, with no brute force to mask it
-    /// — on either engine.
+    /// The prune budget reaches the bisection through the builder: an
+    /// instance it would grind on comes back `NotFound` promptly, with no
+    /// brute force to mask it — a small budget, and no more contractions
+    /// than it allows.
     #[pollster::test]
-    async fn the_solver_limit_bounds_the_opening() {
+    async fn the_prune_budget_bounds_the_opening() {
         let hard = ConstraintSystem::new(
             vec![
                 InputVariable::new("x", 0.0, 100.0),
@@ -763,7 +743,7 @@ mod tests {
         let started = std::time::Instant::now();
         let verdict = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .with_solver_limit(30_000)
+            .with_prune_budget(64)
             .with_proposal_budget(0)
             .with_gpu(false)
             .solve(&hard)
@@ -776,8 +756,9 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
-    /// Pins that the loop is what changed: with no budget on either engine
-    /// the pool behaves as it did before step 4 and gives up after the probe.
+    /// Pins that the loop is what changed: with no proposal budget and no
+    /// seeder the pool behaves as it did before step 4 and gives up after
+    /// the probe.
     #[pollster::test]
     async fn a_zero_budget_is_the_old_behaviour() {
         let verdict = ConstraintSolver::new()
@@ -804,7 +785,6 @@ mod tests {
             .expect("the fixture binds");
         let ladder = Ladder::new(
             &system,
-            SmtLogic::default(),
             Xoshiro256PlusPlus::seed_from_u64(SEED),
             &[Strategy::BruteSquad, Strategy::HitAndRun],
             Budgets {

@@ -130,10 +130,10 @@ pub enum Kind {
     /// An aggregate whose bounds were known at compile time, unrolled into its
     /// terms by [`crate::frontend::rewrite::unroll_aggregates`].
     ///
-    /// N-ary rather than a chain of [`Kind::Binary`]. SMT-LIB's `(+ a b c …)`
-    /// is n-ary too, so this maps onto it directly instead of needing a
-    /// flattening pass; and a thousand-term aggregate is one node deep rather
-    /// than a thousand, which keeps the recursive passes off the stack limit.
+    /// N-ary rather than a chain of [`Kind::Binary`]: a thousand-term
+    /// aggregate is one node deep rather than a thousand, which keeps the
+    /// recursive passes — lowering, interval narrowing — off the stack limit,
+    /// and a fold is what the runtime loop was anyway.
     ///
     /// Evaluated left-to-right from [`AggregateKind::identity`], which is what
     /// the runtime loop does — so unrolling cannot change a result. Rebalancing
@@ -152,8 +152,8 @@ pub enum Kind {
     // `rewrite_booleans` pass in the shared pipeline, which meant the `<= 0`
     // residual convention — *the evaluator's* convention — destroyed the
     // structure `cvg` needs before `cvg` could read it. Each backend lowers
-    // them its own way now: `eval` computes a residual inline, `cvg::smtlib`
-    // renders a comparison as a comparison.
+    // them its own way now: `eval` computes a residual inline, interval
+    // narrowing reads a comparison as a target interval.
     //
     // The grammar keeps them at the root of an expression and nowhere else:
     // `lambdaExpr` takes a `scalarBlock`, so a boolean cannot appear inside
@@ -447,11 +447,11 @@ impl Expr {
     /// The whole exponent this node spells, if it is a literal whole number
     /// within [`POWER_LIMIT`]; `None` for anything a backend hands to `powf`.
     ///
-    /// One rule shared by the tape, the SMT emitter and interval narrowing, so
-    /// the three agree on which powers are polynomials without a pass
-    /// enforcing it. A whole power is sign-safe everywhere and a solver can
-    /// reason about it; a real one is `exp(n * ln x)`, undefined for a
-    /// negative base and beyond every solver.
+    /// One rule shared by the tape, the WGSL kernel and interval narrowing,
+    /// so the three agree on which powers are polynomials without a pass
+    /// enforcing it. A whole power is sign-safe everywhere and has a root to
+    /// narrow through; a real one is `exp(n * ln x)`, undefined for a
+    /// negative base and without an inverse anything here will use.
     #[must_use]
     pub(crate) fn whole_exponent(&self) -> Option<i64> {
         match self.kind {

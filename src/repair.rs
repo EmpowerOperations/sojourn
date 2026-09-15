@@ -38,24 +38,36 @@
 //! outward by a few ulps, so a landing on the bound itself nudges inward by a
 //! doubling ladder of ulps until the coordinate's own constraints pass.
 //!
-//! **Shotgun.** Where clamping cannot land — two bands with a gap between, a
-//! disc approached from a corner — the anchors decide. From each of the nearest
-//! few anchors that are themselves feasible, bisect along the segment toward
-//! the point: the anchor end is feasible, the far end is not, and the feasible
-//! end of the final bracket is a point on the boundary between them. That
-//! landing then gets the clamp stage again, which from a feasible point is
-//! precisely "step each coordinate its clearance off the nearest wall". The
-//! nearest such point is the answer, and an anchor that has the clearance is a
-//! candidate in its own right, which is what makes "never farther than the
-//! nearest anchor" a guarantee rather than a hope. One directed chord per
-//! anchor is the whole of what a chain biased toward the point would find, at
-//! a thousandth of the cost.
+//! **Project.** Where clamping cannot land — two bands with a gap between, a
+//! disc approached from a corner — the point is projected: the feasible point
+//! nearest it, sought by a local solve from where clamping left it
+//! ([`local::nearest`]), `min ‖u − p‖²` over the unit cube subject to every
+//! constraint with the clearance built into its rows. The landing depends on
+//! the constraints and the point and on nothing else. That is the property
+//! the consumer needs, and the one the previous design lacked: it bisected a
+//! chord from the nearest of a set of *anchors* the caller supplied, so every
+//! landing was a convex combination of the proposal and a census point — every
+//! coordinate dragged toward wherever the census happened to be — and over
+//! thousands of repairs the optimizer was herded toward the census rather
+//! than along the boundary its objective preferred. Measured on a disc with
+//! anchors clustered at angle zero: the corner at 45° landed at 17°. A
+//! projection lands it at 45°.
+//!
+//! A landing with the clearance gets the clamp stage again, which from a
+//! feasible point is precisely "step each coordinate its clearance off the
+//! nearest wall" and a no-op where it already has it. A landing that is
+//! feasible but without the clearance — where no slice can read a wall, as
+//! narrowing declines a real exponent — is backed off along the projection's
+//! own direction, `p → x*` continued inward, in doublings of the clearance
+//! until the oracle passes: that direction is the boundary's normal at the
+//! landing, which is the inward direction the chord used to stand in for.
 //!
 //! **Release.** Both stages can move a coordinate that, in hindsight, did not
 //! need to move — a clamp computed against a neighbour that then moved too, a
-//! chord that carried every coordinate when one constraint was active. So the
-//! last thing done to any answer is to put each moved coordinate back where it
-//! was, one at a time, keeping every reversion that keeps the clearance.
+//! projection that carried every coordinate when one constraint was active. So
+//! the last thing done to any answer is to put each moved coordinate back
+//! where it was, one at a time, keeping every reversion that keeps the
+//! clearance.
 //!
 //! # Clearance: a deliberate step inside, not an ulp
 //!
@@ -63,9 +75,8 @@
 //! before evaluating. That round trip is one ulp off for some values, and one
 //! ulp on a coordinate can move a residual by `1e-8` when the coordinate enters
 //! a term at the fourth power. A landing a few ulps inside a bound — which is
-//! what the ladder alone produces, and what a sixty-bit bisection produces
-//! along a chord — is feasible here and infeasible by the time the caller
-//! looks at it. Found at a vertex of the tension spring, where two constraints
+//! what the ladder alone produces — is feasible here and infeasible by the
+//! time the caller looks at it. Found at a vertex of the tension spring, where two constraints
 //! are active at once; `tests/regression_fixture.rs` keeps the case.
 //!
 //! So `repair` takes a **clearance**: a fraction of each variable's box width
@@ -90,55 +101,38 @@
 //! point in it: the region is thinner than the caller's own noise floor, and
 //! saying so beats handing back a point that will fail on the next look.
 //!
-//! # The metric is L1 over box-normalised coordinates
+//! # The metric is over box-normalised coordinates
 //!
 //! Normalised, because the caller thinks in a unit cube and "near" in metres
-//! and pascals at once means nothing. L1 rather than L2, because the contrast
-//! between nearest and farthest neighbour collapses in high dimension and
-//! collapses fastest for the higher norms (Aggarwal, Hinneburg & Keim, 2001);
-//! at fifty to two hundred dimensions over a census of thousands, the nearest
-//! anchor under L2 is barely nearer than the farthest. And along a segment L1
-//! is linear in the parameter, which is what makes the bisection's endpoint
-//! provably no farther than its anchor.
+//! and pascals at once means nothing. What this module measures and reports
+//! in — the consolation in [`RepairError::Cramped`], the back-off's unit — is
+//! L1, which along a segment is linear in the parameter. The projection
+//! itself minimises L2², because COBYLA fits linear models and a kink at every
+//! axis fights them; the two agree on what is near enough for the cases here,
+//! and the optimizer being repaired measures in its own metric anyway.
 //!
 //! # What is deliberately not here
 //!
 //! No randomness — not a draw, not a seed. No gradient: babel has no
 //! derivatives, and a finite-difference normal is ill-defined at exactly the
-//! vertices the clearance exists for, where the axis and the chord are inward
-//! directions already in hand. No solver: an SMT call is milliseconds to
-//! seconds where this budget is microseconds, and transcendentals are outside
-//! its theories anyway. No brute force: it cannot localise in high dimension,
-//! and it would re-solve the find-a-first-point problem the whole module is
-//! built around on every call.
-
-use faer::MatRef;
+//! vertices the clearance exists for, where the axis is an inward direction
+//! already in hand. No anchors: nothing the caller has seen elsewhere may
+//! influence where a point lands, for the reason above. No brute force: it
+//! cannot localise in high dimension, and it would re-solve the
+//! find-a-first-point problem the whole module is built around on every call.
 
 use crate::cvg::incidence::Row;
-use crate::cvg::{classify, interval};
+use crate::cvg::{classify, interval, local};
 use crate::{ConstraintSystem, Point};
 
-/// How many rounds of clamping a point gets before the anchors take over.
+/// How many rounds of clamping a point gets before the projection takes over.
 ///
 /// A clamp is computed with the other coordinates held, so a coordinate that
 /// moves can open room for another; a few rounds catch that. Most points land
 /// in one, and a point that has not landed after this many is one the slices
-/// do not describe — a gap the chord has to cross.
+/// do not describe — a gap or a corner the projection has to find its way
+/// round.
 const CLAMP_SWEEPS: usize = 8;
-
-/// How many of the nearest anchors get a chord.
-///
-/// More than one because the nearest anchor by L1 is not always the one whose
-/// chord ends nearest — a chord stops at the first boundary it meets, and the
-/// second-nearest anchor may see the point across a shorter stretch of
-/// infeasible space. Eight is enough that the census's nearest cluster is
-/// covered and few enough that a repair stays microseconds.
-const ANCHOR_SHOTS: usize = 8;
-
-/// Bisection steps along a chord. Each halves the bracket, so this is a budget
-/// in bits and sixty is past where an `f64` parameter in `[0, 1]` can still be
-/// halved.
-const CHORD_BITS: usize = 60;
 
 /// How far inward a landing may nudge, as a power of two in ulps.
 ///
@@ -151,10 +145,12 @@ const LANDING_LADDER: u32 = 20;
 /// Why [`FeasibleRegion::repair`](crate::FeasibleRegion::repair) could not answer.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RepairError {
-    /// Nothing feasible was reached: clamping could not land, and no anchor
-    /// among the nearest few was feasible. Between two bands with no anchor to
-    /// bisect toward, no interval says which way to go.
-    #[error("no feasible point was reached: clamping could not land and no anchor was feasible")]
+    /// Nothing feasible was reached: clamping could not land, and the
+    /// projection found no feasible evaluation within its budget — a region
+    /// too thin for a local solve to fall into, or none at all.
+    #[error(
+        "no feasible point was reached: clamping could not land and the projection found nothing"
+    )]
     Stranded,
     /// A feasible point was reached, but nowhere with the clearance asked for:
     /// the feasible room there is narrower than twice the clearance. `nearest`
@@ -167,12 +163,11 @@ pub enum RepairError {
 }
 
 /// A point that satisfies `system` with `clearance` to spare, near `point`,
-/// the same every time. The contract — anchors, clearance, the guarantees,
-/// the errors and the panics — is documented on
+/// the same every time. The contract — clearance, the guarantees, the errors
+/// and the panics — is documented on
 /// [`FeasibleRegion::repair`](crate::FeasibleRegion::repair), the only caller.
 pub(crate) fn repair(
     system: &ConstraintSystem,
-    anchors: MatRef<'_, f64>,
     point: &[f64],
     clearance: f64,
 ) -> Result<Point, RepairError> {
@@ -181,11 +176,6 @@ pub(crate) fn repair(
         point.len(),
         dimensions,
         "a point has one coordinate per variable of the system it is repaired against"
-    );
-    assert_eq!(
-        anchors.nrows(),
-        dimensions,
-        "anchors have one row per variable of the system they anchor"
     );
     assert!(
         clearance.is_finite() && clearance >= 0.0,
@@ -229,90 +219,54 @@ pub(crate) fn repair(
         }
     };
 
-    // Anchors nearest to where the point now stands, after whatever clamping
-    // achieved; a clamp that did not land still moved the point onto the right
-    // side of the constraints it could read, and the chord is shorter for it.
-    let mut ranked: Vec<(f64, usize)> = (0..anchors.ncols())
-        .map(|column| {
-            let anchor: Point = (0..dimensions).map(|row| anchors[(row, column)]).collect();
-            (distance(&anchor, &current), column)
-        })
-        .collect();
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // The projection, from where clamping left the point: a clamp that did not
+    // land still moved it onto the right side of the constraints it could
+    // read, and the solve starts nearer for it. "Nearest" is measured to the
+    // caller's point throughout.
+    let projected = local::nearest(system, &current, point, clearance);
 
     let mut best: Option<(f64, Point)> = None;
-    for (_, column) in ranked.into_iter().take(ANCHOR_SHOTS) {
-        let anchor: Point = (0..dimensions).map(|row| anchors[(row, column)]).collect();
-        if !system.is_feasible(&anchor, 0.0) {
-            continue;
-        }
+    if let Some(landed) = projected.clear {
+        // The landing has the clearance; the clamp from a feasible point only
+        // steps a coordinate off a wall it is against, and leaves this one be.
+        let clear = match clamped(system, &widths, landed.clone(), clearance) {
+            Ok(clear) => clear,
+            Err(_) => landed,
+        };
+        best = Some((distance(&clear, point), clear));
+    }
 
-        // The anchor is a candidate at `t = 0` when it has the clearance
-        // itself; a chord can only end nearer than that or lose to it.
-        if system.is_feasible(&anchor, clearance) {
-            let reached = distance(&anchor, point);
-            if best.as_ref().is_none_or(|(nearest, _)| reached < *nearest) {
-                best = Some((reached, anchor.clone()));
-            }
-        }
-
-        // `t = 0` is the anchor and feasible; `t = 1` is `current` and lacks
-        // the clearance, or the clamp stage would have returned. Halve the
-        // bracket toward wherever feasibility ends. A segment through a gap is
-        // bracketed just the same — the feasible end is always a probe that
-        // passed, or the anchor itself. When `current` is feasible but cramped
-        // every probe passes and the landing is `current`; the back-off below
-        // then walks it toward the anchor.
-        let mut landed = anchor.clone();
-        let (mut lower, mut upper) = (0.0_f64, 1.0_f64);
-        for _ in 0..CHORD_BITS {
-            let middle = 0.5 * (lower + upper);
-            if middle <= lower || middle >= upper {
-                break;
-            }
-            let mut probe: Point = anchor
-                .iter()
-                .zip(&current)
-                .map(|(from, to)| from + middle * (to - from))
-                .collect();
-            classify::settle(system, &mut probe);
-            if system.is_feasible(&probe, 0.0) {
-                lower = middle;
-                landed = probe;
-            } else {
-                upper = middle;
-            }
-        }
-
-        // The landing is feasible and within a bit of the boundary along the
-        // chord; the clamp steps it off the walls it is against.
-        let (stepped, cramped_here) = match clamped(system, &widths, landed.clone(), clearance) {
-            Ok(clear) => (Some(clear), landed),
+    if best.is_none()
+        && let Some(landed) = projected.feasible
+    {
+        // Feasible, without the clearance, and the rows had the margin built
+        // in: the constraints here are ones the margin could not read either
+        // — a real exponent that faults a step away. The clamp gets its turn,
+        // and failing that the only inward direction in hand is the
+        // projection's own: back off along `point -> landed`, continued past
+        // the landing, in doublings of the clearance until the oracle is
+        // satisfied. The first rung that passes is within a factor of two of
+        // the least back-off, which at this scale is all the precision the
+        // answer can use.
+        match clamped(system, &widths, landed.clone(), clearance) {
+            Ok(clear) => best = Some((distance(&clear, point), clear)),
             Err(reached) => {
-                // No wall the slices could read — a constraint narrowing
-                // declines, as it does a real exponent — so the only inward
-                // direction in hand is the chord itself. Back off along it
-                // toward the anchor in doublings of the clearance until the
-                // oracle is satisfied; the first rung that passes is within a
-                // factor of two of the least back-off, which at this scale is
-                // all the precision the answer can use.
-                let length = distance(&anchor, &current);
+                let length = distance(&landed, point);
                 let unit = if clearance > 0.0 && length > 0.0 {
                     clearance / length
                 } else {
                     0.0
                 };
-                let mut backed = None;
                 let mut rung = unit;
-                while unit > 0.0 && rung < lower {
-                    let mut probe: Point = anchor
+                while unit > 0.0 && rung < 1.0 {
+                    let mut probe: Point = point
                         .iter()
-                        .zip(&current)
-                        .map(|(from, to)| from + (lower - rung) * (to - from))
+                        .zip(&landed)
+                        .map(|(from, to)| from + (1.0 + rung) * (to - from))
                         .collect();
                     classify::settle(system, &mut probe);
                     if system.is_feasible(&probe, clearance) {
-                        backed = Some(probe);
+                        best = Some((distance(&probe, point), probe));
                         break;
                     }
                     rung *= 2.0;
@@ -325,20 +279,9 @@ pub(crate) fn repair(
                 } else {
                     landed
                 };
-                (backed, consolation)
-            }
-        };
-        match stepped {
-            Some(clear) => {
-                let reached = distance(&clear, point);
-                if best.as_ref().is_none_or(|(nearest, _)| reached < *nearest) {
-                    best = Some((reached, clear));
-                }
-            }
-            None => {
-                let at = distance(&cramped_here, point);
+                let at = distance(&consolation, point);
                 if cramped.as_ref().is_none_or(|(nearest, _)| at < *nearest) {
-                    cramped = Some((at, cramped_here));
+                    cramped = Some((at, consolation));
                 }
             }
         }
@@ -354,8 +297,8 @@ pub(crate) fn repair(
 /// `from` clamped into its slices, sweep by sweep, until it has the clearance:
 /// `Ok` with that point, `Err` with the point as far as clamping got.
 ///
-/// Called on the caller's point and on every chord landing. From an infeasible
-/// point it is the axis projection described in the module doc; from a
+/// Called on the caller's point and on the projection's landing. From an
+/// infeasible point it is the axis projection described in the module doc; from a
 /// feasible one it is the step off the walls, since a coordinate already
 /// inside its shrunk slice is not moved.
 fn clamped(
@@ -440,8 +383,8 @@ fn clamped(
         }
     }
     // Nothing left to clamp, or the sweeps ran out. A point with nothing to
-    // clamp may already have the clearance — a chord landing that met no
-    // wall — and is judged rather than presumed.
+    // clamp may already have the clearance — a projection's landing that met
+    // no wall — and is judged rather than presumed.
     if system.is_feasible(&current, clearance) {
         Ok(current)
     } else {
@@ -481,8 +424,8 @@ fn landed(system: &ConstraintSystem, point: &Point, coordinate: usize, clearance
 /// Clear in, clear out: a reversion is kept only if the whole point still
 /// passes with its clearance, so this can only shorten the distance to
 /// `original`, never break the answer. It exists because both stages over-move
-/// — a clamp is computed against neighbours that then move too, and a chord
-/// carries every coordinate when one constraint was active — and hindsight is
+/// — a clamp is computed against neighbours that then move too, and a
+/// projection carries every coordinate when one constraint was active — and hindsight is
 /// one check per coordinate. The clearance is part of the check because a
 /// coordinate the caller left an ulp from a wall is exactly what must not be
 /// handed back.

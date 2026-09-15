@@ -678,9 +678,23 @@ impl Narrowing<'_> {
 
     /// Pushes `target` onto `lhs - rhs`, which is not a node in the tree — the
     /// comparison holds the two sides apart. The inverses are `Sub`'s.
+    ///
+    /// First the forward check: the difference's enclosure is a superset of
+    /// what it can be, so an enclosure that misses `target` altogether means
+    /// the constraint holds nowhere on this box, whatever its inverses can
+    /// or cannot say — `x^1.234 > 1000000` on `[0, 10]` is settled here, with
+    /// no inverse for a real exponent needed. The conclusion is `EMPTY`, the
+    /// one thing distinct from "nothing concluded".
     fn difference(&mut self, lhs: &Expr, rhs: &Expr, target: Interval) {
         let left = self.forward(lhs);
         let right = self.forward(rhs);
+        if binary(BinaryOp::Sub, left, right)
+            .intersect(target)
+            .is_empty()
+        {
+            self.found = Interval::EMPTY;
+            return;
+        }
         self.backward(lhs, binary(BinaryOp::Add, target, right));
         self.backward(rhs, binary(BinaryOp::Sub, left, target));
     }

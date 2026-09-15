@@ -3,19 +3,19 @@
 //! can it judge while trying?
 //!
 //! `docs/brute-squad.md` is the plan this file is step 0
-//! of. The regime is a feasible fraction of about 1e-6 to 1e-9, where the SMT
-//! solver cannot help — usually because the constraint holds a transcendental,
-//! which Z3 answers `unknown` on — and the honest answer is wide-batch sampling
-//! on every core and any GPU present. These tests are red until that exists,
-//! and go green a rung at a time as each tier lands.
+//! of. The regime is a feasible fraction of about 1e-6 to 1e-9, where no
+//! seeder can help — the region is too thin for a contraction to isolate and
+//! too oddly shaped for a local solve to fall into — and the honest answer is
+//! wide-batch sampling on every core and any GPU present. These tests are red
+//! until that exists, and go green a rung at a time as each tier lands.
 //!
 //! # Two fixtures
 //!
 //! **Time to first hit** is empirical: did a point arrive inside the budget or
 //! not. It goes through the public [`ConstraintSolver::solve`] path, because
-//! the tier being built lives inside it, and it keeps the solver *out* by
-//! passing [`SAMPLING_ONLY`] — Z3 answers `x1 > 0.999999` instantly and would
-//! turn every rung into a measurement of Z3.
+//! the tier being built lives inside it, and it keeps the seeders *out* by
+//! passing [`SAMPLING_ONLY`] — a contraction settles `x1 > 0.999999` at once
+//! and would turn every rung into a measurement of the contractor.
 //!
 //! **Checks per second** is the engineering dial: uniform candidates filled
 //! straight into a matrix, every constraint of a family evaluated over the
@@ -329,27 +329,27 @@ fn the_harness_finds_an_easy_region() {
 }
 
 /// The strategy list this file measures with is production minus the seeders
-/// — the solver and the local solve — and nothing else, so a tier that joins
-/// the defaults is measured here too unless it is one more way of finding a
-/// point without sampling.
+/// — branch-and-prune and the local solve — and nothing else, so a tier that
+/// joins the defaults is measured here too unless it is one more way of
+/// finding a point without sampling.
 #[test]
 fn sampling_only_is_the_default_ladder_minus_the_seeders() {
     let expected: Vec<Strategy> = DEFAULT_STRATEGIES
         .iter()
         .copied()
-        .filter(|strategy| !matches!(strategy, Strategy::Solver | Strategy::LocalSolve))
+        .filter(|strategy| !matches!(strategy, Strategy::Prune | Strategy::LocalSolve))
         .collect();
     assert_eq!(SAMPLING_ONLY, expected.as_slice());
 }
 
-/// Without the solver in the list an empty region is `NotFound`, never
+/// Without branch-and-prune in the list an empty region is `NotFound`, never
 /// `Proved`: nothing was asked that could prove anything. This is the property
 /// every budgeted test below relies on, checked on a region that is empty by
 /// construction so it holds in either profile and at any speed — with the
 /// debug-sized budget, because a billion proposals on an unoptimised tape is
 /// minutes, and the verdict on an empty region is the same at any budget.
 #[test]
-fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
+fn without_a_prover_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = ["x1 > 2.0".to_owned()];
     let verdict = pollster::block_on(
         ConstraintSolver::new()
@@ -369,7 +369,7 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
                 "every constraint is unexpressed when nothing was asked"
             );
         }
-        other => panic!("expected NotFound without a solver, got {other:?}"),
+        other => panic!("expected NotFound without a prover, got {other:?}"),
     }
 }
 

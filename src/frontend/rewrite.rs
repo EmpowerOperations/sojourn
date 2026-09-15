@@ -192,17 +192,17 @@ pub(crate) struct SubscriptError {
 ///
 /// # What it buys
 ///
-/// A subscript is an indirection that serves nobody downstream. `cvg::smtlib`
-/// resolves one itself; `cvg::classify` gave up on the whole constraint rather
-/// than reason about one, so `1.5 == var[1] + var[2]` could never be driven.
-/// Resolving here means neither has to care, and `Ast::contains_dynamic_lookup`
-/// stops meaning "has a subscript" and starts meaning "has one nothing could
-/// resolve" - which is what a caller actually needs before pruning columns it
-/// believes unreferenced.
+/// A subscript is an indirection that serves nobody downstream. `cvg::classify`
+/// gave up on the whole constraint rather than reason about one, so
+/// `1.5 == var[1] + var[2]` could never be driven, and `cvg::interval` can
+/// narrow nothing through one. Resolving here means neither has to care, and
+/// `Ast::contains_dynamic_lookup` stops meaning "has a subscript" and starts
+/// meaning "has one nothing could resolve" - which is what a caller actually
+/// needs before pruning columns it believes unreferenced.
 ///
 /// A *computed* subscript - `var[n]` - is left exactly as it was and keeps the
 /// flag true. Which variable it reads depends on the point, so there is nothing
-/// static to resolve, and `smtlib` already answers `Refusal::ComputedSubscript`.
+/// static to resolve, and interval evaluation answers `ENTIRE` to it.
 ///
 /// # Errors
 /// [`SubscriptError`] when a literal subscript falls outside the schema.
@@ -387,11 +387,12 @@ fn holds_subscript(block: &Block) -> bool {
 /// that no solver will reason about.
 ///
 /// `2 < ln(x1)` becomes `x1 > e^2`; `20 > 2^x5` becomes `x5 < log2(20)`. The
-/// bound is computed here, in `f64`, so what reaches the emitter is linear in
-/// `u` and wants no logarithm from the solver at all. Both are real constraints
-/// in the CVG corpus and are the whole reason this exists — Z3 has no logarithm
-/// under any spelling, and inverting through `^` does not work either, since a
-/// variable exponent answers `unknown` even with the other side pinned.
+/// bound is computed here, in `f64`, so what reaches a backend is linear in
+/// `u` and wants no logarithm inverted at all. Both are real constraints in
+/// the CVG corpus and are the reason this was written — the SMT solver of the
+/// day had no logarithm under any spelling, and inverting through `^` did not
+/// work either, since a variable exponent answered `unknown` even with the
+/// other side pinned.
 ///
 /// It outlives its own motivation, too: restricting `a ^ b` to an integer `b`
 /// would make `2^x5` a compile error, and this rewrites it away first.
@@ -736,11 +737,11 @@ const UNROLL_LIMIT: i64 = 1024;
 /// Replaces every aggregate with the terms it expands to.
 ///
 /// `sum` and `prod` are big-sigma and big-pi over a fixed index set, and that
-/// is all they are: after this pass no [`Kind::Aggregate`] exists, and neither
-/// backend has to know one ever did. This is what keeps them out of an SMT-LIB
-/// translation, where they would otherwise become quantifiers and cost a
-/// complexity class, and out of the batched evaluator, where a loop whose trip
-/// count differs per sample cannot run a tile at a time.
+/// is all they are: after this pass no [`Kind::Aggregate`] exists, and no
+/// backend has to know one ever did. This is what keeps them out of the
+/// batched evaluator, where a loop whose trip count differs per sample cannot
+/// run a tile at a time, and out of interval narrowing, which walks a fold
+/// term by term.
 ///
 /// # Errors
 /// A bound that is not a constant expression, one that is a constant but not a
@@ -937,8 +938,8 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
             // time substitution puts a literal where the parameter was.
             // `var[i-1]` would otherwise unroll to `var[2 - 1]` and stay an
             // expression — indistinguishable downstream from `var[n]`, which
-            // nothing can resolve, so `smtlib` refuses it and `classify` refuses
-            // the whole constraint.
+            // nothing can resolve, so `interval` narrows nothing through it
+            // and `classify` refuses the whole constraint.
             //
             // Best effort: a subscript that will not fold — `var[1/0]`, whose
             // literal is not finite — is left as it was, and reported by
@@ -1027,9 +1028,9 @@ mod tests {
     /// happens to be constant.
     ///
     /// `fold_constants` runs before unrolling, so nothing else will do it, and
-    /// the difference is not cosmetic: `smtlib` resolves a literal subscript
-    /// against the schema and answers `ComputedSubscript` for anything else, so
-    /// an unfolded `var[2 - 1]` costs the solver the whole constraint. Every
+    /// the difference is not cosmetic: `resolve_subscripts` resolves a literal
+    /// subscript against the schema and leaves anything else computed, so an
+    /// unfolded `var[2 - 1]` costs every reader the whole constraint. Every
     /// aggregate subscript in the corpus is arithmetic — Rosenbrock's
     /// `var[i-1]`, `var[2*i-1]` — so this is most of them.
     #[test]
@@ -1276,8 +1277,8 @@ mod tests {
 
     /// `sin` is monotone on `[0, 1]`, but this pass cannot know the box, so it
     /// must leave `sin(x1) > c` alone. `tests/brute_squad.rs` depends on that:
-    /// its transcendental family exists to exercise the case Z3 refuses, and an
-    /// inversion here would quietly turn it back into arithmetic.
+    /// its transcendental family exists to exercise a case no seeder settles,
+    /// and an inversion here would quietly turn it back into arithmetic.
     #[test]
     fn a_trig_function_is_not_inverted() {
         let expression = crate::parse("sin(x1) > 0.5").expect("should compile");

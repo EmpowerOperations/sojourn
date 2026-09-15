@@ -84,10 +84,11 @@ pub(crate) enum Shape {
     ///
     /// Drawing the line here rather than at "and beyond every solver" is
     /// deliberate. The narrower rule let `x2 == x1 + x2/2 - x3/x4` through
-    /// because Z3 can answer it, which is true and beside the point: nothing
-    /// downstream can *drive* it, so it falls to whatever the sampler manages
-    /// and reads as a capability we do not have. One rule stated once beats a
-    /// rule that depends on what the emitter happens to support this month.
+    /// because the solver of the day could answer it, which was true and
+    /// beside the point: nothing downstream can *drive* it, so it falls to
+    /// whatever the sampler manages and reads as a capability we do not
+    /// have. One rule stated once beats a rule that depends on what a
+    /// backend happens to support this month.
     ///
     Implicit { variable: GlobalId },
     /// Nothing structural to say: rows C, D and E, plus anything that is not an
@@ -166,37 +167,13 @@ impl Plan {
 /// defined in terms of another, and `slice` reads the point as it stands,
 /// so computing them out of order reads a stale value.
 pub(crate) fn retract(system: &ConstraintSystem, point: &mut Point, rng: &mut Xoshiro256PlusPlus) {
-    let Some(plan) = &system.plan else {
-        return;
-    };
-    // A driven coordinate holds a value that is about to be replaced, so
-    // narrowing against a constraint that mentions one still waiting its
-    // turn conditions on a stale number. That is not merely wasteful, it
-    // **destroys the freedom driving exists to exploit**: on
-    // `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y` on the
-    // current `z` pins it within `t` of `z - 1`, and then `z` is pinned
-    // within `t` of the new `y`. The pair shuffles by `t` a sweep instead
-    // of travelling, and `two_coupled_equalities_are_traversed` measured it
-    // as three occupied cells of eighty where twenty-four are wanted.
-    //
-    // So a coordinate becomes conditionable only once it has been drawn.
-    // Everything free is conditionable from the start.
-    let mut settled = vec![true; point.len()];
-    for driven in plan.driven() {
-        settled[*driven] = false;
-    }
-
-    for driven in plan.driven().iter().copied() {
-        let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
-        if !slice.is_empty() {
-            point[driven] = if slice.width() > 0.0 {
-                rng.random_range(slice.lo()..=slice.hi())
-            } else {
-                slice.lo()
-            };
+    drive(system, point, |slice, _| {
+        if slice.width() > 0.0 {
+            rng.random_range(slice.lo()..=slice.hi())
+        } else {
+            slice.lo()
         }
-        settled[driven] = true;
-    }
+    });
 }
 
 /// [`retract`] without the draw: every driven coordinate is clamped into its
@@ -209,6 +186,55 @@ pub(crate) fn retract(system: &ConstraintSystem, point: &mut Point, rng: &mut Xo
 /// puts it inside its band, and no further. Same order, same settled mask,
 /// same silence on an empty slice, for the same reasons.
 pub(crate) fn settle(system: &ConstraintSystem, point: &mut Point) {
+    drive(system, point, |slice, value| {
+        value.clamp(slice.lo(), slice.hi())
+    });
+}
+
+/// [`retract`] to the middle: every driven coordinate outside its slice is
+/// put at the centre of it, and one already inside is left where it is.
+///
+/// What a *seed* wants, where a sample wants the draw and a repair the
+/// clamp. A clamp lands on the slice's edge, which is the band's edge padded
+/// by an ulp or two and so a hair outside it; the centre of `f(free) ± t` is
+/// `f(free)` itself, on the surface, and passes the oracle whatever the
+/// padding. A value already inside is kept because a slice is not always a
+/// band: through `abs` it is the hull of two bands, whose centre is in
+/// neither, and a box that has been split down to one of them has its
+/// centre there already. Deterministic, which a seed also wants.
+pub(crate) fn centre(system: &ConstraintSystem, point: &mut Point) {
+    drive(system, point, |slice, value| {
+        if slice.contains(value) {
+            value
+        } else {
+            slice.lo() + slice.width() / 2.0
+        }
+    });
+}
+
+/// The one loop under [`retract`], [`settle`] and [`centre`]: each driven
+/// coordinate in plan order, its slice with the coordinates already placed
+/// conditioned on, and `place` deciding where in the slice it goes.
+///
+/// A driven coordinate holds a value that is about to be replaced, so
+/// narrowing against a constraint that mentions one still waiting its
+/// turn conditions on a stale number. That is not merely wasteful, it
+/// **destroys the freedom driving exists to exploit**: on
+/// `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y` on the
+/// current `z` pins it within `t` of `z - 1`, and then `z` is pinned
+/// within `t` of the new `y`. The pair shuffles by `t` a sweep instead
+/// of travelling, and `two_coupled_equalities_are_traversed` measured it
+/// as three occupied cells of eighty where twenty-four are wanted.
+///
+/// So a coordinate becomes conditionable only once it has been placed.
+/// Everything free is conditionable from the start. An empty slice leaves
+/// the coordinate alone, and the point is judged as an undriven one would
+/// be.
+fn drive(
+    system: &ConstraintSystem,
+    point: &mut Point,
+    mut place: impl FnMut(interval::Interval, f64) -> f64,
+) {
     let Some(plan) = &system.plan else {
         return;
     };
@@ -220,7 +246,7 @@ pub(crate) fn settle(system: &ConstraintSystem, point: &mut Point) {
     for driven in plan.driven().iter().copied() {
         let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
         if !slice.is_empty() {
-            point[driven] = point[driven].clamp(slice.lo(), slice.hi());
+            point[driven] = place(slice, point[driven]);
         }
         settled[driven] = true;
     }
@@ -567,10 +593,10 @@ mod tests {
     /// A variable on both sides is implicit in it, whatever it is wrapped in.
     ///
     /// The rule was once narrower — on both sides *and* inside something the
-    /// emitter refuses — which let `x2 == x1 + x2/2 - x3/x4` through on the
-    /// grounds that Z3 can answer it. True, and beside the point: nothing
-    /// downstream can drive such a variable, so it fell to whatever the sampler
-    /// managed and read as a capability we did not have.
+    /// solver of the day refused — which let `x2 == x1 + x2/2 - x3/x4`
+    /// through on the grounds that it could answer it. True, and beside the
+    /// point: nothing downstream can drive such a variable, so it fell to
+    /// whatever the sampler managed and read as a capability we did not have.
     #[test]
     fn a_variable_on_both_sides_is_implicit() {
         for source in [

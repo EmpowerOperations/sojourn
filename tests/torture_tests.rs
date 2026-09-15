@@ -1,23 +1,24 @@
-//! Constraints built to defeat the solver, so the pool has to survive without it.
+//! Constraints built to defeat every seeder but one, so the pool has to
+//! survive on what is left.
 //!
 //! A real literal exponent is the one power shape every backend refuses to turn
-//! into multiplication and every solver refuses outright: `x^1.234` is
-//! `exp(1.234 * ln x)`, Z3 has no `exp`, and handing Z3 its own `^` is worse
-//! than a refusal — it runs minutes past its rlimit on exactly this exponent
-//! (`docs/todo.md`, "Z3 holes"). So the emitter leaves the constraint out of
-//! the document, the relaxed document is satisfiable trivially, its witness
-//! fails the real constraint, and the pool retreats to sampling: `powf` on
-//! every CPU lane and `pow` on the GPU when the sieve is compiled in, both of
-//! them bound by the special-function hardware rather than by arithmetic.
+//! into multiplication: `x^1.234` is `exp(1.234 * ln x)`, which has no inverse
+//! interval narrowing will use, so nothing contracts through it (the solver
+//! this crate used to link had no `exp` either, and ran minutes past its
+//! limit on exactly this exponent — `docs/todo.md`, "Z3 holes"). A local
+//! solve finds a point on a band of it; where nothing does, the pool retreats
+//! to sampling: `powf` on every CPU lane and `pow` on the GPU when the sieve
+//! is compiled in, both of them bound by the special-function hardware rather
+//! than by arithmetic.
 //!
-//! The contract these pin: sampling finds what is there to be found, and what
-//! it cannot find is reported as *not found* — never as proved empty, since
-//! nothing could prove it — with the sentence a caller can act on.
+//! The contract these pin: sampling finds what is there to be found; what an
+//! enclosure rules out is proved before a proposal is spent; and what it
+//! cannot find and nothing can rule out is reported as *not found* — never as
+//! proved empty — with the sentence a caller can act on.
 
 mod common;
 
 use anyhow::Context;
-use faer::Mat;
 use sojourn::{
     ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable, Strategy,
 };
@@ -111,19 +112,43 @@ async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()
     Ok(())
 }
 
-/// `x^1.234` never reaches a million on `[0, 10]`, but nothing can prove that:
-/// the solver was not allowed to see the constraint, and sampling can only
-/// report that it found nothing. The verdict has to say exactly that, name
-/// the constraint no solver could be asked about, and stop short of calling
-/// the region empty.
+/// `x^1.234` never reaches a million on `[0, 10]`, and an enclosure says so:
+/// a real exponent has no inverse to narrow through, but the forward check
+/// needs none — the whole box evaluates to at most `10^1.234`, and that is a
+/// proof, before a single proposal is spent on it.
+#[pollster::test]
+async fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Result<()> {
+    let source = "x1^1.234 > 1000000";
+    let system = system(&[("x1", 0.0, 10.0)], &[source])?;
+    let verdict = solver().solve(&system).await;
+
+    let Err(because) = verdict else {
+        panic!("a point beyond the box was reported {verdict:?}");
+    };
+    let Infeasibility::Proved { blamed } = because else {
+        panic!("the enclosure rules this out, yet it was reported {because:?}");
+    };
+    let named: Vec<&str> = blamed.iter().map(|c| c.source.as_str()).collect();
+    assert_eq!(named, vec![source]);
+    Ok(())
+}
+
+/// `var[n]` reads whichever coordinate the point says, so no enclosure can
+/// see through it and nothing can prove that neither coordinate reaches
+/// twenty on `[0, 10]`; sampling can only report that it found nothing. The
+/// verdict has to say exactly that, name the constraint nothing could be
+/// concluded from, and stop short of calling the region empty.
 ///
-/// This spends brute force's whole budget — a billion `powf` calls across
+/// This spends brute force's whole budget — a billion proposals across
 /// every thread in release, about ten seconds — because giving up early
 /// would be the bug.
 #[pollster::test]
 async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
-    let source = "x1^1.234 > 1000000";
-    let system = system(&[("x1", 0.0, 10.0)], &[source])?;
+    let source = "var[n] > 20";
+    let system = system(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0), ("n", 1.0, 2.0)],
+        &[source],
+    )?;
     let verdict = solver().solve(&system).await;
 
     let Err(because) = verdict else {
@@ -142,10 +167,11 @@ async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()
     Ok(())
 }
 
-/// The same band, seeded by the local solve alone: a real exponent is outside
-/// every solver's theories and a band this thin is outside the probe's luck,
-/// but a point on it is an ordinary constrained optimisation from the box
-/// centre, and that is what the local solve is for.
+/// A thin band, seeded by the local solve alone: a real exponent has no
+/// inverse for a contraction to narrow through and a band this thin is
+/// outside the probe's luck, but a point on it is an ordinary constrained
+/// optimisation from the box centre, and that is what the local solve is
+/// for.
 #[pollster::test]
 async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
     let system = system(
@@ -173,11 +199,11 @@ async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
 }
 
 /// Repair has no interval to clamp to either — narrowing declines a real
-/// exponent as every solver does — so the chord from the anchor is all it has,
-/// and that is enough: the point lands inside, judged by the evaluator alone.
-/// The clearance has to come from the chord too, since no slice can say where
-/// the wall is to step off it: the landing is backed off along the chord
-/// until the axis neighbours pass.
+/// exponent — so the projection is all it has, and that is enough: the point
+/// lands inside, judged by the evaluator alone. The clearance has to come
+/// from the projection too, since no slice can say where the wall is to step
+/// off it: the rows carry the margin, and failing that the landing is backed
+/// off along the projection's own direction until the axis neighbours pass.
 #[pollster::test]
 async fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     const CLEARANCE: f64 = 1e-3;
@@ -185,11 +211,9 @@ async fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 < 5"],
     )?;
-    let anchors = Mat::from_fn(2, 1, |_, _| 0.0);
-
     let region = region(&system).await?;
     let repaired = region
-        .repair(anchors.as_ref(), &[9.0, 9.0], CLEARANCE)
+        .repair(&[9.0, 9.0], CLEARANCE)
         .context("the origin is feasible, so something is reachable")?;
 
     assert!(

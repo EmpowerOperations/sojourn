@@ -191,8 +191,7 @@ impl Lowerer<'_> {
                         return self.chain(Accumulate::Prod, count, |_, _| base, dst, span);
                     }
                     // A negative exponent is the reciprocal of the positive
-                    // power: a division, which is what earns it a divisor guard
-                    // in the SMT emitter.
+                    // power: a division, with a division's fault at zero.
                     let product = self.chain(Accumulate::Prod, count, |_, _| base, None, span);
                     let one = self.constant(1.0);
                     let dst = dst.unwrap_or_else(|| self.temp());

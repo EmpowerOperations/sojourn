@@ -46,11 +46,12 @@ pub const REPETITIONS: usize = 3;
 /// The brute-force budget a pool test runs with.
 ///
 /// The library's default is a billion proposals, sized for a release build:
-/// a few seconds across a laptop's threads, spent only on what the solver
-/// could not decide. Under a debug build the tape is some fifty times slower,
-/// and a test whose probe is empty and whose constraints Z3 answers `unknown`
-/// on — anything transcendental — or that leaves the solver out would spend
-/// minutes brute-forcing. A million keeps every rung of the ladder running at
+/// a few seconds across a laptop's threads, spent only on what no seeder
+/// could settle. Under a debug build the tape is some fifty times slower,
+/// and a test whose probe is empty and whose constraints nothing can
+/// conclude on — a computed subscript, a contradiction too thin to see — or
+/// that leaves the seeders out would spend minutes brute-forcing. A million
+/// keeps every rung of the ladder running at
 /// debug speed and changes no verdict: a region a million proposals can land,
 /// ten thousand would have landed one time in a hundred. Release runs the
 /// real default, so `just brute` and the release benchmarks measure what a

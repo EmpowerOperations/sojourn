@@ -1,5 +1,5 @@
 # Askama templates are embedded verbatim and rendered into program output, so
 # their line endings are data rather than source formatting. Without this,
-# autocrlf gives Windows a CRLF prelude and Linux an LF one, and the emitted
-# SMT-LIB document is not byte-identical across platforms.
+# autocrlf gives Windows a CRLF prelude and Linux an LF one, and the rendered
+# WGSL kernel is not byte-identical across platforms.
 *.jinja text eol=lf

@@ -275,9 +275,9 @@ impl ConstraintSystem {
 
             // A schema exists here and nowhere earlier, so this is the first
             // moment `var[1]` can be told which variable it means. Resolving it
-            // now is why nothing downstream has to: `smtlib` would resolve it
-            // again and `classify` would refuse the whole constraint rather
-            // than reason about it.
+            // now is why nothing downstream has to: `classify` would refuse the
+            // whole constraint rather than reason about it, and `interval`
+            // would narrow nothing through it.
             let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
                 .map_err(|out_of_range| SystemError::SubscriptOutOfRange {
                     constraint: named.clone(),
@@ -429,6 +429,17 @@ impl ConstraintSystem {
         } else {
             variable.contains(value)
         }
+    }
+
+    /// The declared box, one interval per variable in row order: what a
+    /// contraction starts from and a local solve's unit cube maps onto.
+    pub(crate) fn declared(&self) -> Vec<crate::cvg::interval::Interval> {
+        self.variables
+            .iter()
+            .map(|variable| {
+                crate::cvg::interval::Interval::new(variable.lower_bound, variable.upper_bound)
+            })
+            .collect()
     }
 
     /// How badly the worst constraint is violated, or `None` if the point is

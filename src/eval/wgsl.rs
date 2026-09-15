@@ -1,8 +1,8 @@
 //! The tape as WGSL: the GPU sieve's kernel, one function per constraint.
 //!
-//! The third backend over the tape, beside the tile and lane executors, and
-//! the same shape as the SMT-LIB emitter: the tape's semantics stay here, in
-//! Rust, and the surface syntax lives where it can be read as what it is —
+//! The third backend over the tape, beside the tile and lane executors. The
+//! tape's semantics stay here, in Rust, and the surface syntax lives where
+//! it can be read as what it is —
 //! askama templates under `templates/wgsl/`, compiled at build time against
 //! the views in this module. [`function`] turns a tape into a [`Function`]
 //! view, one [`Stmt`] per instruction with its operands already named;

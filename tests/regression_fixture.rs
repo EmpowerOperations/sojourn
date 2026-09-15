@@ -91,7 +91,7 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
 /// which is what the clearance argument now is.
 mod repair_lands_too_close_at_a_vertex {
     use super::*;
-    use anyhow::{Context, anyhow};
+    use anyhow::Context;
     use faer::Mat;
     use sojourn::{FeasibleRegion, compile};
 
@@ -145,19 +145,13 @@ mod repair_lands_too_close_at_a_vertex {
             .collect()
     }
 
-    /// The solved region, with 256 census points taken as anchors.
-    async fn region_and_anchors() -> anyhow::Result<(FeasibleRegion, Mat<f64>)> {
-        match ConstraintSolver::new()
+    /// The solved region, which is where `repair` lives.
+    async fn region() -> anyhow::Result<FeasibleRegion> {
+        ConstraintSolver::new()
             .with_seed(0x50_50_1E_5E_ED)
             .solve(&system()?)
             .await
-        {
-            Ok(mut region) => {
-                let anchors = region.take(256);
-                Ok((region, anchors))
-            }
-            Err(error) => Err(anyhow!("the spring should be satisfiable: {error}")),
-        }
+            .context("the spring should be satisfiable")
     }
 
     /// The point Artemis's wrapper received from `repair` (its own output,
@@ -167,16 +161,14 @@ mod repair_lands_too_close_at_a_vertex {
     /// the round trip leaves it feasible.
     #[pollster::test]
     async fn the_spring_vertex_is_landed_one_rounding_error_inside() -> anyhow::Result<()> {
-        let (region, anchors) = region_and_anchors().await?;
+        let region = region().await?;
         let landed = [
             0.052_986_411_203_565_92_f64,
             0.388_738_764_466_29,
             9.632_040_910_614,
         ];
 
-        let back = region
-            .repair(anchors.as_ref(), &landed, CLEARANCE)
-            .context("repairable")?;
+        let back = region.repair(&landed, CLEARANCE).context("repairable")?;
 
         let g = residuals(&back)?;
         assert!(
@@ -200,7 +192,7 @@ mod repair_lands_too_close_at_a_vertex {
     /// is here so a fix for the vertex does not lose it.
     #[pollster::test]
     async fn a_repaired_point_should_survive_a_one_ulp_perturbation() -> anyhow::Result<()> {
-        let (region, anchors) = region_and_anchors().await?;
+        let region = region().await?;
         // Just outside the vertex: a thicker wire violates the deflection
         // constraint (the first, which grows with `d^4` in the denominator)
         // while the others stay satisfied.
@@ -211,9 +203,7 @@ mod repair_lands_too_close_at_a_vertex {
             "the starting point should be infeasible: {g0:?}"
         );
 
-        let landed = region
-            .repair(anchors.as_ref(), &outside, CLEARANCE)
-            .context("repairable")?;
+        let landed = region.repair(&outside, CLEARANCE).context("repairable")?;
 
         let g = residuals(&landed)?;
         assert!(g.iter().all(|v| *v <= 0.0));
@@ -249,8 +239,9 @@ mod repair_lands_too_close_at_a_vertex {
 /// way; what did not return was gap coverage, up to sixteen Z3 queries before
 /// `solve` returns, each given the whole solver limit and the n = 20
 /// document taking the full 3,000,000 units (115 s) to answer `unknown`.
-/// The stage now has one budget in Z3's own units and stops at the first
-/// `unknown`; see `cover_gaps` in `src/cvg/mod.rs`.
+/// Coverage is now a bisection under a budget of contractions
+/// (`DEFAULT_PRUNE_BUDGET`), which on a region in one piece is bought for
+/// nothing and bounded; see `cover` in `src/cvg/mod.rs`.
 mod census_does_not_return_on_the_20_segment_beam {
     use super::*;
     use crate::common::stepped_beam;

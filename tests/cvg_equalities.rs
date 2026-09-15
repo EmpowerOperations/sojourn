@@ -331,9 +331,9 @@ async fn a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optio
 ///
 /// `cvg_pools::a_constraint_nothing_can_reason_about_still_yields_points_and_says_so`
 /// is the same constraint at `1e-6` over a box containing the origin, and it
-/// passes for a reason its own doc comment admits is luck: `sin` is refused by
-/// the emitter, so Z3 sees only the bounds, returns a point near the origin, and
-/// `sin(0) = 0` puts that point on the curve by accident.
+/// passes for a reason its own doc comment admits was luck: the solver of the
+/// day saw only the bounds, returned a point near the origin, and
+/// `sin(0) = 0` put that point on the curve by accident.
 ///
 /// This moves the box to `2..3`, where the origin is not available and the luck
 /// runs out, and tightens the tolerance by three orders. Driving `y` from `x`
@@ -351,12 +351,13 @@ async fn a_driven_variable_is_evaluated_not_searched() {
     .await;
 }
 
-/// Driven through a function the emitter *can* translate, so the solver is not
-/// the thing standing in the way — the missing classification is.
+/// Driven through a function with an inverse, so the seed is not the thing
+/// standing in the way — the missing classification is.
 ///
-/// `cvg_pools::roots` is this pair at `1e-4`. Z3 handles `sqrt` and `cbrt` as
-/// polynomial constraints, so it will answer; the question is whether anything
-/// then explores the curve rather than sitting on the one witness.
+/// `cvg_pools::roots` is this pair at `1e-4`. A driven coordinate is put on
+/// its surface when a box's centre is judged, so the seed is immediate; the
+/// question is whether anything then explores the curve rather than sitting
+/// on the one point.
 #[pollster::test]
 async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
     assert_explores(Case {
@@ -388,8 +389,9 @@ async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
 /// equality makes it *implicit* in that variable — no reading of it yields
 /// `v = ...` — and nothing downstream can drive what it cannot isolate. Row C
 /// used to be treated as recoverable, on the grounds that
-/// `x2 == x1 + x2/2 - x3/x4` is one rearrangement from driven and Z3 answers it
-/// anyway. Both true; the rearrangement was never written, so in practice it
+/// `x2 == x1 + x2/2 - x3/x4` is one rearrangement from driven and the solver
+/// of the day answered it anyway. Both true; the rearrangement was never
+/// written, so in practice it
 /// fell to whatever the sampler managed and read as a capability that did not
 /// exist.
 ///

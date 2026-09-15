@@ -2276,16 +2276,66 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       fixed: the walker's burn-in at 200 dimensions on the beam is 95 s and 256 points 335 s,
       the deflection `sum` evaluated every step.
 
-- [ ] **Coverage after a seed the probe did not find.** The budgeted `cover_gaps` still runs
-      after a local-solve seed and asks Z3 about the region's other pieces — minutes on the
-      beam's document, for insurance against a second component. Three things to decide with
-      Z3's fate below: whether coverage is worth anything a local seed cannot vouch against
-      (a second local start from elsewhere is a cheaper second opinion); whether it should be
-      skipped when the probe found points by uniform sampling, since `k` uniform hits already
-      miss a component of measure `f` with probability only `(1 - f)^k`; and whether it moves
-      off the opening's critical path per the concurrent-coverage entry.
+- [x] **Coverage after a seed the probe did not find.** *Settled with Z3's fate, 2026-09-14:*
+      coverage is a bisection of the contracted box (`prune::bisect`, below), spent only when
+      the walker will carry the search or nothing is in hand, and skipped when the probe found
+      points by uniform sampling, since `k` uniform hits already miss a component of measure
+      `f` with probability only `(1 - f)^k`. Its budget is a count of contractions
+      (`DEFAULT_PRUNE_BUDGET`, 256), so on a region in one piece it is bought for nothing and
+      bounded: 13 s for the ten-segment beam's census under debug where the Z3 stage was 85 s.
+      Moving it off the opening's critical path is still the concurrent-coverage entry.
 
-- [ ] **Z3: prove it earns its build, or delete it.** Since the local solve, Z3 finds nothing
+- [x] **Z3's fate: deleted; interval branch-and-prune proves, blames and covers.**
+      *2026-09-14.* `src/cvg/prune.rs` replaces `smt.rs`, `smtlib.rs`, `templates/smt2/`, the
+      leash, `SmtLogic`, `with_solver_limit` and the `z3`/`z3-sys` dependencies with their C++
+      build. **Contraction** is HC4 propagation over `interval::narrow` — every constraint,
+      every symbol it names, intersected into the declared box and requeued on any coordinate
+      that shrank by more than one per cent of its declared width, capped at 32 visits per
+      constraint — and a coordinate that empties is the proof. **Blame** is the trace: each
+      box carries, per coordinate, the constraints that narrowed it, and the blame for an
+      emptied coordinate is the culprit plus that trace closed backwards over the coordinates
+      the culprits read. No deletion filter, no re-run: on the typo fixture it names exactly
+      `x1 < 3`, `x2 > 5`, `x1 > x2` and not `x1 + x2 < 20`, which narrowed nothing — the bar
+      the previous entry set. **Bisection** splits a surviving box on its widest relative
+      coordinate, contracts both halves, and keeps going breadth-first for a budget of
+      contractions; every box dying is a proof the contraction alone could not see (the disc
+      that cannot meet its ring, two contractions), and the leaves that survive are the pieces
+      the walker must be started in. A leaf whose centre — driven coordinates put on their
+      surfaces by `classify::centre` — is judged feasible is settled and is a seed for free; an
+      unsettled leaf gets a one-start local solve inside its own box only when nothing at all
+      is in hand. `interval::difference` gained the forward check, so a constraint whose
+      enclosure misses its target on a box empties it with no inverse needed:
+      `x^1.234 > 1000000` on `[0, 10]` is now proved rather than brute-forced.
+
+      **What is not proved, and stays `NotFound` forever**, pinned in `tests/cvg_pools.rs`:
+      a *thin* contradiction, `x + y <= 1` against `x + y >= 1 + 1e-9`, which bisection
+      reaches only at a width of `1e-9`; and an *algebraic* one, `x*x - 2*x*y + y*y < 0`,
+      whose enclosure holds negatives on every box because the square is never seen as a
+      square. Also `x % 3 >= 2` against `x % 3 <= 1`: `%` across its discontinuities encloses
+      everything, so the never-deliver fixture now reports `NotFound` where Z3 proved it. Z3
+      proved some of these and spun on others; a decision procedure over polynomials (nlsat,
+      CAD) is what the algebraic class needs, and a user story that needs it is the new fact
+      that would justify one. `NotFound { unexpressed }` now names the constraints that
+      narrowed nothing over the whole opening — a computed subscript is the permanent case —
+      and is empty when every constraint said something short of a proof.
+
+      **Splitting is a low-dimensional tool.** At 4096 contractions the ten-segment beam
+      (twenty variables, one piece, walker-carried) spent forty seconds of an unoptimised
+      build bisecting for nothing, since twelve splits isolate nothing at twenty dimensions;
+      at 256 it is a couple. The old budget's first draft also spent sixteen COBYLA solves in
+      leaves that were the whole box on 188 of 200 coordinates — minutes each — which is why
+      leaf solves are for the nothing-in-hand case only. Timings against HEAD on the same
+      loaded machine: beam-10 54 s → 13 s, beam-30 92 s → 44 s, the benchmarks unchanged.
+
+      **Follow-ups not done here:** the contracted root could be handed to the sampler as a
+      tighter proposal box (a plain contradiction already ends before a proposal; a half-empty
+      box would double a probe's hit rate); an inner-box test (every constraint's enclosure
+      inside its target) would settle fat boxes without a centre judgement; and the classic
+      objection to HC4 — it cannot see a shared subexpression, which is why `%` above is not
+      proved — is what a proper CSP (or a symbolic square) would address, if ever needed.
+
+- [x] **Z3: prove it earns its build, or delete it.** *Deleted; the entry above is the
+      answer.* Since the local solve, Z3 finds nothing
       the search could not find without it; its remaining role is `Infeasibility::Proved`. The
       test to write: a system interval analysis cannot prove empty — propagation over the box
       never contracts a domain to nothing, as on `x*y == 1 ∧ x + y == 1` — where a proof and an
@@ -2329,8 +2379,10 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       3. *Every foreign call and every API with a remote chance of combinatorial explosion gets
          a resource limit, or failing that a wall-clock ceiling set so conservatively that
          hitting it means a bug, and hitting it panics rather than waits.* Adopted as a
-         discipline; the leash on Z3 is the model, and COBYLA's callback is the one place
-         today that lacks it.
+         discipline; the leash on Z3 was the model until Z3 left, and with it went the last
+         wall-clock ceiling in the crate — every loop that remains is a count, branch-and-prune
+         included (a contraction budget, a visit cap, a progress threshold). COBYLA's callback
+         is the one place today that lacks a per-iteration bound.
 
 - [ ] **Concurrent coverage: start the walker from the first hit, cover gaps beside it.**
       Settled in discussion on 2026-09-12 as the follow-up to the budget above. Cases: (A)
@@ -2552,8 +2604,48 @@ keeps a fallible signature.
 
 # Repair for Artemis — a public `repair`, specified before it is built
 
-**Status:** built — `sojourn::repair` in `src/repair.rs`, driven by `tests/cvg_repair.rs`. What
-follows is the brief it was built from, with what changed on the way marked as such.
+**Status:** built — `FeasibleRegion::repair` in `src/repair.rs`, driven by `tests/cvg_repair.rs`.
+What follows is the brief it was built from, with what changed on the way marked as such.
+
+**2026-09-14: the anchors are gone.** `repair(point, clearance)` is a function of the system,
+the point and the clearance and of nothing else. Artemis's optimisation quality was bad — it
+was not finding global optima — and the anchors were the mechanism: where clamping could not
+land, the chord from the nearest anchor returned a *convex combination* of anchor and
+proposal, every coordinate dragged toward wherever the census had put points, innocent
+coordinates included, and `Release` could revert a coordinate only where reverting kept the
+clearance, which on a curved boundary it rarely does. Measured on a disc with anchors clustered
+on the rim at angle zero: the corner `(1.2, 1.2)` landed at **17°** instead of 45°, the
+corner `(−1.2, 1.2)` at 125° instead of 135°. Over thousands of repairs that herds the
+optimizer toward the anchor cluster — the region the *walker* found — rather than along the
+boundary the objective prefers, and an optimum on an active constraint far from the census is
+exactly what it fails to reach.
+
+What replaces the shotgun is the **projection**: the feasible point nearest the proposal,
+`min ‖u − p‖²` over the unit cube subject to every constraint, by a local solve
+(`local::nearest`, COBYLA from where clamping left the point). What is optimised over: all
+`d` coordinates, in the cube the caller normalises into; the objective is L2² because COBYLA
+fits linear models and L1's kinks fight them — the L1 argument was about ranking anchors,
+which no longer exists. The rows carry the clearance built in — each is the worst of a
+constraint's residual at the point and at the point stepped twice the clearance along every
+coordinate it names — because without that a *linear* constraint defeats the solve outright:
+COBYLA's steps land exactly on a linear boundary, where a strict comparison's residual is a
+hair positive, and no evaluation is ever judged feasible. Every evaluation is judged where
+it is made (driven coordinates settled, as the chord's probes were); the nearest with the
+clearance is the answer, the nearest feasible one the consolation, and where no slice can
+read a wall the landing is backed off along the projection's own direction — the boundary's
+normal — in doublings of the clearance, which is what the chord used to stand in for. The
+KKT view is what makes it well-posed: at the projection `x* − p = −Σ λᵢ ∇gᵢ(x*)`, the
+displacement lives in the coordinates the *active* constraints name, so the objective has a
+slope everywhere and the constraints pull back only where they bite. That is also the cost
+follow-up not done here: restrict the solve to the incidence closure of the violated
+constraints, growing on demand, and `d²m` shrinks on problems whose violations are local.
+Measured: the disc corner converges in 50 evaluations, the spring vertex in 39–47, a
+proposal a hair outside the ten-segment beam in 471 at twenty variables (`PROJECTION_EVALS_PER_DIMENSION`
+is 64 per `d + 1`); the corner of the disc now lands at 45.00°. The chord's one capability
+the projection lacked turned out not to exist: between the two bands of
+`(x + 2)(x − 1) == 0`, where the chord answered `Stranded` without an anchor, the projection
+reaches the nearer band. Everything below that says "anchor" or "chord" is the record of the
+first design.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),
@@ -2774,7 +2866,8 @@ Artemis's note already names.
 
 - [x] **Public `repair`** — as a function over `ConstraintSystem` and an anchor matrix, for the
       reasons above. `Driven by:` `tests/cvg_repair.rs`, all ten green. *2026-09-12: now
-      `FeasibleRegion::repair`, the anchors still an argument; see the note under the API.*
+      `FeasibleRegion::repair`, the anchors still an argument; see the note under the API.
+      2026-09-14: the anchors are gone; see the status note at the top of this section.*
 - [x] **A public `worst_residual`.** Artemis's wrapper was recompiling every constraint to
       grade a point itself. `ConstraintSystem::worst_residual` is public as of 2026-09-12:
       `None` outside the box or on a fault, else the largest residual, `<= 0` when feasible.

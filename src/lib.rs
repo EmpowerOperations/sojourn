@@ -22,9 +22,10 @@
 //! let samples = region.take(256);
 //!
 //! // A point that is not a sample, brought onto the region near where it
-//! // was, `1e-12` box widths inside every wall, anchored on the samples.
-//! let repaired = region.repair(samples.as_ref(), &[1.5, 1.5], 1e-12)?;
-//! # let _ = repaired;
+//! // was, `1e-12` box widths inside every wall. A function of the system,
+//! // the point and the clearance alone.
+//! let repaired = region.repair(&[1.5, 1.5], 1e-12)?;
+//! # let _ = (samples, repaired);
 //! # Ok(())
 //! # }
 //! ```
@@ -67,8 +68,8 @@ pub use eval::{CompiledExpression, compile};
 pub(crate) use frontend::{Ast, parse};
 pub use repair::RepairError;
 pub use solve::{
-    ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_SOLVER_LIMIT,
-    FeasibleRegion, GPU_VARIABLE, Infeasibility, SmtLogic, Status,
+    ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_PRUNE_BUDGET,
+    FeasibleRegion, GPU_VARIABLE, Infeasibility, Status,
 };
 pub use system::{ConstraintRef, ConstraintSystem, InputVariable, Point, SystemError};
 

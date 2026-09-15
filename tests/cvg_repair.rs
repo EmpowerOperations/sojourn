@@ -12,15 +12,13 @@
 //! normal component, and the L1-nearest point on a disc from a point whose
 //! other coordinate is already in range is straight along one axis. Every
 //! expected value below was derived under L1 first and the test written second.
-//!
-//! Anchors are hand-written wherever the geometry is closed-form, so these
-//! cases do not depend on the sampler. Only the property test draws its anchors
-//! from a solve.
+//! Where clamping cannot land — both coordinates out of range at once — the
+//! answer is the projection, and the disc's corners pin that it is radial:
+//! a function of the constraints alone, with nothing else pulling on it.
 
 mod common;
 
 use anyhow::Context;
-use faer::Mat;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -36,8 +34,8 @@ fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> anyhow::Result
 
 /// The region a solve of `system` returns, which is where `repair` lives.
 ///
-/// The census it produces is not used: every closed-form fixture hands
-/// `repair` its own anchors so the expected values do not depend on the
+/// The census it produces is not used: `repair` is a function of the system,
+/// the point and the clearance, so no expected value below depends on the
 /// sampler. The solve is the price of a region, and on these fixtures it is
 /// milliseconds. An unsatisfiable fixture is an error for the test to
 /// propagate, not a verdict for this to pass judgement on.
@@ -56,12 +54,6 @@ fn variables(specs: &[(&str, f64, f64)]) -> Vec<InputVariable> {
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
         .collect()
-}
-
-/// Points as the matrix `repair` takes: one column each, the shape
-/// `FeasibleRegion::take` returns.
-fn anchors(points: &[&[f64]], rows: usize) -> Mat<f64> {
-    Mat::from_fn(rows, points.len(), |row, column| points[column][row])
 }
 
 /// Same value the other cvg suites use, so a point seen in one is the point
@@ -141,10 +133,9 @@ async fn a_half_space_is_entered_along_its_steep_coordinate() -> anyhow::Result<
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[1.0, 1.0], 0.0)
+        .repair(&[1.0, 1.0], 0.0)
         .context("a half-space is reachable")?;
 
     assert!(
@@ -171,10 +162,9 @@ async fn a_disc_is_entered_where_the_diamond_touches_it() -> anyhow::Result<()> 
         &["sqr(x) + sqr(y) < 1"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[2.0, 0.5], 0.0)
+        .repair(&[2.0, 0.5], 0.0)
         .context("a disc is reachable")?;
 
     assert!(
@@ -207,10 +197,9 @@ async fn a_disc_spelled_with_a_power_is_entered_the_same_way() -> anyhow::Result
         &["x^2 + y^2 < 1"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[2.0, 0.5], 0.0)
+        .repair(&[2.0, 0.5], 0.0)
         .context("a disc is reachable")?;
 
     assert!(
@@ -241,10 +230,9 @@ async fn a_driven_coordinate_is_not_privileged() -> anyhow::Result<()> {
         &["2*x1 + x2 == 3 +/- 0.001"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[1.0, 1.0]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[3.0, 3.0], 0.0)
+        .repair(&[3.0, 3.0], 0.0)
         .context("a slab is reachable")?;
 
     assert!(
@@ -264,22 +252,18 @@ async fn a_driven_coordinate_is_not_privileged() -> anyhow::Result<()> {
 }
 
 #[pollster::test]
-async fn the_nearer_band_wins_over_the_anchor_it_started_from() -> anyhow::Result<()> {
+async fn the_nearer_band_wins() -> anyhow::Result<()> {
     // Two bands, at -2 and 1, each about 0.00033 wide. No interval narrowing
-    // separates them, so this is decided by the anchors: from 0.9 the band at 1
-    // is a tenth away and the band at -2 is nearly three, and from -1 it is the
-    // other way round. Whichever anchor is tried first, the result is the
-    // nearer band.
+    // separates them, so this is decided by the projection: from 0.9 the band
+    // at 1 is a tenth away and the band at -2 is nearly three, and from -1 it
+    // is the other way round.
     let system = system(
         variables(&[("x", -5.0, 5.0)]),
         &["(x + 2) * (x - 1) == 0 +/- 0.001"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[-2.0], &[1.0]], 1);
 
-    let near_one = region
-        .repair(anchors.as_ref(), &[0.9], 0.0)
-        .context("a band is reachable")?;
+    let near_one = region.repair(&[0.9], 0.0).context("a band is reachable")?;
     assert!(
         holds(&system, &near_one),
         "{near_one:?} is outside both bands"
@@ -290,9 +274,7 @@ async fn the_nearer_band_wins_over_the_anchor_it_started_from() -> anyhow::Resul
         near_one[0]
     );
 
-    let near_minus_two = region
-        .repair(anchors.as_ref(), &[-1.0], 0.0)
-        .context("a band is reachable")?;
+    let near_minus_two = region.repair(&[-1.0], 0.0).context("a band is reachable")?;
     assert!(
         holds(&system, &near_minus_two),
         "{near_minus_two:?} is outside both bands"
@@ -315,10 +297,9 @@ async fn a_domain_hole_is_just_infeasible() -> anyhow::Result<()> {
     // "above 1 in the reals".
     let system = system(variables(&[("x1", -1.0, 3.0)]), &["ln(x1) > 0"])?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[2.0]], 1);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[-0.5], 0.0)
+        .repair(&[-0.5], 0.0)
         .context("the log's domain is reachable")?;
 
     assert!(
@@ -346,11 +327,9 @@ async fn two_hundred_bounds_are_landed_on_exactly() -> anyhow::Result<()> {
     let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
     let system = system(variables(&specs), &sources)?;
     let region = region(&system).await?;
-    let anchor = vec![10.75; DIMENSIONS];
-    let anchors = anchors(&[&anchor], DIMENSIONS);
 
     let repaired = region
-        .repair(anchors.as_ref(), &vec![10.2; DIMENSIONS], 0.0)
+        .repair(&vec![10.2; DIMENSIONS], 0.0)
         .context("a corner is reachable")?;
 
     assert!(
@@ -369,13 +348,16 @@ async fn two_hundred_bounds_are_landed_on_exactly() -> anyhow::Result<()> {
 
 #[pollster::test]
 async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
-    // Five variables under three loose inequalities, anchored on a census from
-    // a solve: the shape Artemis actually runs. For points scattered over the
+    // Five variables under three loose inequalities, with a census from a
+    // solve: the shape Artemis actually runs. For points scattered over the
     // whole box: the result is feasible with clearance by an independent
     // evaluation, inside the box, a fixed point of `repair`, the same on a
-    // second call, and never farther than the nearest anchor that has the
-    // clearance — which is a candidate itself.
-    const ANCHORS: usize = 256;
+    // second call, and never farther than the nearest census point that has
+    // the clearance. That last one is a quality bar on the projection rather
+    // than a contract — the census is not consulted — and a landing farther
+    // than a point the walker happened to find would be a projection that had
+    // not found the boundary.
+    const CENSUS: usize = 256;
     const TRIALS: usize = 64;
     let inputs = variables(&[
         ("x1", 0.0, 1.0),
@@ -393,21 +375,21 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
         .with_seed(SEED)
         .solve(&system)
         .await?;
-    let anchors = region.take(ANCHORS);
-    assert_eq!(anchors.ncols(), ANCHORS, "the census should fill");
-    // Only an anchor with the clearance is a candidate `repair` may answer
-    // with, so only those bound how far it may move. Judged once here: the
-    // independent evaluator compiles per call, and this is the hot loop.
-    let clear_anchors: Vec<Vec<f64>> = (0..ANCHORS)
+    let census = region.take(CENSUS);
+    assert_eq!(census.ncols(), CENSUS, "the census should fill");
+    // Only a census point with the clearance is one `repair` could have been
+    // no worse than. Judged once here: the independent evaluator compiles per
+    // call, and this is the hot loop.
+    let clear_census: Vec<Vec<f64>> = (0..CENSUS)
         .map(|column| {
-            (0..anchors.nrows())
-                .map(|row| anchors[(row, column)])
+            (0..census.nrows())
+                .map(|row| census[(row, column)])
                 .collect()
         })
-        .filter(|anchor: &Vec<f64>| has_clearance(&system, anchor, CLEARANCE))
+        .filter(|point: &Vec<f64>| has_clearance(&system, point, CLEARANCE))
         .collect();
     assert!(
-        !clear_anchors.is_empty(),
+        !clear_census.is_empty(),
         "the census should have room to spare"
     );
 
@@ -417,7 +399,7 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
         let point: Vec<f64> = (0..inputs.len())
             .map(|_| rng.random_range(0.0..1.0))
             .collect();
-        let Ok(repaired) = region.repair(anchors.as_ref(), &point, CLEARANCE) else {
+        let Ok(repaired) = region.repair(&point, CLEARANCE) else {
             complaints.push(format!("{point:?}: no repair"));
             continue;
         };
@@ -430,13 +412,13 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
         if !in_box(&system, &repaired) {
             complaints.push(format!("{point:?} -> {repaired:?}: outside the box"));
         }
-        let again = region.repair(anchors.as_ref(), &repaired, CLEARANCE);
+        let again = region.repair(&repaired, CLEARANCE);
         if again.as_deref() != Ok(repaired.as_slice()) {
             complaints.push(format!(
                 "{point:?} -> {repaired:?} -> {again:?}: not a fixed point"
             ));
         }
-        let twice = region.repair(anchors.as_ref(), &point, CLEARANCE);
+        let twice = region.repair(&point, CLEARANCE);
         let same = twice.as_ref().is_ok_and(|twice| {
             twice
                 .iter()
@@ -449,13 +431,13 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
             ));
         }
         let moved = normalised_l1(&system, &point, &repaired);
-        let nearest = clear_anchors
+        let nearest = clear_census
             .iter()
-            .map(|anchor| normalised_l1(&system, &point, anchor))
+            .map(|sample| normalised_l1(&system, &point, sample))
             .fold(f64::INFINITY, f64::min);
         if moved > nearest {
             complaints.push(format!(
-                "{point:?} -> {repaired:?}: moved {moved} where an anchor was {nearest} away"
+                "{point:?} -> {repaired:?}: moved {moved} where a census point was {nearest} away"
             ));
         }
     }
@@ -464,38 +446,88 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
 }
 
 #[pollster::test]
-async fn without_anchors_a_gap_is_not_crossed() -> anyhow::Result<()> {
-    // Between the two bands, with nothing to bisect toward: no interval says
-    // which way to go, so there is no honest answer, and `None` is the honest
-    // answer.
+async fn between_two_bands_the_nearer_is_reached() -> anyhow::Result<()> {
+    // Between the two bands, where no interval says which way to go: the
+    // chord this replaced needed an anchor to bisect toward and answered
+    // `Stranded` without one. The projection needs nothing but the
+    // constraint, and from 0 the band at 1 is the nearer.
     let system = system(
         variables(&[("x", -5.0, 5.0)]),
         &["(x + 2) * (x - 1) == 0 +/- 0.001"],
     )?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(1, 0);
 
-    assert_eq!(
-        region.repair(none.as_ref(), &[0.0], 0.0),
-        Err(RepairError::Stranded)
+    let repaired = region
+        .repair(&[0.0], 0.0)
+        .context("a band is reachable from between them")?;
+    assert!(
+        holds(&system, &repaired),
+        "{repaired:?} is outside both bands"
+    );
+    assert!(
+        (repaired[0] - 1.0).abs() < 0.001,
+        "from 0 the band at 1 is nearer, got {}",
+        repaired[0]
     );
     Ok(())
 }
 
+/// The record of what anchors did, and the reason they are gone. With
+/// anchors clustered on the rim at angle zero, the corner `(1.2, 1.2)` —
+/// where both axis slices are empty and clamping cannot land — used to land
+/// at 17°: the chord from the nearest anchor is a convex combination of
+/// anchor and proposal, and every coordinate was dragged toward the census.
+/// Over thousands of repairs that steered the optimizer toward wherever the
+/// census was, rather than along the boundary its objective preferred. The
+/// projection lands every corner radially, within a fraction of a degree,
+/// and would land it there whatever else the region had ever produced.
 #[pollster::test]
-async fn without_anchors_a_bound_is_still_reached() -> anyhow::Result<()> {
-    // The clamp needs no anchor: the constraint itself says where the feasible
-    // side is.
+async fn a_corner_of_a_disc_is_entered_radially() -> anyhow::Result<()> {
+    const CLEARANCE: f64 = 1e-9;
+    let system = system(
+        variables(&[("x", -2.0, 2.0), ("y", -2.0, 2.0)]),
+        &["x^2 + y^2 < 1"],
+    )?;
+    let region = region(&system).await?;
+
+    let mut complaints = Vec::new();
+    for corner in [[1.2, 1.2], [-1.2, 1.2], [-1.2, -1.2], [1.2, -1.2]] {
+        let repaired = region
+            .repair(&corner, CLEARANCE)
+            .with_context(|| format!("the rim is reachable from {corner:?}"))?;
+        let angle = repaired[1].atan2(repaired[0]).to_degrees();
+        let wanted = corner[1].atan2(corner[0]).to_degrees();
+        let radius = repaired[0].hypot(repaired[1]);
+        if (angle - wanted).abs() > 0.5 {
+            complaints.push(format!(
+                "{corner:?} -> {repaired:?}: at {angle:.2} degrees, not {wanted:.0}"
+            ));
+        }
+        if !(1.0 - 1e-3..1.0).contains(&radius) {
+            complaints.push(format!(
+                "{corner:?} -> {repaired:?}: at radius {radius}, not on the rim"
+            ));
+        }
+        if !has_clearance(&system, &repaired, CLEARANCE) {
+            complaints.push(format!("{corner:?} -> {repaired:?}: no clearance"));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    Ok(())
+}
+
+#[pollster::test]
+async fn a_bound_is_reached() -> anyhow::Result<()> {
+    // The clamp: the constraint itself says where the feasible side is.
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(2, 0);
 
     let repaired = region
-        .repair(none.as_ref(), &[1.0, 1.0], 0.0)
-        .context("a half-space needs no anchor")?;
+        .repair(&[1.0, 1.0], 0.0)
+        .context("a half-space is entered")?;
     assert!(
         holds(&system, &repaired),
         "{repaired:?} violates the half-space"
@@ -510,13 +542,9 @@ async fn a_feasible_point_is_returned_untouched() -> anyhow::Result<()> {
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(2, 0);
     let point = [-0.3, 0.7];
 
-    assert_eq!(
-        region.repair(none.as_ref(), &point, 0.0).as_deref(),
-        Ok(point.as_slice())
-    );
+    assert_eq!(region.repair(&point, 0.0).as_deref(), Ok(point.as_slice()));
     Ok(())
 }
 
@@ -532,10 +560,9 @@ async fn a_half_space_is_entered_clear_of_its_wall() -> anyhow::Result<()> {
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[1.0, 1.0], CLEARANCE)
+        .repair(&[1.0, 1.0], CLEARANCE)
         .context("a half-space is reachable")?;
 
     assert!(
@@ -563,10 +590,9 @@ async fn a_vertex_is_landed_clear_of_both_walls() -> anyhow::Result<()> {
         &["x1 < 0.5", "x2 < 0.5"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.25, 0.25]], 2);
 
     let repaired = region
-        .repair(anchors.as_ref(), &[1.0, 1.0], CLEARANCE)
+        .repair(&[1.0, 1.0], CLEARANCE)
         .context("a corner is reachable")?;
 
     assert!(
@@ -594,13 +620,12 @@ async fn a_chord_landing_is_backed_off() -> anyhow::Result<()> {
         &["(x + 2) * (x - 1) == 0 +/- 0.001"],
     )?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[-2.0], &[1.0]], 1);
     // The band at 1 is about 0.00033 wide in `x`; a hundredth of that, over
     // the box's width of 10.
     let clearance = 0.000_033 / 10.0;
 
     let repaired = region
-        .repair(anchors.as_ref(), &[0.9], clearance)
+        .repair(&[0.9], clearance)
         .context("a band is reachable")?;
 
     assert!(
@@ -623,9 +648,8 @@ async fn a_slab_thinner_than_the_clearance_is_cramped() -> anyhow::Result<()> {
     // honest answer names the nearest feasible point and says so.
     let system = system(variables(&[("x", -1.0, 1.0)]), &["x == 0 +/- 0.001"])?;
     let region = region(&system).await?;
-    let anchors = anchors(&[&[0.0]], 1);
 
-    let verdict = region.repair(anchors.as_ref(), &[0.5], 1e-2);
+    let verdict = region.repair(&[0.5], 1e-2);
 
     match verdict {
         Err(RepairError::Cramped { nearest, clearance }) => {
@@ -649,11 +673,10 @@ async fn a_point_with_clearance_is_returned_untouched() -> anyhow::Result<()> {
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(2, 0);
     let point = [-0.3, 0.7];
 
     assert_eq!(
-        region.repair(none.as_ref(), &point, CLEARANCE).as_deref(),
+        region.repair(&point, CLEARANCE).as_deref(),
         Ok(point.as_slice())
     );
     Ok(())
@@ -673,14 +696,13 @@ async fn a_feasible_point_without_clearance_is_moved_inward() -> anyhow::Result<
         &["2*x1 + x2 < 1"],
     )?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(2, 0);
     let point = [0.0, 1.0 - 1e-12];
     assert!(holds(&system, &point), "the fixture should start feasible");
     assert!(!has_clearance(&system, &point, CLEARANCE));
 
     let repaired = region
-        .repair(none.as_ref(), &point, CLEARANCE)
-        .context("a half-space needs no anchor")?;
+        .repair(&point, CLEARANCE)
+        .context("a half-space is entered")?;
 
     assert!(
         has_clearance(&system, &repaired, CLEARANCE),
@@ -708,10 +730,9 @@ async fn a_box_bound_is_a_wall_too() -> anyhow::Result<()> {
     // inside — the caller's round trip can miss the edge by an ulp as well.
     let system = system(variables(&[("x", 0.0, 1.0)]), &["x > -1"])?;
     let region = region(&system).await?;
-    let none = Mat::<f64>::zeros(1, 0);
 
     let repaired = region
-        .repair(none.as_ref(), &[1.0], CLEARANCE)
+        .repair(&[1.0], CLEARANCE)
         .context("the box's inside is reachable")?;
 
     assert!(

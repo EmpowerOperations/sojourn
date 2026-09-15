@@ -21,19 +21,15 @@ pollster = { version = "1.0.1", optional = true }
 # unification would switch faer to it too — a later, measured experiment.
 pulp = { version = "0.22.3", default-features = false, features = ["std", "x86-v3"] }
 rand = "0.10"
-# Diagnosis, not logging. The pool silently falls back to sampling whenever the
-# solver cannot be given a constraint, and without this there is no way for a
-# caller to learn that happened or why. Compiles to nothing without a subscriber.
-# One way of spelling an error: `SolveError` derives its `Display` and its
-# `From<io::Error>` rather than hand-writing them.
+# One way of spelling an error: `SystemError` and `RepairError` derive their
+# `Display` rather than hand-writing it.
 thiserror = "2.0"
+# Diagnosis, not logging. The search falls back to brute force whenever
+# interval reasoning concludes nothing, and without this there is no way for
+# a caller to learn that happened or why. Compiles to nothing without a
+# subscriber.
 tracing = "0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "vulkan", "dx12", "metal"], optional = true }
-z3 = { version = "0.21.0", features = ["bundled"] }
-# For `Z3_interrupt` alone, the one Z3 call that may come from another thread:
-# the `z3` crate's own interrupt handle borrows a context that cannot leave the
-# thread it was made on. Pinned to the version `z3` itself links.
-z3-sys = { version = "0.13.0", default-features = false }
 
 [build-dependencies]
 antlr-rust-codegen = "0.34"

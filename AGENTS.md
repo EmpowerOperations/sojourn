@@ -1,7 +1,8 @@
 # Sojourn — notes for agents
 
 Sojourn is a constrained random vector generator: given a box and a set of constraints
-it produces random points that satisfy them, by sampling, by walking, and by asking Z3.
+it produces random points that satisfy them, by sampling, by walking, by a local solve,
+and by interval branch-and-prune.
 Constraints are written in babel, a small expression language: `x1 + x2 * cos(x3)^2`
 is a transform, `x1 < x2 + x3` is a constraint. Babel began as Kotlin/ANTLR on the JVM
 (EmpowerOps' optimizer used it) and was ported to Rust here; the generator began as the
@@ -26,7 +27,7 @@ Read these before changing anything, in this order:
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
 | `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the validated system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
-| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the local solve (`local.rs`, COBYLA from `basin`), the SMT emitter, the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
+| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the local solve (`local.rs`, COBYLA from `basin`), branch-and-prune (`prune.rs`), the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
 | `docs/sojourn/` | notes and statement of intent from the original CVG project, whose code became `crate::cvg` | reference |
@@ -56,13 +57,12 @@ just brute          time-to-first-hit rungs + checks/s, release, machine otherwi
   test must not take the binary with it. `.config/nextest.toml` sets a 60 s
   slow-timeout, overridden to 300 s for `cvg_benchmarks` — every problem there runs
   ten seeds, so `top_corner_200d` legitimately takes ~150 s and the equality twin ~350 s.
-- The `z3` crate is built with `bundled`, so a cold build compiles Z3 from source and
-  needs CMake plus a C++ toolchain (MSVC on Windows). Slow the first time, cached after.
+- There is no C or C++ toolchain in the build: the crate is pure Rust, and the one
+  C++ dependency it had (Z3, built from source) was removed in favour of interval
+  branch-and-prune. Do not reintroduce one without a new fact.
 - `antlr-rust-codegen` pulls in RustPython; the lockfile currently wants a recent
   stable rustc. If `cargo build` complains about `requires rustc 1.9x`, update the
   toolchain rather than downgrading dependencies.
-- The environment variable `SOJOURN_SMT_LOGIC` overrides the SMT-LIB logic (default
-  `QF_NIRA`).
 
 ## How to work here
 
@@ -75,15 +75,18 @@ feature branch; tests that fail to *compile* are not — that is an incomplete A
 the 20-segment beam ran 3.7 CPU-hours without returning before anyone knew why —
 so every foreign call, and every API of ours with even a remote chance of
 combinatorial explosion or exponential backoff, carries a budget that ends it:
-a resource limit in the callee's own units where one exists (`rlimit` for Z3,
-an evaluation count for COBYLA), and otherwise a wall-clock ceiling set so
-conservatively that reaching it means a bug, not a slow case — the five-sigma
-use. Reaching it must fail loudly (an error, a `tracing::error!` and
-abandonment, a `panic!`) and never wait. `smt::Z3Backend::solve` is the model:
-rlimit first, a ceiling twenty times past honest work, interrupt, grace,
-abandon-and-report. A budget is a count and decides the answer deterministically;
-a ceiling is a watchdog and only decides that something is broken. Keep them
-distinct, and never let a ceiling become the thing that decides a result.
+a resource limit in the callee's own units where one exists (an evaluation
+count for COBYLA, a contraction count for branch-and-prune, a proposal count
+for brute force), and otherwise a wall-clock ceiling set so conservatively that
+reaching it means a bug, not a slow case — the five-sigma use. Reaching it must
+fail loudly (an error, a `tracing::error!` and abandonment, a `panic!`) and never
+wait. The sampling worker is the model: a search that dies takes its panic to
+the caller's thread by `resume_unwind`, in `solve` and in `take`, rather than
+leaving a channel nobody will ever send on. A budget is a count and decides the
+answer deterministically; a ceiling is a watchdog and only decides that
+something is broken. Keep them distinct, and never let a ceiling become the
+thing that decides a result. (The last foreign call with a ceiling was Z3's
+leash; it went with Z3, and every loop that remains is a count.)
 The full inventory of the engine's loops and the hedges considered is in
 `docs/todo.md` under "Hanging is the worst failure mode".
 
@@ -110,7 +113,7 @@ than be "fixed" to match (see src/README.md).
 **Neither backend's lowering is visible to the other.** The front end produces the
 canonical form of what the author wrote and nothing more. If a pass makes the tree
 easier to *analyse*, it belongs in `frontend::rewrite`; if it makes it faster to
-*run*, it belongs in `eval`; if it makes it *emittable* to a solver, in `cvg::smtlib`.
+*run*, it belongs in `eval`; if it makes it *narrowable*, in `cvg::interval`.
 The `<= 0 is true` residual convention is `eval`'s, not the language's.
 
 `a == b +/- t` is the worked example of that seam. `eval::lower` desugars it into
@@ -131,19 +134,28 @@ a named vector kernel or a named `*_scalar` one; do not rely on auto-vectorisati
 anywhere. Never use pulp's `mul_add` (fused on every backend) or its `max`/`min`
 (x86 semantics, not NaN-propagating). The crate has no `unsafe`; keep it that way.
 
-**The pool's ladder is probe, local solve, solver, brute force.** `cvg`'s
-uniform sampler (`Strategy::BruteSquad`) probes with one brute-force batch —
-tens of microseconds — and delivers where that lands often enough. Where it
-lands nothing, a local solve goes first (`Strategy::LocalSolve`, `cvg/local.rs`):
-COBYLA from the box centre and a few seeded starts, stopped at the first point
-the oracle judges feasible — 24 evaluations and 150 ms on the 100-segment
-stepped beam, where Z3 needs minutes per query. Only where every start fails is
-Z3 asked, under a resource limit (`with_solver_limit`, in Z3's own units so the
-answer is machine-independent) — it settles a contradiction in milliseconds,
-which is now its role: the proof that there is nothing to find. It answers
-`unknown` on anything transcendental or past the limit, and only what it could
-not decide gets brute force: the same sampler on every core for a proposal
-budget (`with_proposal_budget`, default a billion). What brute force finds is a function of the seed and the budget, never
+**The pool's ladder is contract, probe, local solve, bisect, brute force.**
+Branch-and-prune (`Strategy::Prune`, `cvg/prune.rs`) contracts the declared
+box under every constraint before a proposal is spent — HC4 propagation over
+`interval::narrow` — and a coordinate that empties is the proof, with the
+constraints that emptied it as the blame (`Infeasibility::Proved`). `cvg`'s
+uniform sampler (`Strategy::BruteSquad`) then probes with one brute-force
+batch — tens of microseconds — and delivers where that lands often enough.
+Where it lands nothing, a local solve goes next (`Strategy::LocalSolve`,
+`cvg/local.rs`): COBYLA from the box centre and a few seeded starts, stopped
+at the first point the oracle judges feasible — 24 evaluations and 150 ms on
+the 100-segment stepped beam. When the walker will carry the search, or
+nothing has been found, the contracted box is split and pruned for a budget
+of contractions (`with_prune_budget`, a count so the answer is
+machine-independent): every box dying is a proof the contraction alone could
+not see, and the leaves that survive are the pieces the walker must be
+started in, since a chain cannot cross between pieces. Splitting is a
+low-dimensional tool and the budget is sized to say so. Only what none of
+that decides gets brute force: the same sampler on every core for a proposal
+budget (`with_proposal_budget`, default a billion), and an empty search is
+`Infeasibility::NotFound`, which claims nothing — a contradiction too thin or
+too algebraic for an enclosure ends there, and `docs/todo.md` records the
+classes. What brute force finds is a function of the seed and the budget, never
 of the thread count — keep it that way (the batch is the unit of randomness).
 `Strategy` is a test-only configuration, not a user-facing one; the fairness
 oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool
@@ -152,8 +164,8 @@ default takes minutes on an unoptimised tape. The pool's state is a value:
 `cvg::progress::Progress`, threaded through `serve` → `open` → `keep_filling`
 and folded with `absorb`/`extend`, never a field. `ConstraintSystem` is
 immutable and compiled once; `Ladder` holds only the strategies' streams and
-knobs, and the SMT logic a document is emitted under. Keep it that way — the
-only `&mut` in the search is an RNG or a walker's chain.
+knobs. Keep it that way — the only `&mut` in the search is an RNG or a
+walker's chain.
 
 **An equality is read before it is searched.** `cvg::classify` reads
 `a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
@@ -262,21 +274,24 @@ drive plan and the incidence graph, both derived while proving the set fits
 together. Its fields are crate-visible and it answers the simple questions
 only: `is_feasible` (with a clearance) and `worst_residual`. The moves are the
 engine's, as free functions over `&ConstraintSystem` in the module that owns
-the idea — `classify::retract` and `classify::settle` for the plan,
-`interval::slice` for the narrowing question, `smt::adjusted` for the ulp
-nudge of a solver's witness that landed a hair outside in `f64`. There is no
-wrapper type around the system: the one thing a solver call needs beyond it,
-the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
+the idea — `classify::retract`, `classify::settle` and `classify::centre` for
+the plan, `interval::slice` for the narrowing question, `prune::contract` and
+`prune::bisect` for the box. There is no wrapper type around the system.
 
 **`FeasibleRegion` is the solved system.** `ConstraintSolver::solve` takes the
 system by reference and clones it twice, once for the worker thread and once
 for the region, so the region can answer for the system after the search:
 `system()`, `take` for samples, and `repair` — which lives here rather than
 on the system because a region that could not be solved has nothing to repair
-toward. `repair` draws no randomness — not a seed, not a step — and lands a
-coordinate at the caller's clearance inside its bound, *on* the bound at zero
-clearance; the design and the alternatives it displaced are in `docs/todo.md`
-under *Repair for Artemis*.
+toward. `repair` is a function of the system, the point and the clearance
+and of nothing else — it draws no randomness and consults no census, because
+a landing that depends on other points steers the optimizer being repaired
+toward them (the *anchors* it used to take did exactly that, measured as a
+28° bias on a disc). It clamps each coordinate into its slice and, where that
+cannot land, projects: the nearest feasible point by a local solve from the
+proposal (`local::nearest`). A coordinate lands at the caller's clearance
+inside its bound, *on* the bound at zero clearance; the design and the
+alternatives it displaced are in `docs/todo.md` under *Repair for Artemis*.
 
 `cvg::incidence` is the bipartite graph of constraints and coordinates, kept in
 both directions because the walker traverses it both ways. Its indices are
@@ -315,17 +330,17 @@ where the truth is 1.85, made the threshold 36% too tight, and read as the
 sampler being broken. Any new statistic compared here needs the same treatment —
 never `values.len()`.
 
-**Another language is never built with a string builder.** WGSL and SMT-LIB
-both go through askama templates under `templates/`, compiled at
-build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/smtlib.rs`.
+**Another language is never built with a string builder.** WGSL goes through
+askama templates under `templates/`, compiled at build time against views in
+`eval/wgsl.rs` and `cvg/sieve.rs` (SMT-LIB went the same way while it existed).
 The semantics — which helper, which guard, what is refused — stay in Rust; the
 syntax lives in files that read as the language they produce, with one macro
 arm per operator, and the operator types the templates match over are the
 subsets the target language can spell, so a missing arm is a compile error. A
 `format!` that writes a brace, a parenthesis, an operator or a keyword of
-another language is the smell to refuse. Template output is validated (naga,
-Z3's parser), checked for the substrings that matter and for balance, and never
-recorded to a file.
+another language is the smell to refuse. Template output is validated (naga),
+checked for the substrings that matter and for balance, and never recorded to
+a file.
 
 **The GPU is a sieve and never a judge.** Behind the opt-in `gpu` feature
 (`just brute`, `just bench` and `just test-gpu` turn it on), brute force runs
@@ -358,26 +373,23 @@ Compare medians of several runs, in one sitting, with an untouched case as a con
 against the parent commit. Benchmarks are release-only; a debug number is meaningless
 and under upsert would overwrite a good row.
 
-**Z3 is the solver, and its limits are known.** No logarithms, no `e`, `sin`/`cos`
-parse but answer `unknown`, `^` with a variable exponent answers `unknown`, `^` with
-a negative base and fractional exponent is unsound for babel's `cbrt`. The rewrite
-pass `invert_monotone` and each backend's own lowering of a whole exponent to
-multiplication (`Expr::whole_exponent`) route around this; the metric that matters is
-`Document::untranslated`. cvc5 and dReal were evaluated and rejected;
-the table is in todo.md under "The solver question, settled". Do not re-shop for a
-solver without a new fact.
-
-**`Solver::from_string` returns `()`.** A malformed SMT-LIB document leaves an empty
-solver that answers `sat` with an empty model. Every verdict in `cvg::smt` is gated
-on the assertions having arrived; keep it that way.
+**There is no SMT solver, and the limits of what replaced it are known.**
+Interval branch-and-prune proves what an enclosure can see: a plain
+contradiction, a disc that cannot meet its ring. It cannot prove a *thin*
+contradiction (`x + y <= 1` against `x + y >= 1 + 1e-9`) or an *algebraic* one
+(`x*x - 2*x*y + y*y < 0`), and reports those `NotFound`; `tests/cvg_pools.rs`
+pins both. Z3 proved some of those and spun on others, could not be interrupted
+reliably, and cost a C++ build; cvc5 and dReal were evaluated against it and
+rejected. The record is in todo.md under "The solver question, settled" and
+"Z3's fate". Do not re-shop for a solver without a new fact — a user story that
+needs one of the two classes above proved would be one.
 
 ## Style
 
 - Doc comments explain *why* and record what was measured; the code says what.
   Match that register — the module headers are the model.
 - Prefer a type that makes the mistake unrepresentable (`Progress`, the `Slot`
-  binding table, `SmtUnary`) over a
-  check that reports it.
+  binding table, `ConstraintId`/`Row`) over a check that reports it.
 - Public API is batch-only: `CompiledExpression::eval(MatRef) -> Col<f64>`, one
   column per sample, one row per schema variable. `eval_row` is crate-private for
   the walker and is the same tape through the per-lane executor, not a second

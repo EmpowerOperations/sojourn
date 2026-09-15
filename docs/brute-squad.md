@@ -1,5 +1,10 @@
 # I am the brute squad
 
+*2026-09-14: a record. `Strategy::Solver` and the Z3 it named are gone; the proof and the
+gap coverage this plan escalated to are `Strategy::Prune`, interval branch-and-prune, and
+the ladder is contract, probe, local solve, bisect, brute force — see `docs/todo.md`,
+"Z3's fate". Nothing below was rewritten to match.*
+
 *"Sample harder."* A plan for the regime where the feasible region is a
 1e-6 to 1e-9 fraction of the box, the SMT solver cannot help — usually because
 the constraint contains a transcendental — and the honest answer is to bring

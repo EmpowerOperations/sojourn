@@ -438,8 +438,8 @@ impl SemanticTranslator<'_> {
 
     // These survive compilation as `Kind::Compare` and `Kind::NearEq`. Each
     // backend lowers them itself: `eval` computes a residual whose sign carries
-    // the truth value, `cvg::smtlib` writes the comparison out as a comparison.
-    // Neither convention belongs to the front end.
+    // the truth value, `cvg::interval` reads the comparison as a target
+    // interval. Neither convention belongs to the front end.
     fn translate_boolean_expr(
         &self,
         ctx: &BooleanExprContext<'_>,

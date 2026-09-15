@@ -2,7 +2,7 @@
 //! hands back.
 //!
 //! [`ConstraintSolver`] is every knob — the seed, the budgets, the strategy
-//! list, the SMT logic — with a default for each, and one awaitable call,
+//! list — with a default for each, and one awaitable call,
 //! [`solve`](ConstraintSolver::solve), that starts the engine on a worker
 //! thread. [`FeasibleRegion`] is what a satisfied search returns: the solved
 //! region — a handle to that worker, from which feasible points are taken as
@@ -31,9 +31,9 @@ use crate::{ConstraintRef, ConstraintSystem, Point};
 ///
 /// The one way [`solve`](crate::solve) fails to return a region: there is
 /// none to return, or none could be found. Everything else that can go wrong
-/// in a search — a thread that cannot be spawned, a solver that dies, a
-/// document the solver cannot parse — is a bug in this crate or a failure of
-/// the host, and is a panic, raised on the calling thread.
+/// in a search — a thread that cannot be spawned, a worker that dies — is a
+/// bug in this crate or a failure of the host, and is a panic, raised on the
+/// calling thread.
 ///
 /// Kept as two variants rather than a `proved: bool` because they are different
 /// sentences to whoever reads the result. *"Your constraints conflict, here are
@@ -43,28 +43,32 @@ use crate::{ConstraintRef, ConstraintSystem, Point};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Infeasibility {
-    /// A solver proved no point exists, and these are the constraints its proof
-    /// used.
+    /// Interval reasoning proved no point exists, and these are the
+    /// constraints its proof used.
     ///
     /// A list rather than one culprit: a contradiction is a *relationship*.
     /// `x > 8` is perfectly satisfiable right up until `x < 2` appears, and
-    /// naming either alone would be picking arbitrarily. Comes from the unsat
-    /// core, so it is the constraints actually used rather than every one
-    /// present.
+    /// naming either alone would be picking arbitrarily. The list is the
+    /// trace of the proof — every constraint that narrowed a coordinate the
+    /// emptied one depended on — so it is the constraints actually used
+    /// rather than every one present.
     Proved { blamed: Vec<ConstraintRef> },
-    /// Sampling found nothing and no solver could prove anything. **This is not
-    /// a claim that the region is empty.**
+    /// Sampling found nothing and nothing could be proved. **This is not a
+    /// claim that the region is empty.**
     ///
-    /// `unexpressed` names the constraints no solver could be asked about, which
-    /// is usually the reason: a region defined by something outside the theory
-    /// can only be found by luck.
+    /// `unexpressed` names the constraints interval reasoning could conclude
+    /// nothing from — a computed subscript, say — which is often the reason:
+    /// a region defined by something no enclosure can see is found only by
+    /// luck. Empty when every constraint said *something* and it still did
+    /// not add up to a proof, which is what a contradiction too thin or too
+    /// algebraic for intervals looks like.
     NotFound { unexpressed: Vec<ConstraintRef> },
 }
 
 /// The sentence each arm is: a conflict names the constraints in it, and a
-/// shrug says what was tried and, when some constraint was beyond every
-/// solver, which. `Display` by hand because the shrug's second sentence is
-/// conditional; the `Error` impl is derived on it.
+/// shrug says what was tried and, when some constraint was beyond interval
+/// reasoning, which. `Display` by hand because the shrug's second sentence
+/// is conditional; the `Error` impl is derived on it.
 impl std::fmt::Display for Infeasibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let listed = |constraints: &[ConstraintRef]| {
@@ -83,13 +87,13 @@ impl std::fmt::Display for Infeasibility {
             Self::NotFound { unexpressed } => {
                 write!(
                     f,
-                    "no feasible point was found: no solver could prove the region empty \
-                     and sampling found nothing"
+                    "no feasible point was found: nothing proved the region empty and \
+                     sampling found nothing"
                 )?;
                 if !unexpressed.is_empty() {
                     write!(
                         f,
-                        "; no solver could be asked about {}",
+                        "; nothing could be concluded from {}",
                         listed(unexpressed)
                     )?;
                 }
@@ -135,31 +139,31 @@ pub enum Strategy {
     /// Deterministic: a fixed evaluation count per start, and the same seed
     /// gives the same starts.
     LocalSolve,
-    /// Ask the SMT solver for a first point when the probe and the local
-    /// solves found none. The only strategy that can *prove* a region empty,
-    /// and since the local solve exists that is its role: it is reached when
-    /// there is nothing to find, which is when a proof is what is wanted.
-    /// Asked *before* brute force, not after: a contradiction or an equality
-    /// ribbon is settled in milliseconds where brute force would spend its
-    /// whole budget, and what the solver answers `unknown` on — anything
-    /// transcendental — is handed to brute force with the constraints it
-    /// could not express.
+    /// Interval contraction and bisection — branch-and-prune. The one
+    /// strategy that can *prove* a region empty and name the constraints
+    /// that conflict, and the one that finds the *pieces* of a region the
+    /// walker must be started in, since a chain cannot cross between them.
+    /// The declared box is contracted before a single proposal, which is
+    /// where a plain contradiction is caught; the box is split and pruned
+    /// only when the walker will carry the search or nothing has been found.
+    /// Bounded by a count of contractions, never a clock. What it cannot see
+    /// — a contradiction every box encloses a little of — is left to brute
+    /// force and reported as [`Infeasibility::NotFound`] rather than claimed.
     ///
-    /// The one a test leaves out when it must measure sampling alone: Z3
-    /// answers `x1 > 0.999999` instantly, which would make a time-to-first-hit
-    /// fixture a measurement of Z3. Without it the probe hands straight to
-    /// brute force.
-    Solver,
+    /// The one a test leaves out when it must measure sampling alone: a
+    /// contraction settles `x1 > 0.999999` at once, which would make a
+    /// time-to-first-hit fixture a measurement of the contractor.
+    Prune,
 }
 
 /// What production uses: plain sampling, the walker for whatever it leaves
-/// short, a local solve for a first point where sampling finds none, and the
-/// solver to prove the region empty where the local solves find none either.
+/// short, a local solve for a first point where sampling finds none, and
+/// branch-and-prune to prove the region empty or find its pieces.
 ///
 /// The strategies are partitioned by role in [`Ladder::new`] rather than by
 /// position, so the order here is cosmetic. The actual order of escalation is
-/// fixed by [`open`]: probe, then local solve, then solver, then brute force,
-/// then the walker from whatever seed those produced.
+/// fixed by [`open`]: contract, probe, then local solve, then bisect, then
+/// brute force, then the walker from whatever seed those produced.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
 /// copy of this list living in the test suite is a copy that goes stale, and did.
@@ -168,7 +172,7 @@ pub const DEFAULT_STRATEGIES: &[Strategy] = &[
     Strategy::BruteSquad,
     Strategy::LocalSolve,
     Strategy::HitAndRun,
-    Strategy::Solver,
+    Strategy::Prune,
 ];
 
 /// Candidates the brute-force search proposes before giving up, unless
@@ -182,17 +186,26 @@ pub const DEFAULT_STRATEGIES: &[Strategy] = &[
 /// every machine.
 pub const DEFAULT_PROPOSAL_BUDGET: u64 = 1_000_000_000;
 
-/// How much work Z3 may do before giving up with `unknown`, unless
-/// [`ConstraintSolver::with_solver_limit`] says otherwise.
+/// How many contractions branch-and-prune may spend splitting a box, unless
+/// [`ConstraintSolver::with_prune_budget`] says otherwise.
 ///
-/// In Z3's resource units, so that the same problem answers the same way on
-/// every machine. Three million is about twenty-five seconds on this laptop
-/// for a mixed integer-nonlinear instance (measured at eight seconds per
-/// million, roughly linear up to there and not beyond), which is the "tough"
-/// regime's wait; a contradiction or a ribbon is settled in milliseconds and
-/// never approaches it. An `unknown` from the limit hands over to brute force
-/// like any other.
-pub const DEFAULT_SOLVER_LIMIT: u32 = 3_000_000;
+/// A count of contractions, so that the same problem answers the same way on
+/// every machine. Spent only when the walker will carry the search or
+/// nothing has been found; a problem sampling settles pays one contraction
+/// of the declared box and nothing more.
+///
+/// Splitting is a low-dimensional tool: it isolates a piece of a region, or
+/// proves a box empty, only where it can split enough coordinates, and 256
+/// contractions is eight levels — every coordinate once at eight
+/// dimensions. Measured: the two roots of `(x + 2)(x - 1) == 0` and the two
+/// branches of `abs(x) == 1` each cost 2; the disc inside a ring it cannot
+/// meet is proved empty in 2; a circle's ribbon at `1e-6` spends whatever it
+/// is given and settles nothing, which is the shape of a budget spent
+/// honestly. On the ten-segment stepped beam — twenty variables, one piece,
+/// carried by the walker — every contraction is bought for nothing, and at
+/// 4096 that was forty seconds of an unoptimised build; at 256 it is a
+/// couple, which is what a problem this tool cannot help pays.
+pub const DEFAULT_PRUNE_BUDGET: u32 = 256;
 
 /// Candidates brute force proposes on a GPU before giving up, unless
 /// [`ConstraintSolver::with_gpu_proposal_budget`] says otherwise.
@@ -219,60 +232,6 @@ pub const DEFAULT_GPU_PROPOSAL_BUDGET: u64 = 30_000_000_000;
 /// "which device did it actually use"; the list is logged at `info` whenever
 /// the variable is set. Only read by builds with the `gpu` feature.
 pub const GPU_VARIABLE: &str = "SOJOURN_GPU";
-
-/// Which SMT-LIB logic a document declares.
-///
-/// Defaults to `QF_NIRA`, which is what the prelude needs — see the comment on
-/// the `set-logic` line in `cvg::smtlib`. Overridable because the right answer is a
-/// property of the backend and of what the constraints happen to use, and
-/// neither is fixed: a document with no `to_int` in it would be honest as
-/// `QF_NRA`, and a future backend may want `ALL` or a dialect of its own.
-///
-/// Precedence, most specific first: [`ConstraintSolver::with_logic`] beats the
-/// `SOJOURN_SMT_LOGIC` environment variable, which beats `QF_NIRA`. The
-/// environment sets the *default* rather than winning outright, so a test that
-/// pins the logic still passes on a machine where the variable is set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SmtLogic(String);
-
-impl SmtLogic {
-    /// The environment variable consulted by [`SmtLogic::default`].
-    pub const VARIABLE: &'static str = "SOJOURN_SMT_LOGIC";
-
-    /// A logic by name. Unvalidated on purpose — the list of logics a solver
-    /// accepts is the solver's business, and a name it rejects surfaces
-    /// immediately as a parse failure rather than quietly.
-    #[must_use]
-    pub fn named(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-}
-
-impl SmtLogic {
-    /// The default, given whatever the environment said.
-    ///
-    /// Split out from [`Default`] so it can be tested: mutating a real
-    /// environment variable is process-global, and under plain `cargo test`
-    /// that races every other test in the binary.
-    pub(crate) fn from_variable(value: Option<&str>) -> Self {
-        value
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| Self("QF_NIRA".to_owned()), Self::named)
-    }
-}
-
-impl Default for SmtLogic {
-    fn default() -> Self {
-        Self::from_variable(std::env::var(Self::VARIABLE).ok().as_deref())
-    }
-}
-
-impl std::fmt::Display for SmtLogic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Everything a solve needs beyond the problem itself.
 ///
@@ -307,7 +266,6 @@ pub struct ConstraintSolver {
     rng: Xoshiro256PlusPlus,
     known_feasible: Vec<Point>,
     strategies: Vec<Strategy>,
-    logic: SmtLogic,
     budgets: Budgets,
 }
 
@@ -321,8 +279,8 @@ pub(crate) struct Budgets {
     pub(crate) proposals: u64,
     /// See [`ConstraintSolver::with_threads`].
     pub(crate) threads: usize,
-    /// See [`ConstraintSolver::with_solver_limit`].
-    pub(crate) solver_limit: u32,
+    /// See [`ConstraintSolver::with_prune_budget`].
+    pub(crate) prune: u32,
     /// See [`ConstraintSolver::with_gpu`]. Read only when the `gpu` feature
     /// is on; kept in the struct either way so the builder is one API.
     #[cfg_attr(
@@ -343,7 +301,7 @@ impl Default for Budgets {
         Self {
             proposals: DEFAULT_PROPOSAL_BUDGET,
             threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-            solver_limit: DEFAULT_SOLVER_LIMIT,
+            prune: DEFAULT_PRUNE_BUDGET,
             gpu: true,
             gpu_proposals: DEFAULT_GPU_PROPOSAL_BUDGET,
         }
@@ -356,7 +314,6 @@ impl Default for ConstraintSolver {
             rng: Xoshiro256PlusPlus::from_rng(&mut rand::rng()),
             known_feasible: Vec::new(),
             strategies: DEFAULT_STRATEGIES.to_vec(),
-            logic: SmtLogic::default(),
             budgets: Budgets::default(),
         }
     }
@@ -384,8 +341,8 @@ impl ConstraintSolver {
     /// What a caller reproducing a run supplies. Every point the search
     /// delivers is a function of this seed and the budgets, so two solves of
     /// the same system under the same seed hand out the same points in the
-    /// same order — which is also what makes a [`repair`](FeasibleRegion::repair) anchored on those
-    /// points repeat.
+    /// same order. ([`repair`](FeasibleRegion::repair) needs no seed: it is a
+    /// function of the system, the point and the clearance.)
     #[must_use]
     pub fn with_seed(self, seed: u64) -> Self {
         self.with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
@@ -396,18 +353,6 @@ impl ConstraintSolver {
     #[must_use]
     pub fn with_rng(mut self, rng: Xoshiro256PlusPlus) -> Self {
         self.rng = rng;
-        self
-    }
-
-    /// The SMT-LIB logic the emitted document declares.
-    ///
-    /// Rarely worth setting. It exists because the right logic is a property of
-    /// the backend and of what the constraints use, and neither is fixed —
-    /// see [`SmtLogic`] for the default and for the `SOJOURN_SMT_LOGIC` escape
-    /// hatch this takes precedence over.
-    #[must_use]
-    pub fn with_logic(mut self, logic: SmtLogic) -> Self {
-        self.logic = logic;
         self
     }
 
@@ -446,23 +391,17 @@ impl ConstraintSolver {
         self
     }
 
-    /// How much work the SMT solver may do before it gives up with `unknown`.
+    /// How many contractions branch-and-prune may spend splitting the box.
     ///
-    /// In Z3's own resource units — a count of the work it has done, not a
-    /// clock — so that the same problem gets the same answer on every
-    /// machine. The default is [`DEFAULT_SOLVER_LIMIT`]; zero is no limit at
-    /// all. An `unknown` from the limit is handled like any other: brute
-    /// force gets the budget.
-    ///
-    /// The limit is not the only leash. Z3 has been caught ignoring it, so a
-    /// call is also interrupted when the [`solve`](Self::solve) future is
-    /// dropped or when a wall-clock ceiling far past honest work passes
-    /// (twenty times the limit's measured cost, never under a minute, an hour
-    /// for zero), and a call that ignores the interrupt is abandoned with an
-    /// error-level `tracing` line rather than allowed to hang the search.
+    /// A count, not a clock, so that the same problem gets the same answer on
+    /// every machine. The default is [`DEFAULT_PRUNE_BUDGET`]; zero contracts
+    /// the declared box once and never splits it, which still catches a plain
+    /// contradiction and never finds a second piece. A budget spent without a
+    /// conclusion is handled like any other shrug: brute force gets its turn,
+    /// and an empty search is [`Infeasibility::NotFound`].
     #[must_use]
-    pub const fn with_solver_limit(mut self, limit: u32) -> Self {
-        self.budgets.solver_limit = limit;
+    pub const fn with_prune_budget(mut self, contractions: u32) -> Self {
+        self.budgets.prune = contractions;
         self
     }
 
@@ -524,14 +463,13 @@ impl ConstraintSolver {
     /// The search runs on its own thread and this future waits on the opening
     /// verdict, so a `timeout` around it does fire. **Dropping the future is
     /// how to cancel:** a brute-force search notices between batches and
-    /// stops, freeing every core it took, and a solver call in progress is
-    /// interrupted — see [`with_solver_limit`](Self::with_solver_limit) for
-    /// what happens if Z3 ignores that. [`FeasibleRegion::take`] is
-    /// synchronous by design. Recorded in `docs/todo.md`.
+    /// stops, freeing every core it took, and a bisection notices between
+    /// boxes. [`FeasibleRegion::take`] is synchronous by design. Recorded in
+    /// `docs/todo.md`.
     ///
     /// # Errors
     /// There is no region: the constraints were proved to conflict, or nothing
-    /// could be found and no solver could prove anything — [`Infeasibility`]
+    /// could be found and nothing could be proved — [`Infeasibility`]
     /// says which and names the constraints involved. Nothing else is an
     /// error; see [`Infeasibility`] for what is a panic instead.
     ///
@@ -544,7 +482,7 @@ impl ConstraintSolver {
         // `'static`, and the handle answers for the region after the search,
         // which is where repair lives. A system is tapes and two small graphs,
         // so two clones are nothing against the search.
-        let ladder = Ladder::new(system, self.logic, self.rng, &self.strategies, self.budgets);
+        let ladder = Ladder::new(system, self.rng, &self.strategies, self.budgets);
         let system = system.clone();
 
         let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -662,15 +600,15 @@ impl FeasibleRegion {
     /// A point that satisfies the system with room to spare, near `point`,
     /// the same every time.
     ///
-    /// `anchors` are feasible points the caller believes in, one per column in
-    /// schema order — what [`take`](Self::take) hands out is the intended
-    /// source, and the caller supplies them rather than this reading its own
-    /// buffer because the answer has to be a function of what the caller can
-    /// see: same system, same anchors, same point, same output, bit for bit.
-    /// They are judged rather than trusted; an infeasible column is skipped.
-    /// With no anchors at all the answer is whatever clamping alone reaches,
-    /// which is enough wherever the constraints name where their feasible
-    /// side is.
+    /// The answer is a function of the system, the point and the clearance
+    /// and of nothing else — not of the samples this region has handed out,
+    /// not of anything the caller has seen elsewhere. That is what an
+    /// optimizer being repaired needs: a landing that depends on other points
+    /// steers the optimizer toward them, and this used to take *anchors* for
+    /// exactly that reason and with exactly that effect. Each coordinate is
+    /// clamped into the interval its constraints leave it, and where that
+    /// cannot land the point is projected — the feasible point nearest it,
+    /// by a local solve from where clamping left it.
     ///
     /// `clearance` is the room kept from every wall, as a fraction of each
     /// variable's box width: the result and each of its `2d` axis neighbours
@@ -683,9 +621,10 @@ impl FeasibleRegion {
     ///
     /// A point that already has the clearance comes back unchanged, so
     /// `repair(repair(x)) == repair(x)`; a feasible point without it is moved
-    /// inward. And never farther from `point`, in L1 over box-normalised
-    /// coordinates, than the nearest anchor with the clearance among the few
-    /// considered. The algorithm is `src/repair.rs`.
+    /// inward. Otherwise the answer is a judged point with the clearance, no
+    /// farther from `point` than clamping reached, and where clamping could
+    /// not land, the nearest the projection found within its evaluation
+    /// budget. The algorithm is `src/repair.rs`.
     ///
     /// # Errors
     /// [`RepairError::Stranded`] when nothing feasible was reached at all, and
@@ -693,16 +632,11 @@ impl FeasibleRegion {
     /// could not be had there.
     ///
     /// # Panics
-    /// If `point` or `anchors` do not have one entry per variable, or
-    /// `clearance` is negative or not finite. That is a caller mixing up
-    /// systems, not a verdict about the point.
-    pub fn repair(
-        &self,
-        anchors: faer::MatRef<'_, f64>,
-        point: &[f64],
-        clearance: f64,
-    ) -> std::result::Result<Point, RepairError> {
-        crate::repair::repair(&self.system, anchors, point, clearance)
+    /// If `point` does not have one entry per variable, or `clearance` is
+    /// negative or not finite. That is a caller mixing up systems, not a
+    /// verdict about the point.
+    pub fn repair(&self, point: &[f64], clearance: f64) -> std::result::Result<Point, RepairError> {
+        crate::repair::repair(&self.system, point, clearance)
     }
 
     /// Up to `count` samples, waiting for them.
@@ -823,32 +757,5 @@ impl Drop for FeasibleRegion {
         if let Some(handle) = self.worker.take() {
             drop(handle.join());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SmtLogic;
-
-    #[test]
-    fn the_environment_sets_the_default_and_nothing_more() {
-        // Precedence, in the only form that can be checked without mutating a
-        // process-global: absent or blank falls back, anything else is taken
-        // verbatim. That `with_logic` beats this is structural — it replaces
-        // the field the default produced.
-        assert_eq!(SmtLogic::from_variable(None), SmtLogic::named("QF_NIRA"));
-        assert_eq!(
-            SmtLogic::from_variable(Some("")),
-            SmtLogic::named("QF_NIRA")
-        );
-        assert_eq!(
-            SmtLogic::from_variable(Some("   ")),
-            SmtLogic::named("QF_NIRA")
-        );
-        assert_eq!(SmtLogic::from_variable(Some("ALL")), SmtLogic::named("ALL"));
-        assert_eq!(
-            SmtLogic::from_variable(Some(" QF_NRA ")),
-            SmtLogic::named("QF_NRA")
-        );
     }
 }

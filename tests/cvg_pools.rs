@@ -11,7 +11,7 @@
 //!   so rejection sampling finds points immediately.
 //! * **Equality-with-tolerance is not.** `x1 == sqrt(x2) +/- 0.0001` is a
 //!   measure-zero ribbon that uniform sampling will essentially never land on.
-//!   Those stay red until a solver is wired up — that is the honest picture, not
+//!   Those were red until a seeder existed — that was the honest picture, not
 //!   a gap in the port.
 //!
 //! All sixteen cases from the fixture are here. Several of them exercise babel
@@ -19,10 +19,11 @@
 //! pool, which is worth more than the solver coverage they were written for.
 //!
 //! Deliberately not ported: `Z3Fixture` and `Z3ExtensionsFixture` test the Z3
-//! API we are not using; `LanguageFixture` is half JVM sanity checks and half
-//! decimal-to-rational conversion that belongs with the SMT emitter;
-//! `IntegrationTests` asserts a list equals an integer and calls `.all()`
-//! without a terminal assertion, so it either always fails or asserts nothing.
+//! API, which this crate no longer links; `LanguageFixture` is half JVM sanity
+//! checks and half decimal-to-rational conversion for an SMT emitter this
+//! crate no longer has; `IntegrationTests` asserts a list equals an integer
+//! and calls `.all()` without a terminal assertion, so it either always fails
+//! or asserts nothing.
 
 mod common;
 
@@ -113,14 +114,14 @@ fn assert_ten_feasible(system: &ConstraintSystem, sources: &[&str], points: &[Ve
 /// `Unknown` is a claim about what we *know*, not about what we can deliver.
 ///
 /// This case was written expecting the system to come up empty: the band is one
-/// part in a million of the box, far too thin to sample, and `sin` is outside
-/// what the emitter will put to a solver. It does not come up empty, and the
-/// reason is worth keeping.
+/// part in a million of the box, far too thin to sample. It does not come
+/// up empty, and the reason is worth keeping.
 ///
-/// With `sin` refused, the document Z3 receives contains only the bounds — so it
-/// returns some arbitrary point satisfying those, near the origin. And
-/// `sin(0) = 0`, so that point happens to sit *on the curve*. Hit-and-run seeds
-/// from it and walks **along** the curve, since shrinkage converges onto the
+/// `y` is driven by `sin(x)`, so a box's centre is put on the curve when it
+/// is judged and the declared box settles at once — where the solver of the
+/// day, refusing `sin`, saw only the bounds and landed near the origin, on
+/// the curve by the accident of `sin(0) = 0`. Hit-and-run seeds from the
+/// point and walks **along** the curve, since shrinkage converges onto the
 /// feasible piece containing the current point however thin that piece is.
 ///
 /// So the pool delivers real points for a constraint nothing in the pipeline can
@@ -196,9 +197,13 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
 
     let mut pool = match verdict {
         Ok(region) => region,
-        // Also a fine answer, and it would mean the emitter grew `%`.
+        // Also fine answers. `%` across its discontinuities is beyond an
+        // interval enclosure, so the honest verdict is `NotFound`; a `Proved`
+        // would mean the contractor learned `%`, and would have to say who.
         Err(because) => {
-            assert!(matches!(because, Infeasibility::Proved { ref blamed } if !blamed.is_empty()));
+            if let Infeasibility::Proved { blamed } = &because {
+                assert!(!blamed.is_empty(), "{because}");
+            }
             return Ok(());
         }
     };
@@ -321,11 +326,12 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() -> anyhow::Re
 /// and the four together hold nothing, which sampling cannot distinguish from
 /// bad luck and a local solve cannot distinguish from a bad start. What a
 /// user needs back is the *set* that conflicts, so they know which line to
-/// look at — which is the unsat core, and the one thing only a solver gives.
-/// Measured 2026-09-13: Z3 blames exactly `x1 < 3`, `x2 > 5`, `x1 > x2`, and
-/// the message reads "no point satisfies these constraints together:
-/// `x1 < 3`, `x2 > 5`, `x1 > x2`". This is the test the question "does Z3
-/// earn its build" is answered against; see `docs/todo.md`.
+/// look at. Interval contraction blames exactly `x1 < 3`, `x2 > 5`,
+/// `x1 > x2` — the trace of the coordinate it emptied — and the message reads
+/// "no point satisfies these constraints together: `x1 < 3`, `x2 > 5`,
+/// `x1 > x2`". This was the test the question "does Z3 earn its build" was
+/// answered against, and the answer was that this does it without Z3; see
+/// `docs/todo.md`.
 #[pollster::test]
 async fn a_backwards_comparison_is_blamed_together_with_what_it_contradicts() -> anyhow::Result<()>
 {
@@ -381,6 +387,65 @@ async fn a_backwards_comparison_is_blamed_together_with_what_it_contradicts() ->
     Ok(())
 }
 
+/// The boundary of what interval reasoning proves, stated so it is a
+/// documented limit rather than a discovered one. A *thin* contradiction —
+/// two half-planes a billionth apart — is one every box encloses a little
+/// of until bisection reaches that width, which is beyond any budget; the
+/// honest verdict is `NotFound`, and it names nothing, because every
+/// constraint narrowed *something* without it adding up to a proof.
+#[pollster::test]
+async fn a_thin_contradiction_is_not_found_rather_than_proved() -> anyhow::Result<()> {
+    let verdict = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system(
+            vec![
+                InputVariable::new("x", -1.0, 1.0),
+                InputVariable::new("y", -1.0, 1.0),
+            ],
+            &["x + y <= 1", "x + y >= 1.000000001"],
+        )?)
+        .await;
+
+    let Err(Infeasibility::NotFound { unexpressed }) = verdict else {
+        panic!("a contradiction too thin for an enclosure was reported {verdict:?}");
+    };
+    assert!(
+        unexpressed.is_empty(),
+        "both constraints narrow boxes; neither is beyond interval reasoning: {unexpressed:?}"
+    );
+    Ok(())
+}
+
+/// The other side of the boundary: an *algebraic* contradiction.
+/// `x*x - 2*x*y + y*y` is `(x - y)^2` and never negative, but an enclosure
+/// evaluates the three terms separately and holds negatives on every box
+/// of any width — the square is never seen as a square. A decision
+/// procedure over polynomials proves this; nothing here does, and the
+/// verdict says so rather than claiming it.
+#[pollster::test]
+async fn an_algebraic_contradiction_is_not_found_rather_than_proved() -> anyhow::Result<()> {
+    let verdict = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system(
+            vec![
+                InputVariable::new("x", -1.0, 1.0),
+                InputVariable::new("y", -1.0, 1.0),
+            ],
+            &["x*x - 2*x*y + y*y < 0"],
+        )?)
+        .await;
+
+    assert!(
+        matches!(verdict, Err(Infeasibility::NotFound { .. })),
+        "a contradiction no enclosure can see was reported {verdict:?}"
+    );
+    Ok(())
+}
+
 #[pollster::test]
 async fn a_satisfiable_problem_is_not_blamed_on_anything() -> anyhow::Result<()> {
     // The other half of the above: the machinery has to stay quiet when there is
@@ -404,7 +469,7 @@ async fn a_satisfiable_problem_is_not_blamed_on_anything() -> anyhow::Result<()>
 async fn power_with_variable_as_exponent() -> anyhow::Result<()> {
     // 2^x5 < 20 means x5 < log2(20) ~ 4.32, so ~43% of the range.
     // The JVM comment reads "nope, Z3 wont reason about real-exponents" —
-    // rejection sampling has no such trouble.
+    // rejection sampling has no such trouble, and neither has an enclosure.
     let sources = &["20 > 2^x5"];
     let system = system(variables(&[("x5", 0.0, 10.0)]), sources)?;
     let mut region = ConstraintSolver::new()

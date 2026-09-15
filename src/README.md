@@ -25,8 +25,8 @@ the compiler. The type is opaque, so what runs the tape can change without
 an API change.
 
 **`cvg` keeps the tree open**, because its whole job is reading structure: which
-constraints a solver can be asked about, which variables another determines,
-which comparison can be inverted into a bound.
+variables another determines, which comparison can be inverted into a bound,
+what interval an expression can take over a box.
 
 neither backend's lowering is visible to the other**. 
 
@@ -61,10 +61,10 @@ pattern-match instead of carrying evaluators of their own. Inversion has to see
 `Kind::Compare`, which it does, because nothing eliminates one any more.
 
 One rewrite that used to be here is deliberately not: `x ^ n` for a whole `n`
-reaches every backend as written. The tape, the shader rendered from it and the
-SMT emitter each lower it to repeated multiplication themselves, keyed on one
-rule (`Expr::whole_exponent`), and interval narrowing inverts the node through
-its root. Expanding it in the tree cost a compound base `n` evaluations and left
+reaches every backend as written. The tape and the shader rendered from it
+each lower it to repeated multiplication themselves, keyed on one rule
+(`Expr::whole_exponent`), and interval narrowing inverts the node through its
+root. Expanding it in the tree cost a compound base `n` evaluations and left
 a product fold nothing could invert.
 
 Two passes are fallible, and both refuse rather than defer:
@@ -136,12 +136,13 @@ Strictness rides on a nudge: `a < b` evaluates as `(a - b) + ε` with ε being
 survives only when the difference is exactly zero — precisely where strict and
 non-strict differ.
 
-**This is one backend's convention, not the language's.** `cvg::smtlib` shares
-none of it: a comparison is emitted as `(> x 5.0)`, an equality as two bounds
-`and`-ed together. It used to receive `(< (- 5.0 x) 0.0)` and have to *detect* a
+**This is one backend's convention, not the language's.** `cvg::interval`
+shares none of it: a comparison is read as a target interval for the
+difference, an equality as the band `[-t, t]`. The SMT emitter that existed
+before it used to receive `(< (- 5.0 x) 0.0)` and have to *detect* a
 three-hundred-digit denormal to recover the strictness, and an equality arrived
-as `(<= (expr_max …) 0.0)` — an `ite` where a conjunction was meant. Both are
-gone with the pass that caused them.
+as `(<= (expr_max …) 0.0)` — an `ite` where a conjunction was meant. Both went
+with the pass that caused them.
 
 `Kind::And` exists for the same reason. `invert_monotone` needs a conjunction
 for its domain guard — `ln(x) < 2` means `x < e²` **and** `x > 0` — and used to
@@ -169,10 +170,10 @@ gone such a file is only the tape agreeing with itself.
   API: the crate-internal `eval_row` exists because the walker is sequential by
   nature, and it is the same tape through the per-lane executor, not a second
   implementation.
-- [`cvg/smtlib.rs`](cvg/smtlib.rs) — renders constraints as SMT-LIB2 for a solver.
-  What it cannot express it *reports* through `Document::untranslated` rather
-  than dropping, which is most of why the two passes above exist: every
-  constraint they rewrite is one the solver can then see.
+- [`cvg/interval.rs`](cvg/interval.rs) — evaluates and narrows over intervals.
+  What it cannot narrow through it answers `ENTIRE` to rather than guessing,
+  which is most of why the two passes above exist: every constraint they
+  rewrite is one an enclosure can then see.
 
 ## Files
 
@@ -184,6 +185,5 @@ gone such a file is only the tape agreeing with itself.
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
 | [`../templates/wgsl/`](../templates/wgsl) | the WGSL, as askama templates: `operators.wgsl.jinja` (one macro arm per babel operator and its domain guard), `function.wgsl.jinja` (a tape as a function), `prelude.wgsl.jinja`, `harness.wgsl.jinja` (the sieve's entry points and bindings) |
-| [`../templates/smt2/`](../templates/smt2) | the SMT-LIB2, as askama templates: `operators.smt2.jinja` (the operator table), `term.smt2.jinja` (one term, children already rendered), `condition.smt2.jinja` (divisor guards and root auxiliaries), `prelude.smt2.jinja` (the `babel_*` helpers), `document.smt2.jinja` (the whole document, owning every newline) |
 | [`system.rs`](system.rs), [`solve.rs`](solve.rs), [`repair.rs`](repair.rs) | the generator's API: a validated set of constraints over a box, which answers whether a point is feasible and nothing harder; the solver builder and the solved region it returns, which hands out samples and repairs a point against its system; the repair algorithm |
-| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `smtlib.rs`/`smt.rs` (SMT-LIB2 and Z3), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder and the worker |
+| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `prune.rs` (interval branch-and-prune: the proof, the blame, the pieces), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder and the worker |
