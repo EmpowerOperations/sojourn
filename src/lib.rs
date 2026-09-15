@@ -31,13 +31,26 @@
 //! # }
 //! ```
 //!
-//! One expression can also be compiled and evaluated over a batch on its own:
+//! One expression can also be compiled and evaluated over a batch on its own,
+//! and comes with its gradient wherever every operator in it has a derivative:
 //!
-//! ```ignore
+//! ```
+//! # fn main() -> anyhow::Result<()> {
 //! let compiled = sojourn::compile("x1 + x2 > 20 - x3^2", &["x1", "x2", "x3"])?;
 //!
 //! // One column per sample, one row per variable, in the order given.
+//! let samples = faer::Mat::from_fn(3, 2, |row, column| (row + 3 * column) as f64);
 //! let residuals = compiled.eval(samples.as_ref())?;
+//!
+//! // One row per symbol the expression names — `gradient.symbols()` says
+//! // which — one column per sample: the constraint's Jacobian.
+//! if let Some(gradient) = compiled.gradient() {
+//!     let jacobian = gradient.eval(samples.as_ref())?;
+//!     assert_eq!(jacobian.nrows(), gradient.symbols().len());
+//! }
+//! # let _ = residuals;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Source text goes in; nothing hands back a syntax tree. Two consumers parse
@@ -65,7 +78,7 @@ mod solve;
 mod system;
 
 pub(crate) use eval::Schema;
-pub use eval::{CompiledExpression, compile};
+pub use eval::{CompiledExpression, CompiledGradient, Compiler, Gradient, compile};
 pub(crate) use frontend::{Ast, parse};
 pub use repair::RepairError;
 pub use solve::{

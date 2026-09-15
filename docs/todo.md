@@ -1036,6 +1036,20 @@ adaptive sampler keeps getting picked. So the round-robin balancing — allocati
 by measured throughput, and avoiding pools whose dispersion is poor — was work in progress that was
 never finished or run. Treat it as a design sketch, not as behaviour to reproduce.
 
+## Speculation
+
+Ideas with no test behind them yet. Each waits for a fixture that wants it.
+
+- **Smooth proxies for the jumps.** `floor`, `ceil`, `sgn` and `%` have no useful derivative,
+  so a constraint using one is compiled without a gradient and its projection falls to COBYLA.
+  The lie worth considering: a continuous, differentiable proxy — a staircase with sigmoid
+  risers standing in for `floor`, say — used *only to steer* a Newton step, with every landing
+  still judged by the true oracle. It is a lie only about the step direction, never about
+  feasibility, which is what makes it tempting. The sound alternative is already in the crate:
+  branch-and-bound over intervals (`prune`) splits the domain at the jumps, inside each piece
+  the function is smooth and the gradient real, and Newton runs within the leaf. Do the sound
+  one first if either is ever wanted; a proxy is a fixture away from being worth trying.
+
 ## Watch these
 
 - **The rewrites are accumulating ad-hoc, and there is no pipeline to hang them on.** Wave 1 #1 was
@@ -2677,6 +2691,57 @@ is not in the debug suite. The cost follow-up stands: restrict the projection to
 closure of the constraints active at the landing (`d²m` shrinks to the coupled coordinates —
 two on the slab, all of them on Keane), and stop a projection that has made no feasible
 evaluation in its first simplex rather than at its budget.
+
+**2026-09-15, later: gradients, and Newton on the KKT system.** The projection is the
+college question — the shortest distance from a point to a surface is along its normal — and
+COBYLA was answering it by finite differences dressed as linear models at `O(d²m)` a step. No
+library takes the gradient-based version off our hands: basin's nonlinear-constraint solvers
+are derivative-free, its gradient methods handle linear constraints only, SMT decides and
+never differentiates. So the gradient is ours, and it is computed **on the tape, in reverse
+mode** (`src/eval/differentiate.rs`): the primal instructions renamed to single assignment
+(a fold's accumulator is written once per term), then a backward sweep emitting
+`ā += d̄ · ∂op/∂a` as ordinary instructions — one rule per instruction beside the
+instruction set, the same table shape as every other backend — with the `Load`s' adjoints as
+the partials. Every partial from one run at a fixed multiple of an evaluation, whatever `d`;
+the AST route was considered and would have paid `d×` and `n²` on a product. Before
+allocation, because the allocator reuses physical registers and an adjoint per physical
+register is wrong; `VirtualTape` is that form, `AllocatedTape` the one the executors run,
+and both are the evaluator's intermediate representation. The gradient is compiled beside the
+expression by `Compiler` (`compile` is its defaults, `Gradient::BestEffort`; `Gradient::Never`
+skips it), so "compiled" means every register is allocated and nothing is lowered later;
+`CompiledExpression::gradient()` and `CompiledGradient::eval` — the batched Jacobian — are
+public, for a caller's own gradient solver. `floor`, `ceil`, `sgn`, `%` and a computed subscript decline the whole tape;
+`abs`/`max`/`min`/`Worst` are differentiated almost everywhere through `sgn`. Every
+operator is pinned against a central finite difference of the compiled expression, and a
+constraint's gradient against a finite difference of its compiled *residual*, so the sign
+conventions hold end to end. `Constraint::gradient` is computed once in `ConstraintSystem::new`.
+
+`src/cvg/newton.rs` is the projector: the active set is the constraints violated where the
+point stands (bounds are rows like any other); each solve is `(J Jᵀ) λ = J (p − uₖ) + g`,
+`uₖ₊₁ = p − Jᵀ λ`, a `|A| × |A|` LU; the fixed point you described adds a row the nominated
+point violates and drops one whose multiplier came out negative, until the KKT conditions
+hold — verified, not assumed. Fallible everywhere: a biting constraint without a gradient, a
+singular solve, no convergence in the budget, all `None`, and COBYLA runs only then. The
+iteration converges *linearly* on a curved constraint, since it models the objective's
+Hessian and not the constraint's — the missing `Σ λᵢ ∇²gᵢ` is the contraction factor, a half
+on the sine band — which is why `NEWTON_ITERATIONS` is 128 and not 32: the ball oracle
+(below) caught the sine band landing on the clamp's point because Newton had not converged
+at 32 and COBYLA was skipped. **Cost, measured in release, per repair:** slab-50 **15 µs**
+(was 0.3 s), ball-50 near-miss 19 µs, a hair outside the ten-segment beam 0.85 ms, the
+hundred-segment beam 132 ms; Keane keeps its reference path and lands by Newton from the
+chord's landing. Every existing fixture is unchanged; the geometry ones tightened from
+`1e-4` to `1e-10`.
+
+**The ball oracle**, `tests/cvg_repair.rs::no_point_in_the_repairs_own_ball_is_nearer`:
+random proposals against six shapes with no closed form, twenty thousand uniform points in
+the ball of the repair's own radius, none feasible with the clearance may be nearer. It is a
+test and not a stage because uniform points in a ball localise nothing past a handful of
+dimensions. It earned its keep on the first run.
+
+Follow-ups: the batched Jacobian (`CompiledGradient::eval`, written, unused) and the public
+`gradient` for Artemis's own gradient solvers — the latter one line when asked; `prune` over
+a ball as the low-dimensional global check; a true Newton with the constraint Hessians if
+the linear rate ever shows.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

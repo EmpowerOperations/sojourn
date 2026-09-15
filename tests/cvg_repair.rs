@@ -149,7 +149,7 @@ async fn a_half_space_is_entered_along_its_normal() -> anyhow::Result<()> {
         "{repaired:?} violates the half-space"
     );
     assert!(
-        (repaired[0] - 0.2).abs() < 1e-4 && (repaired[1] - 0.6).abs() < 1e-4,
+        (repaired[0] - 0.2).abs() < 1e-10 && (repaired[1] - 0.6).abs() < 1e-10,
         "the foot of the normal is (0.2, 0.6), got {repaired:?}"
     );
     Ok(())
@@ -180,7 +180,7 @@ async fn a_disc_is_entered_radially() -> anyhow::Result<()> {
     );
     let scale = 4.25_f64.sqrt();
     assert!(
-        (repaired[0] - 2.0 / scale).abs() < 1e-4 && (repaired[1] - 0.5 / scale).abs() < 1e-4,
+        (repaired[0] - 2.0 / scale).abs() < 1e-10 && (repaired[1] - 0.5 / scale).abs() < 1e-10,
         "the radial point is {:?}, got {repaired:?}",
         [2.0 / scale, 0.5 / scale]
     );
@@ -208,7 +208,7 @@ async fn a_disc_spelled_with_a_power_is_entered_the_same_way() -> anyhow::Result
     );
     let scale = 4.25_f64.sqrt();
     assert!(
-        (repaired[0] - 2.0 / scale).abs() < 1e-4 && (repaired[1] - 0.5 / scale).abs() < 1e-4,
+        (repaired[0] - 2.0 / scale).abs() < 1e-10 && (repaired[1] - 0.5 / scale).abs() < 1e-10,
         "the radial point is {:?}, got {repaired:?}",
         [2.0 / scale, 0.5 / scale]
     );
@@ -241,7 +241,7 @@ async fn a_driven_coordinate_is_not_privileged() -> anyhow::Result<()> {
     // (3, 3) - (5.999 / 5) (2, 1).
     let foot = [3.0 - 2.0 * 5.999 / 5.0, 3.0 - 5.999 / 5.0];
     assert!(
-        (repaired[0] - foot[0]).abs() < 1e-3 && (repaired[1] - foot[1]).abs() < 1e-3,
+        (repaired[0] - foot[0]).abs() < 1e-10 && (repaired[1] - foot[1]).abs() < 1e-10,
         "the foot of the normal on the near face is {foot:?}, got {repaired:?}"
     );
     Ok(())
@@ -739,6 +739,107 @@ async fn a_box_bound_is_a_wall_too() -> anyhow::Result<()> {
         "x should step to {}, got {}",
         1.0 - CLEARANCE,
         repaired[0]
+    );
+    Ok(())
+}
+
+// ---- the ball oracle: the local projection is the projection ---------------
+
+/// A brute-force check on "nearest": no feasible point with the clearance,
+/// drawn uniformly from the ball of the repair's own radius around the
+/// proposal, is nearer than the repair. The closed-form fixtures above pin
+/// particular geometries; this pins the claim on shapes that have no closed
+/// form — a ring, a sine band, a cubic — where the Newton or COBYLA landing
+/// could in principle be a local projection and not the projection. Low
+/// dimension only: uniform points in a ball localise nothing past a handful
+/// of variables, which is the reason this is an oracle in a test and not a
+/// stage in `repair`.
+#[pollster::test]
+async fn no_point_in_the_repairs_own_ball_is_nearer() -> anyhow::Result<()> {
+    const CLEARANCE: f64 = 1e-9;
+    const DRAWS: usize = 20_000;
+    const PROPOSALS: usize = 4;
+    /// The projection converges to `1e-13` of the box, the clamp lands a
+    /// clearance inside; a hit nearer by less than this is the same point.
+    const ALLOWANCE: f64 = 1e-6;
+    /// A box and the constraints over it.
+    type Shape<'a> = (&'a [(&'a str, f64, f64)], &'a [&'a str]);
+    let shapes: &[Shape<'_>] = &[
+        (&[("x", -2.0, 2.0), ("y", -2.0, 2.0)], &["x^2 + y^2 < 1"]),
+        (
+            &[("x", -2.0, 2.0), ("y", -2.0, 2.0)],
+            &["x^2 + y^2 < 1.5", "x^2 + y^2 > 0.5"],
+        ),
+        (
+            &[("x", -3.0, 3.0), ("y", -3.0, 3.0)],
+            &["y < sin(x) + 0.2", "y > sin(x) - 0.2"],
+        ),
+        (&[("x", -2.0, 2.0), ("y", -2.0, 2.0)], &["y > x^3 - x"]),
+        (
+            &[("x", -2.0, 2.0), ("y", -2.0, 2.0), ("z", -2.0, 2.0)],
+            &["x^2 + y^2 + z^2 < 1", "x + y + z > 0.3"],
+        ),
+        (
+            &[("x1", -5.0, 5.0), ("x2", -5.0, 5.0), ("x3", -5.0, 5.0)],
+            &["x1 == x2 + x3 +/- 0.01", "x1 * x2 < 1"],
+        ),
+    ];
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
+    let mut complaints = Vec::new();
+    for (specs, sources) in shapes {
+        let system = system(variables(specs), sources)?;
+        let region = region(&system).await?;
+        let widths: Vec<f64> = specs.iter().map(|(_, lo, hi)| hi - lo).collect();
+        for _ in 0..PROPOSALS {
+            let proposal: Vec<f64> = specs
+                .iter()
+                .map(|(_, lo, hi)| rng.random_range(*lo..*hi))
+                .collect();
+            if system.is_feasible(&proposal, CLEARANCE) {
+                continue;
+            }
+            let repaired = match region.repair(&proposal, CLEARANCE) {
+                Ok(repaired) => repaired,
+                Err(error) => {
+                    complaints.push(format!("{sources:?} from {proposal:?}: {error}"));
+                    continue;
+                }
+            };
+            let radius = normalised_l2(&system, &proposal, &repaired);
+
+            // Uniform in the ball: draws in its bounding cube, kept if inside.
+            let mut nearest = radius;
+            let mut culprit = None;
+            for _ in 0..DRAWS {
+                let candidate: Vec<f64> = proposal
+                    .iter()
+                    .zip(&widths)
+                    .map(|(centre, width)| centre + rng.random_range(-radius..=radius) * width)
+                    .collect();
+                // Judged by the system's own oracle: this is a question about
+                // the geometry, not about the evaluator, and the independent
+                // one compiles per call.
+                let at = normalised_l2(&system, &proposal, &candidate);
+                if at < nearest * (1.0 - ALLOWANCE) && system.is_feasible(&candidate, CLEARANCE) {
+                    nearest = at;
+                    culprit = Some(candidate);
+                }
+            }
+            if let Some(culprit) = culprit {
+                complaints.push(format!(
+                    "{sources:?} from {proposal:?}: repaired to {repaired:?} at {radius:.6}, but                      {culprit:?} is feasible at {nearest:.6}"
+                ));
+            }
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "{}",
+        complaints.join(
+            "
+"
+        )
     );
     Ok(())
 }

@@ -288,11 +288,18 @@ and of nothing else — it consults no census, because a landing that depends
 on other points steers the optimizer being repaired toward them (the
 *anchors* it used to take did exactly that, measured as a 28° bias on a
 disc). "Near" is Euclidean over box-normalised coordinates, not taxicab: it
-clamps each coordinate into its slice, then projects from there — the nearest
-feasible point by a local solve (`local::nearest`) — unless the clamp's
-landing is separable (bounds), where the axis projection already is the
-Euclidean one. A constraint flat where the point stands is walked in from a
-reference found by `local::find_initial` under a fixed seed, then projected.
+clamps each coordinate into its slice, then projects from there — Newton on
+the KKT system over the active set (`cvg/newton.rs`), with gradients from the
+tape's reverse sweep (`eval/differentiate.rs`); COBYLA (`local::nearest`) only
+where a biting constraint has no derivative or Newton did not converge —
+unless the clamp's landing is separable (bounds), where the axis projection
+already is the Euclidean one. A constraint flat where the point stands is
+walked in from a reference found by `local::find_initial` under a fixed seed,
+then projected. **Gradients are reverse-mode over the virtual tape**, one
+rule per instruction beside the instruction set, every partial from one
+backward sweep at a fixed multiple of an evaluation; a tape holding `floor`,
+`ceil`, `sgn`, `%` or a computed subscript has no gradient and everything
+that wants one declines, never approximates.
 A coordinate lands at the caller's clearance inside its bound, *on* the bound
 at zero clearance; the design and the alternatives it displaced are in
 `docs/todo.md` under *Repair for Artemis*.

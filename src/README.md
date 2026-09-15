@@ -5,8 +5,8 @@ to say so. In the middle is an `Ast`; on either side is a backend that takes it
 somewhere.
 
 ```
-                                   +-- eval --> CompiledExpression   runs a batch
-   source -->  frontend  -->  Ast -+
+                                   +-- eval --> CompiledExpression   runs a batch,
+   source -->  frontend  -->  Ast -+                                 and its gradient
                                    +-- cvg  --> FeasibleRegion       searches for points
 ```
 
@@ -15,9 +15,11 @@ meaning-preserving: it produces the canonical form of what the author wrote and
 nothing more. A pass that makes the tree easier to *analyse* belongs there.
 
 **`eval` lowers as hard as it can**, in the name of speed. It flattens the tree
-to a three-address tape (`eval/tape.rs`), packs the temporaries into registers,
-and runs it a tile of 256 samples at a time, each instruction one kernel across
-the lanes. The kernels (`eval/simd.rs`) are explicit SIMD through `pulp`, with
+to a three-address tape — its intermediate representation, `eval/tape.rs`: a
+`VirtualTape` over virtual registers, which `eval/differentiate.rs` transforms
+into the tape of the gradient by a reverse sweep, then an `AllocatedTape` with
+the temporaries packed into registers — and runs it a tile of 256 samples at a
+time, each instruction one kernel across the lanes. The kernels (`eval/simd.rs`) are explicit SIMD through `pulp`, with
 AVX2 chosen at run time and a scalar backend otherwise; the operators that have
 no vector form — libm, `%`, `pow`, rounding — run in kernels named `*_scalar`,
 so a loop that is not vectorised says so in the code rather than being left to
@@ -181,9 +183,9 @@ gone such a file is only the tape agreeing with itself.
 |---|---|
 | [`ast.rs`](ast.rs) | `Program`, `Block`, `Expr`, `Kind`, and the operator semantics in `UnaryOp::apply` / `BinaryOp::apply` |
 | [`frontend/`](frontend) | text to `Ast`: `parse` and the `Ast` type in `mod.rs`, `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
-| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which turns a tape into the view that `templates/wgsl/` renders as a WGSL function for the GPU sieve |
+| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`), `differentiate.rs` (the reverse sweep: a tape's gradient as a tape), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which turns a tape into the view that `templates/wgsl/` renders as a WGSL function for the GPU sieve |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
 | [`../templates/wgsl/`](../templates/wgsl) | the WGSL, as askama templates: `operators.wgsl.jinja` (one macro arm per babel operator and its domain guard), `function.wgsl.jinja` (a tape as a function), `prelude.wgsl.jinja`, `harness.wgsl.jinja` (the sieve's entry points and bindings) |
 | [`system.rs`](system.rs), [`solve.rs`](solve.rs), [`repair.rs`](repair.rs) | the generator's API: a validated set of constraints over a box, which answers whether a point is feasible and nothing harder; the solver builder and the solved region it returns, which hands out samples and repairs a point against its system; the repair algorithm |
-| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `prune.rs` (interval branch-and-prune: the proof, the blame, the pieces), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder and the worker |
+| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `prune.rs` (interval branch-and-prune: the proof, the blame, the pieces), `newton.rs` (the projection by Newton on the KKT system, for `repair`), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder and the worker |

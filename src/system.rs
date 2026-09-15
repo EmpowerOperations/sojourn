@@ -26,6 +26,7 @@ use faer::MatRef;
 use crate::cvg::classify;
 use crate::cvg::incidence::{ConstraintId, Incidence, Row};
 use crate::diagnostics::CompilationFailure;
+use crate::eval::Gradient;
 use crate::{Ast, CompiledExpression, Schema};
 
 /// A point in the input space, one value per variable in declaration order.
@@ -85,8 +86,9 @@ impl std::fmt::Display for ConstraintRef {
 /// Kept as a pair rather than two parallel lists because everything that
 /// indexes one indexes the other by the same [`ConstraintId`], and two lists
 /// aligned only by the loop that built them are one refactor from silently
-/// disagreeing. The AST is what narrowing walks and the emitter renders; the
-/// tape is what every feasibility check runs.
+/// disagreeing. The AST is what narrowing walks; the tape is what every
+/// feasibility check runs, and its gradient, compiled alongside where the
+/// constraint has one, is what a projection's Newton step reads.
 #[derive(Debug, Clone)]
 pub(crate) struct Constraint {
     pub(crate) written: Ast,
@@ -287,7 +289,7 @@ impl ConstraintSystem {
 
             // Compiling is the binding check, and the tape it produces is the
             // one every strategy evaluates, so it is kept rather than redone.
-            let tape = match crate::eval::bind(&constraint, &schema) {
+            let tape = match crate::eval::bind(&constraint, &schema, Gradient::BestEffort) {
                 Ok(tape) => tape,
                 Err(unbound) => {
                     return Err(SystemError::Unbound {
@@ -429,6 +431,18 @@ impl ConstraintSystem {
         } else {
             variable.contains(value)
         }
+    }
+
+    /// The gradient of constraint `index`'s residual at `point`, one partial
+    /// per coordinate the constraint names in its own order — the order
+    /// `incidence.rows_of` gives — or `None` where the constraint has no
+    /// derivative or it is not finite at `point`.
+    pub(crate) fn gradient(&self, index: usize, point: &[f64]) -> Option<Vec<f64>> {
+        self.constraints[index]
+            .compiled
+            .gradient()?
+            .eval_row(point)
+            .ok()
     }
 
     /// The declared box, one interval per variable in row order: what a

@@ -60,7 +60,7 @@ use askama::Template;
 
 use crate::ast::{BinaryOp, CompareOp, UnaryOp};
 
-use super::tape::{Accumulate, IRTape, Instruction};
+use super::tape::{Accumulate, AllocatedTape, Instruction};
 
 /// How far past feasible, relative to the magnitudes compared, the sieve still
 /// keeps a candidate.
@@ -133,7 +133,7 @@ pub(crate) enum Stmt {
 }
 
 /// The tape as a [`Function`] named `name` over `inputs` coordinates.
-pub(crate) fn function(tape: &IRTape, name: &str, inputs: usize) -> Function {
+pub(crate) fn function(tape: &AllocatedTape, name: &str, inputs: usize) -> Function {
     let consts = tape
         .consts
         .iter()
@@ -283,8 +283,8 @@ mod tests {
         let mut text = Prelude::new().render().expect("the prelude renders");
         for (index, source) in sources.iter().enumerate() {
             let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-            let compiled =
-                crate::eval::bind(&ast, &schema).unwrap_or_else(|e| panic!("{source:?}: {e}"));
+            let compiled = crate::eval::bind(&ast, &schema, crate::eval::Gradient::Never)
+                .unwrap_or_else(|e| panic!("{source:?}: {e}"));
             text.push('\n');
             text.push_str(
                 &function(&compiled.tape, &format!("c{index}"), 3)

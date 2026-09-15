@@ -12,17 +12,20 @@
 use super::tape::{Instruction, Register, VirtualRegister};
 
 /// Assigns physical registers. Returns the allocated instructions, the
-/// physical result register, and the total register count.
+/// physical registers of `outputs` in order, and the total register count.
+///
+/// `outputs` are the registers the caller reads after the run — the result,
+/// and a differentiated tape's partials — so they live to the end.
 pub(crate) fn allocate(
     insns: Vec<Instruction<VirtualRegister>>,
-    result: VirtualRegister,
+    outputs: &[VirtualRegister],
     consts: u16,
     locals: u16,
-) -> (Vec<Instruction<Register>>, Register, u16) {
+) -> (Vec<Instruction<Register>>, Vec<Register>, u16) {
     let temps = insns
         .iter()
         .flat_map(|insn| insn.dst().into_iter().chain(insn.sources()))
-        .chain(std::iter::once(result))
+        .chain(outputs.iter().copied())
         .filter_map(|reg| match reg {
             VirtualRegister::Temp(t) => Some(t as usize + 1),
             _ => None,
@@ -30,7 +33,7 @@ pub(crate) fn allocate(
         .max()
         .unwrap_or(0);
 
-    // First definition and last mention of every temporary. The result is
+    // First definition and last mention of every temporary. An output is
     // mentioned by nobody and read by the caller, so it lives to the end.
     let mut def = vec![usize::MAX; temps];
     let mut last = vec![0usize; temps];
@@ -46,11 +49,16 @@ pub(crate) fn allocate(
             }
         }
     }
-    if let VirtualRegister::Temp(t) = result {
-        last[t as usize] = insns.len();
+    for output in outputs {
+        if let VirtualRegister::Temp(t) = output {
+            last[*t as usize] = insns.len();
+        }
     }
 
-    // Linear scan. The destination is allocated *before* this instruction's
+    // "Linear-scan register allocation" (Poletto & Sarkar 1999): one pass in
+    // instruction order, a free list of physical slots, each temporary taking
+    // one at its first write and returning it after its last read. The
+    // destination is allocated *before* this instruction's
     // dying operands are released, so it can never alias one of them — which
     // the batched executor's three-way slice split relies on. `Combine` writes
     // its own accumulator, which is the same virtual register on both sides
@@ -99,8 +107,11 @@ pub(crate) fn allocate(
         }
     }
 
-    let result = physical(result, &slot);
-    (allocated, result, base + peak)
+    let outputs = outputs
+        .iter()
+        .map(|output| physical(*output, &slot))
+        .collect();
+    (allocated, outputs, base + peak)
 }
 
 #[cfg(test)]

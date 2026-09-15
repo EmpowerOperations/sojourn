@@ -61,6 +61,7 @@ pub mod gpu;
 pub(crate) mod incidence;
 pub(crate) mod interval;
 pub(crate) mod local;
+pub(crate) mod newton;
 mod progress;
 mod prune;
 pub(crate) mod sampling;

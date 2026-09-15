@@ -45,14 +45,23 @@
 //! `repair_lands_axis_aligned_not_nearest`). Everywhere else the clamp's
 //! landing is a candidate and the warm start.
 //!
-//! **Project.** The feasible point nearest the caller's, sought by a local
-//! solve ([`local::nearest`]) from the clamp's landing when it landed and from
-//! wherever the clamp got to when it did not: `min ‖u − p‖²` over the unit
-//! cube subject to every constraint with the clearance built into its rows.
-//! From a feasible warm start the solve slides along the boundary to the
-//! Euclidean foot. The landing depends on the constraints and the point and
-//! on nothing else. That is the property the consumer needs, and the one an
-//! earlier design lacked: it bisected a chord from the nearest of a set of
+//! **Project.** The feasible point nearest the caller's, `min ‖u − p‖²` over
+//! the unit cube subject to every constraint, from the clamp's landing when
+//! it landed and from wherever the clamp got to when it did not. Two solvers,
+//! in order. [`newton::nearest`] first: Newton on the KKT system over the
+//! active set, with the gradients the tape's reverse sweep provides — exact
+//! in one step on a linear constraint, a handful on a curved one, microseconds
+//! at fifty variables — and it declines wherever a constraint that bites has
+//! no derivative or the iteration does not converge. Then [`local::nearest`],
+//! COBYLA, derivative-free, only where Newton declined or its landing could
+//! not be stepped off the walls: it needs no gradient and pays `O(d²m)` per
+//! iteration for that, and it is not run beside a successful Newton because
+//! on a smooth piece Newton is exact and COBYLA cannot beat it, on a
+//! nonconvex one both are local, and the difference is a thousandfold in
+//! cost. From a feasible warm start either solve slides along the boundary to
+//! the Euclidean foot. The landing depends on the constraints and the point
+//! and on nothing else. That is the property the consumer needs, and the one
+//! an earlier design lacked: it bisected a chord from the nearest of a set of
 //! *anchors* the caller supplied, so every landing was a convex combination of
 //! the proposal and a census point — every coordinate dragged toward wherever
 //! the census happened to be — and over thousands of repairs the optimizer was
@@ -141,19 +150,20 @@
 //!
 //! # What is deliberately not here
 //!
-//! No randomness — not a draw, not a seed. No gradient: babel has no
-//! derivatives, and a finite-difference normal is ill-defined at exactly the
-//! vertices the clearance exists for, where the axis is an inward direction
-//! already in hand. No anchors: nothing the caller has seen elsewhere may
-//! influence where a point lands, for the reason above. No brute force: it
-//! cannot localise in high dimension, and it would re-solve the
-//! find-a-first-point problem the whole module is built around on every call.
+//! No randomness — not a draw, not a seed. No finite differences: the
+//! gradients Newton reads are the tape's own reverse sweep, exact, and a
+//! constraint without one declines rather than being approximated at a
+//! vertex where an approximation is ill-defined. No anchors: nothing the
+//! caller has seen elsewhere may influence where a point lands, for the
+//! reason above. No brute force: it cannot localise in high dimension, and it
+//! would re-solve the find-a-first-point problem the whole module is built
+//! around on every call.
 
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 
 use crate::cvg::incidence::Row;
-use crate::cvg::{Cancellation, classify, interval, local};
+use crate::cvg::{Cancellation, classify, interval, local, newton};
 use crate::{ConstraintSystem, Point};
 
 /// How many rounds of clamping a point gets before the projection starts
@@ -285,14 +295,24 @@ pub(crate) fn repair(
     // The projection, always otherwise: from the clamp's landing it slides
     // along the boundary to the Euclidean foot, which the clamp — an axis
     // projection — reaches only where one coordinate is the whole answer.
-    // "Nearest" is measured to the caller's point throughout.
-    landings.extend(stepped_off(
-        system,
-        &widths,
-        local::nearest(system, &start, point, clearance),
-        point,
-        clearance,
-    ));
+    // "Nearest" is measured to the caller's point throughout. Newton on the
+    // KKT system first, exact and cheap where every active constraint has a
+    // gradient; the derivative-free solve only where it declined or its
+    // landing could not be stepped off the walls.
+    if let Some(landing) = newton::nearest(system, &start, point)
+        && let Some(landing) = off_the_boundary(system, &widths, landing, point, clearance)
+    {
+        landings.push(landing);
+    }
+    if !landings.iter().any(Landing::is_clear) {
+        landings.extend(stepped_off(
+            system,
+            &widths,
+            local::nearest(system, &start, point, clearance),
+            point,
+            clearance,
+        ));
+    }
 
     // Nothing feasible seen: a constraint flat where the point stands, which
     // no slice and no linear model can read. Walk in from a reference point
@@ -392,21 +412,14 @@ fn distance(widths: &[f64], a: &[f64], b: &[f64]) -> f64 {
         .sqrt()
 }
 
-/// The landings a projection yields, once its points have been stepped off
-/// their walls: at most one with the clearance and one without.
+/// The landings a derivative-free projection yields, once its points have
+/// been stepped off their walls: at most one with the clearance and one
+/// without.
 ///
 /// A `clear` landing gets the clamp from a feasible point, which only steps a
 /// coordinate off a wall it is against and leaves one with room alone. A
-/// `feasible` landing without the clearance — the rows had the margin built
-/// in, so the constraints here are ones the margin could not read either, a
-/// real exponent that faults a step away — gets the clamp too, and failing
-/// that the only inward direction in hand is the projection's own: back off
-/// along `point -> landing`, continued past the landing, in doublings of the
-/// clearance until the oracle is satisfied. The first rung that passes is
-/// within a factor of two of the least back-off, which at this scale is all
-/// the precision the answer can use. Where nothing passes, the consolation is
-/// the clamp's own result if it stayed feasible — the middle of a slab beats
-/// its edge — and the landing otherwise.
+/// `feasible` landing without the clearance is a landing on the boundary,
+/// and goes the way every such landing goes: [`off_the_boundary`].
 fn stepped_off(
     system: &ConstraintSystem,
     widths: &[f64],
@@ -423,45 +436,65 @@ fn stepped_off(
         landings.push(Landing::Clear(clear));
     }
     if let Some(landing) = projected.feasible {
-        match clamped(system, widths, landing.clone(), clearance) {
-            Ok(clear) => landings.push(Landing::Clear(clear)),
-            Err(reached) => {
-                let length = distance(widths, &landing, point);
-                let unit = if clearance > 0.0 && length > 0.0 {
-                    clearance / length
-                } else {
-                    0.0
-                };
-                let mut backed = None;
-                let mut rung = unit;
-                while unit > 0.0 && rung < 1.0 {
-                    let mut probe: Point = point
-                        .iter()
-                        .zip(&landing)
-                        .map(|(from, to)| from + (1.0 + rung) * (to - from))
-                        .collect();
-                    classify::settle(system, &mut probe);
-                    if system.is_feasible(&probe, clearance) {
-                        backed = Some(probe);
-                        break;
-                    }
-                    rung *= 2.0;
-                }
-                match backed {
-                    Some(clear) => landings.push(Landing::Clear(clear)),
-                    None => {
-                        let consolation = if system.is_feasible(&reached, 0.0) {
-                            reached
-                        } else {
-                            landing
-                        };
-                        landings.push(Landing::Feasible(consolation));
-                    }
-                }
-            }
-        }
+        landings.extend(off_the_boundary(system, widths, landing, point, clearance));
     }
     landings
+}
+
+/// A landing on the boundary — Newton's, which is there by construction, or
+/// a derivative-free one judged feasible without the clearance — stepped
+/// inside.
+///
+/// The clamp first: from a feasible point it is precisely "step each
+/// coordinate its clearance off the nearest wall". Where no slice can read
+/// the wall — narrowing declines a real exponent — the only inward direction
+/// in hand is the projection's own: back off along `point -> landing`,
+/// continued past the landing, in doublings of the clearance until the
+/// oracle is satisfied. That direction is `−Σ λᵢ ∇gᵢ`, the boundary's normal
+/// at the landing, which is what makes a small step along it the least the
+/// clearance can cost. The first rung that passes is within a factor of two
+/// of the least back-off, which at this scale is all the precision the
+/// answer can use. Where nothing passes, the consolation is the clamp's own
+/// result if it stayed feasible — the middle of a slab beats its edge — and
+/// the landing itself if that is; a landing a hair outside with nothing
+/// inside it is no landing at all.
+fn off_the_boundary(
+    system: &ConstraintSystem,
+    widths: &[f64],
+    landing: Point,
+    point: &[f64],
+    clearance: f64,
+) -> Option<Landing> {
+    let reached = match clamped(system, widths, landing.clone(), clearance) {
+        Ok(clear) => return Some(Landing::Clear(clear)),
+        Err(reached) => reached,
+    };
+    let length = distance(widths, &landing, point);
+    let unit = if clearance > 0.0 && length > 0.0 {
+        clearance / length
+    } else {
+        0.0
+    };
+    let mut rung = unit;
+    while unit > 0.0 && rung < 1.0 {
+        let mut probe: Point = point
+            .iter()
+            .zip(&landing)
+            .map(|(from, to)| from + (1.0 + rung) * (to - from))
+            .collect();
+        classify::settle(system, &mut probe);
+        if system.is_feasible(&probe, clearance) {
+            return Some(Landing::Clear(probe));
+        }
+        rung *= 2.0;
+    }
+    if system.is_feasible(&reached, 0.0) {
+        Some(Landing::Feasible(reached))
+    } else if system.is_feasible(&landing, 0.0) {
+        Some(Landing::Feasible(landing))
+    } else {
+        None
+    }
 }
 
 /// The last feasible point along the segment from `reference` to `point`,

@@ -10,7 +10,7 @@ use crate::ast;
 use crate::diagnostics::Fault;
 
 use super::EPSILON;
-use super::tape::{FaultKind, IRTape, Instruction, LaneFault};
+use super::tape::{AllocatedTape, FaultKind, Instruction, LaneFault};
 
 /// The single place a `var[i]` subscript becomes a row position.
 ///
@@ -27,8 +27,8 @@ pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, Fault
         })
 }
 
-/// Evaluates `tape` for one row. `frame` must be [`IRTape::prime`]d.
-pub(crate) fn run_lane(tape: &IRTape, row: &[f64], frame: &mut [f64]) -> Result<f64, Fault> {
+/// Evaluates `tape` for one row. `frame` must be [`AllocatedTape::prime`]d.
+pub(crate) fn run_lane(tape: &AllocatedTape, row: &[f64], frame: &mut [f64]) -> Result<f64, Fault> {
     let fault = |pc: usize, kind: FaultKind| {
         tape.fault(LaneFault {
             insn: u32::try_from(pc).expect("fewer than 2^32 instructions"),

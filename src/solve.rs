@@ -608,12 +608,15 @@ impl FeasibleRegion {
     /// exactly that reason and with exactly that effect. "Near" is Euclidean
     /// distance over box-normalised coordinates: each coordinate is clamped
     /// into the interval its constraints leave it, and from there the point
-    /// is projected — the feasible point nearest it, by a local solve — so a
-    /// step over a wall is put back where it stepped from rather than slid
-    /// along the wall to wherever one coordinate could reach. A constraint
-    /// flat where the point stands is walked in from a reference point found
-    /// under a fixed seed. Every repair that is not a matter of bounds alone
-    /// pays a local solve: about 0.3 s at fifty variables in a release build.
+    /// is projected — the feasible point nearest it, by Newton on the KKT
+    /// system with the constraints' own gradients, or by a derivative-free
+    /// solve where a constraint that bites has no derivative (`floor`,
+    /// `ceil`, `sgn`, `%`, a computed subscript) — so a step over a wall is
+    /// put back where it stepped from rather than slid along the wall to
+    /// wherever one coordinate could reach. A constraint flat where the
+    /// point stands is walked in from a reference point found under a fixed
+    /// seed. Microseconds at fifty variables in a release build where the
+    /// gradients apply; the derivative-free fallback is tenths of a second.
     ///
     /// `clearance` is the room kept from every wall, as a fraction of each
     /// variable's box width: the result and each of its `2d` axis neighbours

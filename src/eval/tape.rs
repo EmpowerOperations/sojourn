@@ -1,5 +1,8 @@
-//! The evaluator's intermediate representation: a flat list of three-address
-//! instructions over virtual registers.
+//! The evaluator's **intermediate representation** (IR): a flat list of
+//! three-address instructions, in two forms. [`VirtualTape`] is the IR as
+//! lowering produces it, over virtual registers, which a tape-to-tape pass
+//! (`differentiate`) transforms; [`AllocatedTape`] is the same IR after
+//! register allocation, over physical ones, which the executors run.
 //!
 //! A tree walk pays its dispatch once per node per sample. A tape pays it once
 //! per instruction per *tile* of samples: each instruction is one loop over a
@@ -19,8 +22,12 @@
 //! checked instruction. `tests/corpus.rs`, `tests/runtime_errors.rs` and
 //! `tests/special_values.rs` are the spec.
 
+use std::collections::HashMap;
+
 use crate::ast::{AggregateKind, BinaryOp, CompareOp, UnaryOp};
 use crate::diagnostics::{Fault, ProblemKind, Span};
+
+use super::regalloc;
 
 /// A physical register: an index into the frame (per lane) or the register
 /// file (per tile).
@@ -44,6 +51,111 @@ pub(crate) enum VirtualRegister {
     Const(u16),
     Local(u16),
     Temp(u32),
+}
+
+/// The constant pool of a tape under construction: one register per distinct
+/// bit pattern, so `0.0` and `-0.0` stay distinct and a value used twice is
+/// loaded once.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Constants {
+    values: Vec<f64>,
+    index: HashMap<u64, u16>,
+}
+
+impl Constants {
+    /// The register holding `value`, minted on first use.
+    pub(crate) fn intern(&mut self, value: f64) -> VirtualRegister {
+        let bits = value.to_bits();
+        if let Some(&index) = self.index.get(&bits) {
+            return VirtualRegister::Const(index);
+        }
+        let index = u16::try_from(self.values.len()).expect("fewer than 65536 constants");
+        self.values.push(value);
+        self.index.insert(bits, index);
+        VirtualRegister::Const(index)
+    }
+
+    pub(crate) fn values(&self) -> &[f64] {
+        &self.values
+    }
+}
+
+/// The intermediate representation before register allocation: instructions
+/// over virtual registers, with the constant pool they refer to.
+///
+/// The form a tape-to-tape transformation wants. Allocation packs
+/// temporaries, so a physical register holds different values at different
+/// instructions; before it, a temporary is one value, which is what the
+/// reverse sweep in `differentiate` relies on.
+#[derive(Debug, Clone)]
+pub(crate) struct VirtualTape {
+    pub(crate) consts: Constants,
+    pub(crate) locals: u16,
+    /// One past the highest temporary in use; [`fresh_temp`](Self::fresh_temp)
+    /// is the only way to mint one, so it stays true.
+    temps: u32,
+    pub(crate) insns: Vec<Instruction<VirtualRegister>>,
+    pub(crate) spans: Vec<Span>,
+    pub(crate) result: VirtualRegister,
+    /// The partial derivatives a differentiated tape also computes, one per
+    /// symbol; empty for a plain expression.
+    pub(crate) partials: Vec<VirtualRegister>,
+}
+
+impl VirtualTape {
+    /// A lowered program's tape: `temps` is the count the lowerer minted.
+    pub(crate) fn new(
+        consts: Constants,
+        locals: u16,
+        temps: u32,
+        insns: Vec<Instruction<VirtualRegister>>,
+        spans: Vec<Span>,
+        result: VirtualRegister,
+    ) -> Self {
+        Self {
+            consts,
+            locals,
+            temps,
+            insns,
+            spans,
+            result,
+            partials: Vec::new(),
+        }
+    }
+
+    /// One past the highest temporary in use: where a tape built on top of
+    /// this one continues numbering.
+    pub(crate) const fn temps(&self) -> u32 {
+        self.temps
+    }
+
+    /// A temporary no instruction has written yet.
+    pub(crate) fn fresh_temp(&mut self) -> VirtualRegister {
+        let t = VirtualRegister::Temp(self.temps);
+        self.temps += 1;
+        t
+    }
+
+    /// Packs the temporaries and pins everything else: the tape the
+    /// executors run.
+    pub(crate) fn allocate(self) -> AllocatedTape {
+        let consts = u16::try_from(self.consts.values().len()).expect("fewer than 65536 constants");
+        let mut outputs = vec![self.result];
+        outputs.extend_from_slice(&self.partials);
+        let (insns, outputs, registers) =
+            regalloc::allocate(self.insns, &outputs, consts, self.locals);
+        let mut outputs = outputs.into_iter();
+        let result = outputs.next().expect("the result is the first output");
+        AllocatedTape {
+            consts: self.consts.values().to_vec(),
+            locals: self.locals,
+            registers,
+            insns,
+            spans: self.spans,
+            result,
+            partials: outputs.collect(),
+        }
+    }
 }
 
 /// How a fold step combines, each arm deferring to the AST's own definition so
@@ -179,6 +291,34 @@ impl<R: Copy> Instruction<R> {
         }
     }
 
+    /// The same instruction writing `dst` instead; a `Check` is unchanged.
+    pub(crate) fn with_dst(self, dst: R) -> Self {
+        match self {
+            Instruction::Load { input, .. } => Instruction::Load { dst, input },
+            Instruction::Copy { src, .. } => Instruction::Copy { dst, src },
+            Instruction::Unary { op, a, .. } => Instruction::Unary { dst, op, a },
+            Instruction::Binary { op, a, b, .. } => Instruction::Binary { dst, op, a, b },
+            Instruction::Compare { op, a, b, .. } => Instruction::Compare { dst, op, a, b },
+            Instruction::Combine {
+                how, a, b, last, ..
+            } => Instruction::Combine {
+                dst,
+                how,
+                a,
+                b,
+                last,
+            },
+            Instruction::Check { reg } => Instruction::Check { reg },
+            Instruction::Gather {
+                index, subscript, ..
+            } => Instruction::Gather {
+                dst,
+                index,
+                subscript,
+            },
+        }
+    }
+
     /// The same instruction over another register type.
     pub(crate) fn map<S>(self, mut f: impl FnMut(R) -> S) -> Instruction<S> {
         match self {
@@ -252,9 +392,10 @@ pub(crate) enum FaultKind {
     },
 }
 
-/// A lowered, allocated program.
+/// The intermediate representation after register allocation: what the
+/// executors run.
 #[derive(Debug, Clone)]
-pub(crate) struct IRTape {
+pub(crate) struct AllocatedTape {
     /// Register `i` holds `consts[i]`. Deduplicated by bit pattern, so `0.0`
     /// and `-0.0` are distinct.
     pub(crate) consts: Vec<f64>,
@@ -271,9 +412,12 @@ pub(crate) struct IRTape {
     /// `spans[i]` is the node `insns[i]` computes: the span a check reports.
     pub(crate) spans: Vec<Span>,
     pub(crate) result: Register,
+    /// The partial derivatives a differentiated tape also computes, one per
+    /// symbol of the expression; empty for a plain expression.
+    pub(crate) partials: Vec<Register>,
 }
 
-impl IRTape {
+impl AllocatedTape {
     /// Fills a frame or one lane's worth of a register file: constants in
     /// place, everything else NaN. The NaN is the walker's unwritten-slot
     /// sentinel and is what makes a `Check` on an unassigned local fire.

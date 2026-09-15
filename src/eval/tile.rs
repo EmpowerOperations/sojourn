@@ -22,7 +22,7 @@ use crate::ast::{BinaryOp, UnaryOp};
 
 use super::lane;
 use super::simd;
-use super::tape::{Accumulate, FaultKind, IRTape, Instruction, LaneFault, Register};
+use super::tape::{Accumulate, AllocatedTape, FaultKind, Instruction, LaneFault, Register};
 
 /// Lanes per tile.
 ///
@@ -46,7 +46,7 @@ impl RegisterFile {
     /// tape writes every register it reads before reading it, except a local
     /// the lowerer could not prove assigned — which must read NaN, and does,
     /// because nothing ever writes it.
-    pub(crate) fn new(tape: &IRTape, width: usize) -> Self {
+    pub(crate) fn new(tape: &AllocatedTape, width: usize) -> Self {
         let mut data = vec![f64::NAN; tape.registers as usize * width];
         for (index, &value) in tape.consts.iter().enumerate() {
             data[index * width..(index + 1) * width].fill(value);
@@ -294,7 +294,7 @@ macro_rules! dispatch_combine {
 
 /// One tile's worth of work, dispatched once onto the chosen instruction set.
 struct TileRun<'a> {
-    tape: &'a IRTape,
+    tape: &'a AllocatedTape,
     samples: MatRef<'a, f64>,
     first_column: usize,
     lanes: usize,
@@ -315,7 +315,7 @@ impl WithSimd for TileRun<'_> {
 /// `first_column`, on the best instruction set this machine has. Returns the
 /// lowest faulted lane, if any.
 pub(crate) fn run_tile(
-    tape: &IRTape,
+    tape: &AllocatedTape,
     samples: MatRef<'_, f64>,
     first_column: usize,
     lanes: usize,
@@ -337,7 +337,7 @@ pub(crate) fn run_tile(
 /// scalar one and compare.
 pub(crate) fn run_tile_on(
     arch: pulp::Arch,
-    tape: &IRTape,
+    tape: &AllocatedTape,
     samples: MatRef<'_, f64>,
     first_column: usize,
     lanes: usize,
@@ -469,6 +469,7 @@ mod tests {
     use super::{RegisterFile, TILE, run_tile, run_tile_on};
     use crate::Schema;
     use crate::diagnostics::EvaluationFailure;
+    use crate::eval::Gradient;
 
     fn runtime(
         result: Result<faer::Col<f64>, EvaluationFailure>,
@@ -524,7 +525,8 @@ mod tests {
         let names = ["x1", "x2", "x3", "x4"];
         for source in SOURCES {
             let ast = crate::parse(source).expect("sources compile");
-            let expression = crate::eval::bind(&ast, &Schema::new(names)).expect("binds");
+            let expression =
+                crate::eval::bind(&ast, &Schema::new(names), Gradient::Never).expect("binds");
             let rows: Vec<Vec<f64>> = (0..64)
                 .map(|_| -> Vec<f64> { (0..names.len()).map(|_| rng.uniform(0.5, 10.0)).collect() })
                 .filter(|row| expression.eval_row(row).is_ok())
@@ -550,7 +552,8 @@ mod tests {
     #[test]
     fn a_batched_fault_names_the_lowest_column_and_the_innermost_node() {
         let ast = crate::parse("ln(x1) + x2").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1", "x2"])).unwrap();
+        let expression =
+            crate::eval::bind(&ast, &Schema::new(["x1", "x2"]), Gradient::Never).unwrap();
         // Column 3 faults at `ln`; column 5 faults at the addition's input.
         let mut batch = Mat::from_fn(2, 8, |_, _| 1.0);
         batch[(0, 3)] = 0.0;
@@ -571,7 +574,7 @@ mod tests {
     #[test]
     fn an_absorbed_infinity_is_still_a_fault() {
         let ast = crate::parse("atan(x1 * x1)").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let mut batch = Mat::from_fn(1, TILE, |_, _| 1.0);
         batch[(0, 100)] = 1e200;
         let problem = runtime(expression.eval(batch.as_ref()));
@@ -595,7 +598,7 @@ mod tests {
     #[test]
     fn a_wide_batch_is_tiled_and_reassembled_in_order() {
         let ast = crate::parse("x1 * 2").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let columns = 2 * TILE + 7;
         #[expect(clippy::cast_precision_loss, reason = "small counts")]
         let batch = Mat::from_fn(1, columns, |_, c| c as f64);
@@ -608,7 +611,7 @@ mod tests {
     #[test]
     fn the_sample_index_survives_tiling() {
         let ast = crate::parse("ln(x1)").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let mut batch = Mat::from_fn(1, 2 * TILE, |_, _| 1.0);
         batch[(0, TILE + 3)] = 0.0;
         assert_eq!(
@@ -620,7 +623,7 @@ mod tests {
     #[test]
     fn an_empty_batch_yields_an_empty_column() {
         let ast = crate::parse("x1 * 2").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let batch = Mat::<f64>::zeros(1, 0);
         assert_eq!(expression.eval(batch.as_ref()).unwrap().nrows(), 0);
     }
@@ -631,7 +634,8 @@ mod tests {
     fn max_and_min_agree_on_signed_zeros_between_executors() {
         for source in ["max(x1, x2)", "min(x1, x2)"] {
             let ast = crate::parse(source).unwrap();
-            let expression = crate::eval::bind(&ast, &Schema::new(["x1", "x2"])).unwrap();
+            let expression =
+                crate::eval::bind(&ast, &Schema::new(["x1", "x2"]), Gradient::Never).unwrap();
             let rows = [[-0.0, 0.0], [0.0, -0.0], [0.0, 0.0], [-0.0, -0.0]];
             let batch = Mat::from_fn(2, rows.len(), |r, c| rows[c][r]);
             let tiled = expression.eval(batch.as_ref()).unwrap();
@@ -714,7 +718,8 @@ mod tests {
     #[test]
     fn a_faulting_column_does_not_hold_and_its_neighbours_are_judged() {
         let ast = crate::parse("ln(x1) + x2 <= 1").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1", "x2"])).unwrap();
+        let expression =
+            crate::eval::bind(&ast, &Schema::new(["x1", "x2"]), Gradient::Never).unwrap();
         // x1 = 1..8 so ln(x1) + 1 <= 1 holds only at x1 = 1; column 3 faults at
         // `ln(0)`, column 5 carries a NaN input.
         let mut batch = Mat::from_fn(2, 8, |r, c| {
@@ -739,7 +744,7 @@ mod tests {
     #[test]
     fn an_absorbed_infinity_does_not_hold() {
         let ast = crate::parse("atan(x1 * x1) < 2").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let mut batch = Mat::from_fn(1, TILE + 5, |_, _| 1.0);
         batch[(0, TILE + 2)] = 1e200;
         let mut holds = vec![true; TILE + 5];
@@ -752,7 +757,7 @@ mod tests {
     #[test]
     fn holds_only_narrows() {
         let ast = crate::parse("x1 <= 5").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1"])).unwrap();
+        let expression = crate::eval::bind(&ast, &Schema::new(["x1"]), Gradient::Never).unwrap();
         let batch = Mat::from_fn(1, 4, |_, c| [1.0, 2.0, 3.0, 9.0][c]);
         let mut holds = vec![true, false, true, true];
         expression.holds(batch.as_ref(), &mut holds).unwrap();
@@ -762,7 +767,8 @@ mod tests {
     #[test]
     fn holds_rejects_a_width_mismatch() {
         let ast = crate::parse("x1 + x2").unwrap();
-        let expression = crate::eval::bind(&ast, &Schema::new(["x1", "x2"])).unwrap();
+        let expression =
+            crate::eval::bind(&ast, &Schema::new(["x1", "x2"]), Gradient::Never).unwrap();
         let wrong_rows = Mat::from_fn(3, 4, |_, _| 1.0);
         assert!(matches!(
             expression.holds(wrong_rows.as_ref(), &mut [true; 4]),

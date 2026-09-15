@@ -2,13 +2,15 @@
 //! time or one row at a time.
 //!
 //! `tape.rs` is the instruction set, `lower.rs` produces it, `regalloc.rs`
-//! packs its temporaries, and the two executors — `tile.rs` for a batch,
-//! `lane.rs` for a row — run it. Every tape is straight-line: the front end
+//! packs its temporaries, `differentiate.rs` turns a tape into the tape of
+//! its gradient, and the two executors — `tile.rs` for a batch, `lane.rs`
+//! for a row — run either. Every tape is straight-line: the front end
 //! unrolls `sum` and `prod` or refuses them, so nothing here loops. It replaced a tree-walking evaluator, and was
 //! held to that walker's answers bit for bit over a few thousand random and
 //! adversarial rows before the walker was deleted; what remains as the spec is
 //! the corpus, the runtime-error tests and `tests/special_values.rs`.
 
+mod differentiate;
 mod lane;
 mod lower;
 mod regalloc;
@@ -19,13 +21,13 @@ pub(crate) mod wgsl;
 
 use std::collections::BTreeSet;
 
-use faer::{Col, MatRef};
+use faer::{Col, Mat, MatRef};
 
 use crate::Ast;
 use crate::diagnostics::EvaluationFailure;
 use crate::diagnostics::{BindError, CompileError, Fault, Problem, RuntimeProblem};
 
-use tape::IRTape;
+use tape::{AllocatedTape, Register};
 use tile::{RegisterFile, TILE};
 
 /// Java's `Double.MIN_NORMAL`, the nudge that makes a *strict* inequality
@@ -37,15 +39,8 @@ use tile::{RegisterFile, TILE};
 /// `> 0`, so `6 > 6` is false.
 pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 
-/// Resolves a parsed expression's symbols against the declared variables and
-/// lowers it, ready to evaluate.
-///
-/// A free function rather than a method on the tree, because a tree that
-/// knows how to compile itself is not a data type. The AST is the shared
-/// middle; this module is one of two backends that consume it.
-///
-/// Parses `source` and binds it to `variables`: the one call that turns text
-/// into something that runs.
+/// Compiles `source` against `variables` with the defaults: the shorthand
+/// for [`Compiler::new().compile(..)`](Compiler::compile).
 ///
 /// `variables` is every name the expression may use, in the order a batch's
 /// rows will come in. Order matters beyond that: `var[i]` indexes into this
@@ -58,18 +53,80 @@ pub fn compile<S: AsRef<str>>(
     source: &str,
     variables: &[S],
 ) -> Result<CompiledExpression, CompileError> {
-    let ast = crate::parse(source)?;
-    Ok(bind(&ast, &Schema::for_names(variables))?)
+    Compiler::new().compile(source, variables)
 }
 
-/// Binds a parsed expression to a schema and lowers it.
+/// Whether a compiled expression comes with its gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Gradient {
+    /// Never: the expression is compiled alone and
+    /// [`CompiledExpression::gradient`] is `None`.
+    Never,
+    /// Where the expression has one: every operator in it has a derivative.
+    /// `floor`, `ceil`, `sgn`, `%` and a computed subscript do not, and an
+    /// expression using one is compiled without a gradient rather than
+    /// refused.
+    #[default]
+    BestEffort,
+}
+
+/// The knobs a compilation has, with a default for each; [`compile`] is the
+/// defaults.
+///
+/// A free function and a builder rather than a method on the tree, because
+/// a tree that knows how to compile itself is not a data type. The AST is
+/// the shared middle; this module is one of two backends that consume it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Compiler {
+    gradient: Gradient,
+}
+
+impl Compiler {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether to compile the gradient beside the expression. The default is
+    /// [`Gradient::BestEffort`]; the cost is a second tape of a few times the
+    /// size, built once here, so that "compiled" means every register is
+    /// allocated and nothing is lowered later.
+    #[must_use]
+    pub const fn with_gradient(mut self, gradient: Gradient) -> Self {
+        self.gradient = gradient;
+        self
+    }
+
+    /// Parses `source` and binds it to `variables`: the one call that turns
+    /// text into something that runs.
+    ///
+    /// # Errors
+    /// [`CompileError::Parse`] with every problem found — parsing does not
+    /// stop at the first — or [`CompileError::Bind`] naming the symbols
+    /// `variables` lacks.
+    pub fn compile<S: AsRef<str>>(
+        &self,
+        source: &str,
+        variables: &[S],
+    ) -> Result<CompiledExpression, CompileError> {
+        let ast = crate::parse(source)?;
+        Ok(bind(&ast, &Schema::for_names(variables), self.gradient)?)
+    }
+}
+
+/// Binds a parsed expression to a schema and lowers it — and its gradient,
+/// as `gradient` says.
 ///
 /// This is where missing values are reported — once per schema, rather than on
 /// every evaluation as the JVM implementation did.
 ///
 /// # Errors
 /// Returns [`BindError`] if the schema omits a symbol the expression needs.
-pub(crate) fn bind(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindError> {
+pub(crate) fn bind(
+    ast: &Ast,
+    schema: &Schema,
+    gradient: Gradient,
+) -> Result<CompiledExpression, BindError> {
     let mut global_positions = Vec::with_capacity(ast.symbols.len());
     let mut missing = Vec::new();
 
@@ -86,10 +143,22 @@ pub(crate) fn bind(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, Bin
         return Err(BindError { missing });
     }
 
-    let tape = lower::lower(&ast.program, &global_positions, schema.len());
+    let virtual_tape = lower::lower(&ast.program, &global_positions, schema.len());
+    let gradient =
+        match gradient {
+            Gradient::Never => None,
+            Gradient::BestEffort => differentiate::differentiate(&virtual_tape, &global_positions)
+                .map(|derivative| CompiledGradient {
+                    tape: derivative.allocate(),
+                    source: ast.source.clone(),
+                    schema: schema.clone(),
+                    symbols: ast.symbols.clone(),
+                }),
+        };
 
     Ok(CompiledExpression {
-        tape,
+        tape: virtual_tape.allocate(),
+        gradient,
         source: ast.source.clone(),
         schema: schema.clone(),
         symbols: ast.symbols.clone(),
@@ -107,7 +176,10 @@ pub(crate) fn bind(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, Bin
 /// borrow it could have taken.
 #[derive(Debug, Clone)]
 pub struct CompiledExpression {
-    tape: IRTape,
+    tape: AllocatedTape,
+    /// The gradient's tape, compiled alongside as [`Compiler::with_gradient`]
+    /// asked.
+    gradient: Option<CompiledGradient>,
     /// Held for diagnostics: a runtime failure renders a caret against it.
     source: String,
     /// Gives the expected row count, and the names a failure reports values by.
@@ -149,6 +221,18 @@ impl CompiledExpression {
     #[must_use]
     pub fn references(&self) -> BTreeSet<&str> {
         self.symbols.iter().map(String::as_str).collect()
+    }
+
+    /// The gradient of this expression — of its residual, for a constraint —
+    /// compiled alongside it, or `None` where the compiler was told not to or
+    /// an operator in it has no derivative (`floor`, `ceil`, `sgn`, `%`, a
+    /// computed subscript); see [`Gradient`].
+    ///
+    /// Reverse mode over the tape: one run yields every partial at a cost
+    /// that does not grow with the number of variables. See `differentiate.rs`.
+    #[must_use]
+    pub fn gradient(&self) -> Option<&CompiledGradient> {
+        self.gradient.as_ref()
     }
 
     /// Evaluates one residual per column of `samples`.
@@ -195,7 +279,13 @@ impl CompiledExpression {
             if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
                 let column = first + lane;
                 let row = samples.col(column).iter().copied().collect::<Vec<_>>();
-                return Err(self.runtime_failure(&self.tape.fault(fault), Some(column), &row));
+                return Err(runtime_failure(
+                    &self.source,
+                    &self.schema,
+                    &self.tape.fault(fault),
+                    Some(column),
+                    &row,
+                ));
             }
             for (lane, &value) in tiles.results(&self.tape, lanes).iter().enumerate() {
                 residuals[first + lane] = value;
@@ -294,40 +384,142 @@ impl CompiledExpression {
         let mut frame = vec![0.0; self.tape.registers as usize];
         self.tape.prime(&mut frame);
         lane::run_lane(&self.tape, row, &mut frame)
-            .map_err(|fault| self.runtime_failure(&fault, None, row))
+            .map_err(|fault| runtime_failure(&self.source, &self.schema, &fault, None, row))
     }
 
     /// The tape, for the lowering and allocation tests.
     #[cfg(test)]
-    pub(super) fn tape(&self) -> &IRTape {
+    pub(super) fn tape(&self) -> &AllocatedTape {
         &self.tape
     }
+}
 
-    /// Renders a [`Fault`] into the failure a caller sees.
+/// Renders a [`Fault`] into the failure a caller sees.
+///
+/// The evaluator reports a kind and a location; rendering needs the source,
+/// which it deliberately does not carry. Building the [`Problem`] here keeps
+/// line and column derived from `span.start` in the one place that does it
+/// for syntax errors too.
+fn runtime_failure(
+    source: &str,
+    schema: &Schema,
+    fault: &Fault,
+    column: Option<usize>,
+    row: &[f64],
+) -> EvaluationFailure {
+    EvaluationFailure::Runtime(Box::new(RuntimeProblem {
+        problem: Problem::new(fault.kind.clone(), source, fault.span),
+        sample: column,
+        // Needs a slot-to-name table the AST deliberately discards.
+        locals: Vec::new(),
+        parameters: schema
+            .names()
+            .iter()
+            .cloned()
+            .zip(row.iter().copied())
+            .collect(),
+    }))
+}
+
+/// The gradient of a compiled expression, as a tape of its own: the primal
+/// value and every partial from one run.
+///
+/// Partials are per symbol the expression names, in the order
+/// [`symbols`](Self::symbols) gives — first reference order, which is not
+/// the schema's — one row per symbol.
+#[derive(Debug, Clone)]
+pub struct CompiledGradient {
+    tape: AllocatedTape,
+    source: String,
+    schema: Schema,
+    symbols: Vec<String>,
+}
+
+impl CompiledGradient {
+    /// The symbols the partials are ordered by: `eval`'s rows, by name.
+    #[must_use]
+    pub fn symbols(&self) -> &[String] {
+        &self.symbols
+    }
+
+    /// The Jacobian over a batch: one row per symbol, one column per sample.
     ///
-    /// The evaluator reports a kind and a location; rendering needs the source,
-    /// which it deliberately does not carry. Building the [`Problem`] here keeps
-    /// line and column derived from `span.start` in the one place that does it
-    /// for syntax errors too.
-    fn runtime_failure(
+    /// # Errors
+    /// As [`CompiledExpression::eval`]; a gradient that is not finite is a
+    /// fault where the value may not have been.
+    pub fn eval(&self, samples: MatRef<'_, f64>) -> Result<Mat<f64>, EvaluationFailure> {
+        if samples.nrows() != self.schema.len() {
+            return Err(EvaluationFailure::RowWidthMismatch {
+                expected: self.schema.len(),
+                actual: samples.nrows(),
+            });
+        }
+        let columns = samples.ncols();
+        let mut jacobian = Mat::zeros(self.symbols.len(), columns);
+
+        let mut tiles = Tiles::new(&self.tape, columns);
+        while let Some((first, lanes)) = tiles.next_tile(columns) {
+            if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
+                let column = first + lane;
+                let row = samples.col(column).iter().copied().collect::<Vec<_>>();
+                return Err(runtime_failure(
+                    &self.source,
+                    &self.schema,
+                    &self.tape.fault(fault),
+                    Some(column),
+                    &row,
+                ));
+            }
+            for (symbol, partial) in self.tape.partials.iter().enumerate() {
+                for (lane, &value) in tiles.register(*partial, lanes).iter().enumerate() {
+                    jacobian[(symbol, first + lane)] = value;
+                }
+            }
+        }
+
+        Ok(jacobian)
+    }
+
+    /// The partials at one row.
+    ///
+    /// # Errors
+    /// As [`eval`](Self::eval), without a column to name.
+    pub(crate) fn eval_row(&self, row: &[f64]) -> Result<Vec<f64>, EvaluationFailure> {
+        self.eval_row_with_value(row).map(|(_, partials)| partials)
+    }
+
+    /// The value and the partials at one row, from the one run that computes
+    /// both.
+    ///
+    /// # Errors
+    /// As [`eval`](Self::eval), without a column to name.
+    pub(crate) fn eval_row_with_value(
         &self,
-        fault: &Fault,
-        column: Option<usize>,
         row: &[f64],
-    ) -> EvaluationFailure {
-        EvaluationFailure::Runtime(Box::new(RuntimeProblem {
-            problem: Problem::new(fault.kind.clone(), &self.source, fault.span),
-            sample: column,
-            // Needs a slot-to-name table the AST deliberately discards.
-            locals: Vec::new(),
-            parameters: self
-                .schema
-                .names()
-                .iter()
-                .cloned()
-                .zip(row.iter().copied())
-                .collect(),
-        }))
+    ) -> Result<(f64, Vec<f64>), EvaluationFailure> {
+        if row.len() != self.schema.len() {
+            return Err(EvaluationFailure::RowWidthMismatch {
+                expected: self.schema.len(),
+                actual: row.len(),
+            });
+        }
+        let mut frame = vec![0.0; self.tape.registers as usize];
+        self.tape.prime(&mut frame);
+        let value = lane::run_lane(&self.tape, row, &mut frame)
+            .map_err(|fault| runtime_failure(&self.source, &self.schema, &fault, None, row))?;
+        let partials = self
+            .tape
+            .partials
+            .iter()
+            .map(|partial| frame[partial.index()])
+            .collect();
+        Ok((value, partials))
+    }
+
+    /// The tape, for the differentiation tests.
+    #[cfg(test)]
+    pub(super) fn tape(&self) -> &AllocatedTape {
+        &self.tape
     }
 }
 
@@ -382,9 +574,9 @@ impl Schema {
 
 /// Parses and lowers `source` against `names`, for the tests of the pieces.
 #[cfg(test)]
-pub(super) fn tape_for(source: &str, names: &[&str]) -> IRTape {
+pub(super) fn tape_for(source: &str, names: &[&str]) -> AllocatedTape {
     let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-    bind(&ast, &Schema::for_names(names))
+    bind(&ast, &Schema::for_names(names), Gradient::Never)
         .unwrap_or_else(|e| panic!("{source:?} against {names:?}: {e:?}"))
         .tape()
         .clone()
@@ -400,7 +592,7 @@ struct Tiles {
 }
 
 impl Tiles {
-    fn new(tape: &IRTape, columns: usize) -> Self {
+    fn new(tape: &AllocatedTape, columns: usize) -> Self {
         let width = columns.min(TILE);
         Self {
             file: RegisterFile::new(tape, width),
@@ -422,7 +614,7 @@ impl Tiles {
 
     fn run(
         &mut self,
-        tape: &IRTape,
+        tape: &AllocatedTape,
         samples: MatRef<'_, f64>,
         first: usize,
         lanes: usize,
@@ -438,8 +630,13 @@ impl Tiles {
         )
     }
 
-    fn results(&self, tape: &IRTape, lanes: usize) -> &[f64] {
+    fn results(&self, tape: &AllocatedTape, lanes: usize) -> &[f64] {
         self.file.reg(tape.result, lanes)
+    }
+
+    /// Any register after a run: a differentiated tape's partials.
+    fn register(&self, register: Register, lanes: usize) -> &[f64] {
+        self.file.reg(register, lanes)
     }
 }
 
@@ -453,7 +650,8 @@ impl Tiles {
 #[cfg(test)]
 pub(crate) fn eval_one(source: &str, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
     let ast = crate::parse(source).map_err(CompileError::from)?;
-    let compiled = bind(&ast, &Schema::for_table(inputs)).map_err(CompileError::from)?;
+    let compiled =
+        bind(&ast, &Schema::for_table(inputs), Gradient::Never).map_err(CompileError::from)?;
     let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
     let res = compiled.eval(sample.as_ref())?;
     Ok(res[0])
@@ -465,7 +663,7 @@ pub(crate) fn eval_one(source: &str, inputs: &[(&str, f64)]) -> Result<f64, Eval
 #[cfg(test)]
 pub(crate) fn eval_parsed(ast: &Ast, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
     let schema = Schema::for_table(inputs);
-    let compiled = bind(ast, &schema).map_err(CompileError::from)?;
+    let compiled = bind(ast, &schema, Gradient::Never).map_err(CompileError::from)?;
     let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
     let res = compiled.eval(sample.as_ref())?;
     Ok(res[0])

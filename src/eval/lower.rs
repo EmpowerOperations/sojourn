@@ -1,4 +1,4 @@
-//! `ast::Program` → [`IRTape`]: one post-order walk emitting instructions in
+//! `ast::Program` → [`VirtualTape`]: one post-order walk emitting instructions in
 //! exactly the order the tree-walker evaluated nodes, so that a fault lands
 //! on the same span and a fold accumulates in the same order.
 //!
@@ -6,23 +6,21 @@
 //! literals become constant registers, `LocalSlot`s become local registers
 //! one-to-one, and everything else is a temporary.
 
-use std::collections::HashMap;
-
 use crate::ast;
 use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, Program};
 use crate::diagnostics::Span;
 
-use super::regalloc;
-use super::tape::{Accumulate, IRTape, Instruction, VirtualRegister};
+use super::tape::{Accumulate, Constants, Instruction, VirtualRegister, VirtualTape};
 
 /// Lowers `program` against a schema of `row_len` variables, with
-/// `global_positions[GlobalId]` giving each symbol's row.
-pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize) -> IRTape {
+/// `global_positions[GlobalId]` giving each symbol's row — to the virtual
+/// tape, which [`VirtualTape::allocate`] turns into the one the executors run
+/// and `differentiate` turns into its gradient's.
+pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize) -> VirtualTape {
     let mut lowerer = Lowerer {
         global_positions,
         row_len,
-        consts: Vec::new(),
-        const_index: HashMap::new(),
+        consts: Constants::default(),
         next_temp: 0,
         insns: Vec::new(),
         spans: Vec::new(),
@@ -36,9 +34,7 @@ pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize)
 struct Lowerer<'a> {
     global_positions: &'a [u32],
     row_len: usize,
-    consts: Vec<f64>,
-    /// Bit pattern → constant register, so `0.0` and `-0.0` stay distinct.
-    const_index: HashMap<u64, u16>,
+    consts: Constants,
     next_temp: u32,
     insns: Vec<Instruction<VirtualRegister>>,
     spans: Vec<Span>,
@@ -65,14 +61,7 @@ impl Lowerer<'_> {
     }
 
     fn constant(&mut self, value: f64) -> VirtualRegister {
-        let bits = value.to_bits();
-        if let Some(&index) = self.const_index.get(&bits) {
-            return VirtualRegister::Const(index);
-        }
-        let index = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
-        self.consts.push(value);
-        self.const_index.insert(bits, index);
-        VirtualRegister::Const(index)
+        self.consts.intern(value)
     }
 
     /// Delivers a value that already lives in `value` to `dst` if one was
@@ -358,18 +347,15 @@ impl Lowerer<'_> {
         acc
     }
 
-    fn finish(self, result: VirtualRegister, frame_size: u32) -> IRTape {
-        let consts = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
-        let locals = u16::try_from(frame_size).expect("fewer than 65536 locals");
-        let (insns, result, registers) = regalloc::allocate(self.insns, result, consts, locals);
-        IRTape {
-            consts: self.consts,
-            locals,
-            registers,
-            insns,
-            spans: self.spans,
+    fn finish(self, result: VirtualRegister, frame_size: u32) -> VirtualTape {
+        VirtualTape::new(
+            self.consts,
+            u16::try_from(frame_size).expect("fewer than 65536 locals"),
+            self.next_temp,
+            self.insns,
+            self.spans,
             result,
-        }
+        )
     }
 }
 
@@ -380,12 +366,12 @@ mod tests {
     use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp};
     use crate::diagnostics::Span;
 
-    use super::super::tape::{Accumulate, IRTape, Instruction, Register};
+    use super::super::tape::{Accumulate, AllocatedTape, Instruction, Register};
     use super::super::tape_for;
 
     const R: fn(u16) -> Register = Register;
 
-    fn loads(tape: &IRTape, input: u32) -> usize {
+    fn loads(tape: &AllocatedTape, input: u32) -> usize {
         tape.insns
             .iter()
             .filter(|i| matches!(i, Instruction::Load { input: x, .. } if *x == input))
@@ -778,7 +764,7 @@ mod tests {
             },
             frame_size: 1,
         };
-        let tape = super::lower(&program, &[], 0);
+        let tape = super::lower(&program, &[], 0).allocate();
         assert_eq!(tape.insns, vec![Instruction::Check { reg: R(0) }]);
         assert_eq!(tape.spans, vec![Span::new(0, 1)]);
         assert_eq!(tape.result, R(0));
