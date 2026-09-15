@@ -605,10 +605,15 @@ impl FeasibleRegion {
     /// not of anything the caller has seen elsewhere. That is what an
     /// optimizer being repaired needs: a landing that depends on other points
     /// steers the optimizer toward them, and this used to take *anchors* for
-    /// exactly that reason and with exactly that effect. Each coordinate is
-    /// clamped into the interval its constraints leave it, and where that
-    /// cannot land the point is projected — the feasible point nearest it,
-    /// by a local solve from where clamping left it.
+    /// exactly that reason and with exactly that effect. "Near" is Euclidean
+    /// distance over box-normalised coordinates: each coordinate is clamped
+    /// into the interval its constraints leave it, and from there the point
+    /// is projected — the feasible point nearest it, by a local solve — so a
+    /// step over a wall is put back where it stepped from rather than slid
+    /// along the wall to wherever one coordinate could reach. A constraint
+    /// flat where the point stands is walked in from a reference point found
+    /// under a fixed seed. Every repair that is not a matter of bounds alone
+    /// pays a local solve: about 0.3 s at fifty variables in a release build.
     ///
     /// `clearance` is the room kept from every wall, as a fraction of each
     /// variable's box width: the result and each of its `2d` axis neighbours
@@ -622,9 +627,9 @@ impl FeasibleRegion {
     /// A point that already has the clearance comes back unchanged, so
     /// `repair(repair(x)) == repair(x)`; a feasible point without it is moved
     /// inward. Otherwise the answer is a judged point with the clearance, no
-    /// farther from `point` than clamping reached, and where clamping could
-    /// not land, the nearest the projection found within its evaluation
-    /// budget. The algorithm is `src/repair.rs`.
+    /// farther from `point` than clamping reached, and the nearest the
+    /// projection found within its evaluation budget. The algorithm is
+    /// `src/repair.rs`.
     ///
     /// # Errors
     /// [`RepairError::Stranded`] when nothing feasible was reached at all, and

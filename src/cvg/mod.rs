@@ -363,9 +363,8 @@ impl Cancellation<'_> {
         Cancellation(Some(opening))
     }
 
-    /// Never requested: for a test driving a solver call with no future
-    /// behind it to drop.
-    #[cfg(test)]
+    /// Never requested: for a local solve with no future behind it to drop —
+    /// a repair's reference point, or a test driving a call directly.
     pub(crate) const fn never() -> Cancellation<'static> {
         Cancellation(None)
     }
@@ -477,7 +476,8 @@ fn open(
     // hundred coordinates would spend its budget on the first few.
     if progress.is_empty()
         && let Some(rng) = &mut ladder.local
-        && let Some(point) = local::find_initial(problem, &problem.declared(), local::STARTS, rng, cancel)
+        && let Some(point) =
+            local::find_initial(problem, &problem.declared(), local::STARTS, rng, cancel)
     {
         progress = progress.extend(vec![point]);
     }

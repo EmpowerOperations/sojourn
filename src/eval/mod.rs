@@ -158,6 +158,19 @@ impl CompiledExpression {
     /// transpose — and it is the orientation `faer` stores contiguously, so a
     /// column is a sample laid out end to end.
     ///
+    /// **A constraint evaluates to its violation.** A boolean expression —
+    /// `a < b`, `a >= b`, `a == b +/- t` — comes back as a scalar whose sign
+    /// carries the truth value: negative or zero values `<= 0` holds (the constraint passes),
+    /// postive values `> 0` does not hold (the constraint fails), and the size of
+    /// a positive value is how badly. That is the `g(x) <= 0` form a
+    /// constrained solver takes, so one compiled constraint per row of a
+    /// COBYLA-style `constraints` vector is exactly this call. Precisely:
+    /// `a <= b` is `a - b`; `a < b` is `a - b` nudged by the smallest positive
+    /// `f64`, which vanishes at any real magnitude and separates the two only
+    /// at exact equality; `a == b +/- t` is `max(a - b - t, b - a - t)`, the
+    /// distance outside the band, negative inside it; a conjunction is the
+    /// worst of its terms. An arithmetic expression evaluates to its value.
+    ///
     /// Runs a tile of [`TILE`] columns at a time. The first failing column, in
     /// order, is the one reported, naming the innermost subexpression that
     /// went wrong.

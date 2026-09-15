@@ -2646,6 +2646,37 @@ the projection lacked turned out not to exist: between the two bands of
 `(x + 2)(x − 1) == 0`, where the chord answered `Stranded` without an anchor, the projection
 reaches the nearer band. Everything below that says "anchor" or "chord" is the record of the
 first design.
+
+**2026-09-15: the metric is Euclidean, and a flat constraint gets a reference.** Two SSCCEs
+from Artemis 0.13.2 against `587199c` (`docs/user-sscce/`). *`repair_lands_axis_aligned_not_nearest`:*
+the clamp is the taxicab projection and `repair` returned the moment it landed, so the
+Euclidean projection never ran on exactly the cases an optimizer produces — the slab
+`x1 == x2 + 1 ± 0.01` landed `√2×` farther than the nearest point on every row (`x1` moved the
+whole gap, `x1` and `x2` should each have moved half), a disc's near-misses 1.03–1.54× farther,
+slid along the wall. Taxicab had been chosen for ranking anchors in high dimension; the anchors
+are gone and the bias it carries — prefer any landing that touches one coordinate over a
+nearer one that touches two — is one an optimizer must not be fed. Now the projection runs
+from the clamp's landing on every repair, the clamp's landing and the projection's are both
+candidates, released, and the Euclidean-nearer wins — except where the clamp's landing is
+*separable* (every constraint naming a moved coordinate names it alone: bounds), where the
+axis projection already is the Euclidean one and two hundred bounds would otherwise cost a
+solve of minutes. Three tables are the fixture, each against its closed form.
+*`repair_strands_on_a_product_constraint`:* Keane's `0.75 − ∏xᵢ < 0` with seven coordinates at
+`1e-11`; the product is `1e-59`, the constraint flat to fifty digits in every direction, every
+slice empty, COBYLA's linear model of it a flat model — `Stranded` with a feasible point 4.6
+units away. No local method sees a flat constraint; what is needed is a feasible point to walk
+in from, and it comes without anchors: `find_initial` over the declared box under
+`REFERENCE_SEED`, a constant, so the reference is a function of the system; a chord bisected
+from it toward the proposal; the projection from the chord's landing, where the constraint is
+well-scaled again. The reference decides only which basin, never where in it, and is reached
+only when the projection from the point saw nothing feasible. **Cost, measured in release:**
+about 0.3 s per repair at fifty variables on the slab and the ball (≈30× that unoptimised),
+1.3 s for Keane at 50 including the solve, 4.7 s at 100 — the projection from the flat point
+spends its whole budget before the reference is tried, which is why the hundred-variable case
+is not in the debug suite. The cost follow-up stands: restrict the projection to the incidence
+closure of the constraints active at the landing (`d²m` shrinks to the coupled coordinates —
+two on the slab, all of them on Keane), and stop a projection that has made no feasible
+evaluation in its first simplex rather than at its budget.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

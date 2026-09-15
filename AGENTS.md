@@ -284,14 +284,18 @@ for the region, so the region can answer for the system after the search:
 `system()`, `take` for samples, and `repair` — which lives here rather than
 on the system because a region that could not be solved has nothing to repair
 toward. `repair` is a function of the system, the point and the clearance
-and of nothing else — it draws no randomness and consults no census, because
-a landing that depends on other points steers the optimizer being repaired
-toward them (the *anchors* it used to take did exactly that, measured as a
-28° bias on a disc). It clamps each coordinate into its slice and, where that
-cannot land, projects: the nearest feasible point by a local solve from the
-proposal (`local::nearest`). A coordinate lands at the caller's clearance
-inside its bound, *on* the bound at zero clearance; the design and the
-alternatives it displaced are in `docs/todo.md` under *Repair for Artemis*.
+and of nothing else — it consults no census, because a landing that depends
+on other points steers the optimizer being repaired toward them (the
+*anchors* it used to take did exactly that, measured as a 28° bias on a
+disc). "Near" is Euclidean over box-normalised coordinates, not taxicab: it
+clamps each coordinate into its slice, then projects from there — the nearest
+feasible point by a local solve (`local::nearest`) — unless the clamp's
+landing is separable (bounds), where the axis projection already is the
+Euclidean one. A constraint flat where the point stands is walked in from a
+reference found by `local::find_initial` under a fixed seed, then projected.
+A coordinate lands at the caller's clearance inside its bound, *on* the bound
+at zero clearance; the design and the alternatives it displaced are in
+`docs/todo.md` under *Repair for Artemis*.
 
 `cvg::incidence` is the bipartite graph of constraints and coordinates, kept in
 both directions because the walker traverses it both ways. Its indices are

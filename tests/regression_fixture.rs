@@ -316,3 +316,359 @@ mod census_does_not_return_on_the_20_segment_beam {
         Ok(())
     }
 }
+
+/// Artemis 0.13.2, 2026-09-15, against `587199c`: `c06-rosenbrock-50-slab`
+/// came out worse at every concurrency level and the ball cases did not
+/// move. The report is a table of where `repair` landed against the
+/// closed-form Euclidean-nearest feasible point: the shell exact, the far
+/// disc exact, the disc's near misses 1.03–1.54× farther, and the slab
+/// `√2×` farther every time — `x1` moved the whole gap where `x1` and `x2`
+/// should each have moved half.
+///
+/// The clamp is an axis projection — the L1-nearest point, which moves one
+/// coordinate wherever one can reach — and `repair` used to return the
+/// moment it landed, so the Euclidean projection never ran on exactly the
+/// cases an optimizer produces: a step a hair over a curved wall, a step
+/// off a slab. The contract is Euclidean now, in box-normalised
+/// coordinates, and the projection runs from the clamp's landing on every
+/// repair that is not separable. The three tables are the acceptance, each
+/// against its closed form.
+mod repair_lands_axis_aligned_not_nearest {
+    use super::*;
+    use anyhow::Context;
+    use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
+    use sojourn::FeasibleRegion;
+
+    const CLEARANCE: f64 = 1e-12;
+    /// The projection converges to `FINAL_RADIUS` in the cube and lands
+    /// `LEAST_MARGIN` inside; against a proposal a hundredth of a unit off a
+    /// wall both are visible, and a tenth of a percent is generous to them
+    /// and nowhere near the ratios reported.
+    const ALLOWANCE: f64 = 1e-3;
+
+    fn l2(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    fn system(n: usize, lo: f64, hi: f64, sources: &[String]) -> anyhow::Result<ConstraintSystem> {
+        let variables = (1..=n)
+            .map(|i| InputVariable::new(format!("x{i}"), lo, hi))
+            .collect();
+        Ok(ConstraintSystem::new(variables, sources.iter().cloned())?)
+    }
+
+    async fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
+        ConstraintSolver::new()
+            .with_seed(7)
+            .solve(system)
+            .await
+            .context("the fixture should be satisfiable")
+    }
+
+    /// Every landing against its closed form: feasible with the clearance,
+    /// and no farther from the proposal than the nearest feasible point,
+    /// within the allowance. Reported together, as the table it is.
+    fn complaints(
+        system: &ConstraintSystem,
+        proposals: &[Vec<f64>],
+        landings: &[Result<Vec<f64>, sojourn::RepairError>],
+        nearest: impl Fn(&[f64]) -> Vec<f64>,
+    ) -> Vec<String> {
+        let mut complaints = Vec::new();
+        for (k, (proposal, landing)) in proposals.iter().zip(landings).enumerate() {
+            let closed = nearest(proposal);
+            assert!(
+                system.is_feasible(&closed, 0.0),
+                "the closed-form nearest point is not feasible: {closed:?}"
+            );
+            let reach = l2(proposal, &closed);
+            match landing {
+                Ok(landed) => {
+                    let ratio = l2(proposal, landed) / reach;
+                    if !system.is_feasible(landed, CLEARANCE) {
+                        complaints.push(format!("#{k}: landed without the clearance"));
+                    }
+                    if ratio > 1.0 + ALLOWANCE {
+                        complaints.push(format!(
+                            "#{k}: landed {ratio:.3}x farther than the nearest feasible point"
+                        ));
+                    }
+                }
+                Err(error) => complaints.push(format!("#{k}: {error}")),
+            }
+        }
+        complaints
+    }
+
+    /// `c05`: `(x1 - 3)^2 + (x2 - 3)^2 < 2.25` over `[-10, 10]^50`. The nearest
+    /// point is radial onto the circle of radius 1.5 about `(3, 3)`; the
+    /// proposals sit a hundredth, three tenths, three and eight units outside
+    /// it at random angles, the other 48 coordinates anywhere.
+    #[pollster::test]
+    async fn a_ball_near_miss_lands_on_the_radial_projection() -> anyhow::Result<()> {
+        let system = system(
+            50,
+            -10.0,
+            10.0,
+            &["(x1 - 3)^2 + (x2 - 3)^2 < 2.25".to_owned()],
+        )?;
+        let region = region(&system).await?;
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut proposals = Vec::new();
+        for scale in [0.01, 0.3, 3.0, 8.0] {
+            for _ in 0..2 {
+                let mut p: Vec<f64> = (0..50).map(|_| rng.random_range(-10.0..10.0)).collect();
+                let angle: f64 = rng.random_range(0.0..std::f64::consts::TAU);
+                p[0] = (3.0 + (1.5 + scale) * angle.cos()).clamp(-10.0, 10.0);
+                p[1] = (3.0 + (1.5 + scale) * angle.sin()).clamp(-10.0, 10.0);
+                proposals.push(p);
+            }
+        }
+
+        let landings: Vec<_> = proposals
+            .iter()
+            .map(|p| region.repair(p, CLEARANCE))
+            .collect();
+
+        let complaints = complaints(&system, &proposals, &landings, |p| {
+            let (dx, dy) = (p[0] - 3.0, p[1] - 3.0);
+            let scale = (1.5 - 1e-9) / dx.hypot(dy);
+            let mut q = p.to_vec();
+            q[0] = 3.0 + dx * scale;
+            q[1] = 3.0 + dy * scale;
+            q
+        });
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        Ok(())
+    }
+
+    /// `c06`: `x1 == x2 + 1 +/- 0.01` over `[-10, 10]^50`. The nearest point
+    /// shifts `x1` and `x2` symmetrically onto the nearer face; the clamp
+    /// alone moved `x1` by the whole gap, `√2×` farther, on every row.
+    #[pollster::test]
+    async fn a_slab_landing_moves_both_coordinates() -> anyhow::Result<()> {
+        let system = system(50, -10.0, 10.0, &["x1 == x2 + 1 +/- 0.01".to_owned()])?;
+        let region = region(&system).await?;
+        let mut rng = SmallRng::seed_from_u64(2);
+        let mut proposals = Vec::new();
+        for gap in [0.02, 0.1, 1.0, 5.0, -0.02, -1.0, -5.0] {
+            let mut p: Vec<f64> = (0..50).map(|_| rng.random_range(-9.0..9.0)).collect();
+            p[0] = p[1] + 1.0 + gap;
+            if p[0].abs() > 10.0 {
+                p[1] = 0.0;
+                p[0] = 1.0 + gap;
+            }
+            proposals.push(p);
+        }
+
+        let landings: Vec<_> = proposals
+            .iter()
+            .map(|p| region.repair(p, CLEARANCE))
+            .collect();
+
+        let complaints = complaints(&system, &proposals, &landings, |p| {
+            let gap = p[0] - p[1] - 1.0;
+            let excess = gap.abs() - (0.01 - 1e-9);
+            let mut q = p.to_vec();
+            if excess > 0.0 {
+                let shift = excess / 2.0 * gap.signum();
+                q[0] -= shift;
+                q[1] += shift;
+            }
+            q
+        });
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        Ok(())
+    }
+
+    /// `c12`: `sum x_i^2 == 1 +/- 1e-4` over `[0, 1]^20`. The nearest point
+    /// is the radial scaling onto the nearer face of the shell. Passed on
+    /// `587199c` already — clamping cannot land on a twenty-variable
+    /// equality, so the projection always ran — and is here so the contract
+    /// is pinned on a shape where the clamp never had a say.
+    #[pollster::test]
+    async fn a_sphere_shell_landing_is_the_radial_projection() -> anyhow::Result<()> {
+        let system = system(
+            20,
+            0.0,
+            1.0,
+            &["sum(1, 20, i -> (var[i])^2) == 1 +/- 0.0001".to_owned()],
+        )?;
+        let region = region(&system).await?;
+        let mut rng = SmallRng::seed_from_u64(3);
+        let mut proposals: Vec<Vec<f64>> = (0..5)
+            .map(|_| (0..20).map(|_| rng.random_range(0.0..1.0)).collect())
+            .collect();
+        proposals.push(vec![1.0; 20]);
+        proposals.push(vec![0.5; 20]);
+        proposals.push((0..20).map(|i| 0.05 + 0.04 * i as f64).collect());
+
+        let landings: Vec<_> = proposals
+            .iter()
+            .map(|p| region.repair(p, CLEARANCE))
+            .collect();
+
+        let complaints = complaints(&system, &proposals, &landings, |p| {
+            let r2: f64 = p.iter().map(|x| x * x).sum();
+            let target = if r2 > 1.0 {
+                (1.0_f64 + 1e-4 - 1e-10).sqrt()
+            } else {
+                (1.0_f64 - 1e-4 + 1e-10).sqrt()
+            };
+            let scale = target / r2.sqrt();
+            p.iter().map(|x| x * scale).collect()
+        });
+        assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+        Ok(())
+    }
+}
+
+/// Artemis 0.13.2, 2026-09-15, `c10-keane-bump-50` and `c11-keane-bump-100`
+/// against `587199c`: `repair` answered `Stranded` on Keane's bump —
+/// `0.75 - prod x_i < 0`, `sum x_i - 7.5 n < 0` over `[0, 10]^n` — for
+/// proposals with several coordinates driven to the lower wall plus the
+/// clearance, where the product is `1e-59` against the `0.75` needed and a
+/// feasible point is a few units away (every coordinate below 1 lifted to 1).
+/// Both runs aborted on it; the census had no trouble at all.
+///
+/// A constraint that flat is invisible to every local method: every slice is
+/// empty, and COBYLA's linear model of a function flat to fifty digits moves
+/// nothing. What was needed is a feasible point to walk *in* from, which the
+/// chord design had from its anchors and the projection did not. It has one
+/// now without anchors: a local solve from the box centre under a fixed seed
+/// — a function of the system — a chord bisected from it toward the
+/// proposal, and the projection from where the chord lands, where the
+/// constraint is well-scaled again. The proposal is Artemis's, verbatim;
+/// the hundred-variable one repairs the same way and is not here because
+/// the projection from a point that flat spends its whole budget before the
+/// reference is tried — 4.7 s in release, minutes unoptimised.
+mod repair_strands_on_a_product_constraint {
+    use super::*;
+    use anyhow::Context;
+
+    const CLEARANCE: f64 = 1e-12;
+
+    const POINT_50: [f64; 50] = [
+        0.08928918738349267,
+        0.8128352441524971,
+        9.423980250530082,
+        8.201514214434269e-7,
+        0.074313852199003,
+        9.787239247939075,
+        1.4211922856333103e-6,
+        0.1897163472654313,
+        9.84180144604797,
+        9.365967211219166,
+        0.050729876983561795,
+        9.964434055086267,
+        9.99999999999,
+        9.998420069515479,
+        0.6367844193595209,
+        1.000177718424311e-11,
+        0.2817004031539234,
+        0.08928918738349179,
+        0.04463556293675364,
+        9.888842446816353,
+        9.755546509597457,
+        9.993325488268553,
+        0.04070536976125716,
+        9.982578066498466,
+        6.753114992849506,
+        9.916261792957172,
+        9.917970006505211,
+        9.84180144604797,
+        9.965996110813085,
+        0.04224343643094741,
+        0.08928918738349179,
+        0.0892891873834909,
+        9.995418246406189,
+        1.000177718424311e-11,
+        0.45955550570587533,
+        0.07810019738970642,
+        3.6437449990600612e-6,
+        9.84180144604797,
+        0.09112711432073706,
+        9.992216303186801,
+        9.5554706945567,
+        1.000177718424311e-11,
+        0.021898415600998256,
+        0.047301883444006876,
+        10.0,
+        1.000177718424311e-11,
+        0.0575386197917398,
+        9.980275812968333,
+        9.994656793123873,
+        0.21906571038074585,
+    ];
+
+    fn keane(n: usize) -> anyhow::Result<ConstraintSystem> {
+        let variables = (1..=n)
+            .map(|i| InputVariable::new(format!("x{i}"), 0.0, 10.0))
+            .collect();
+        Ok(ConstraintSystem::new(
+            variables,
+            [
+                format!("0.75 - prod(1, {n}, i -> var[i]) < 0"),
+                format!("sum(1, {n}, i -> var[i]) - {} < 0", 7.5 * n as f64),
+            ],
+        )?)
+    }
+
+    fn l2(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// A feasible point within a few units of the proposal: every coordinate
+    /// below 1 lifted to 1, and the ones on the upper wall pulled in so the
+    /// clearance has room there too.
+    fn lifted(point: &[f64]) -> Vec<f64> {
+        point.iter().map(|&x| x.clamp(1.0, 10.0 - 1e-9)).collect()
+    }
+
+    async fn is_repaired(n: usize, point: &[f64]) -> anyhow::Result<()> {
+        let system = keane(n)?;
+        let region = ConstraintSolver::new()
+            .with_seed(0x50_50_1E_5E_ED)
+            .solve(&system)
+            .await
+            .context("Keane's region is nearly the whole box")?;
+        let lifted = lifted(point);
+        assert!(
+            system.is_feasible(&lifted, CLEARANCE),
+            "the lifted point should be plainly feasible"
+        );
+
+        let repaired = region.repair(point, CLEARANCE).with_context(|| {
+            format!(
+                "stranded at n = {n} with a feasible point {:.2} away",
+                l2(point, &lifted)
+            )
+        })?;
+
+        assert!(
+            system.is_feasible(&repaired, CLEARANCE),
+            "landed without the clearance: {repaired:?}"
+        );
+        assert!(
+            l2(point, &repaired) <= l2(point, &lifted) + 1e-9,
+            "landed farther than the lifted point ({} > {})",
+            l2(point, &repaired),
+            l2(point, &lifted)
+        );
+        Ok(())
+    }
+
+    #[pollster::test]
+    async fn the_50_variable_proposal_is_repaired() -> anyhow::Result<()> {
+        is_repaired(50, &POINT_50).await
+    }
+}

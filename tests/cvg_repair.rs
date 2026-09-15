@@ -2,19 +2,20 @@
 //!
 //! The contract is Artemis's (the optimizer that consumes this crate): hand
 //! over any point in the declared box, get back one the same feasibility
-//! oracle passes, near the input in **L1 over box-normalised coordinates**,
-//! the same answer every time. The design and the alternatives it rejected are
+//! oracle passes, **Euclidean-nearest over box-normalised coordinates**, the
+//! same answer every time. The design and the alternatives it rejected are
 //! in `docs/todo.md` under *Repair for Artemis*.
 //!
-//! The geometry cases have closed-form answers under that metric, which is not
-//! the Euclidean projection anyone would sketch: the L1-nearest point on a
-//! half-space is reached by moving *one* coordinate, the one with the steepest
-//! normal component, and the L1-nearest point on a disc from a point whose
-//! other coordinate is already in range is straight along one axis. Every
-//! expected value below was derived under L1 first and the test written second.
-//! Where clamping cannot land — both coordinates out of range at once — the
-//! answer is the projection, and the disc's corners pin that it is radial:
-//! a function of the constraints alone, with nothing else pulling on it.
+//! The geometry cases have closed-form answers under that metric — the foot
+//! of the perpendicular on a half-space, the radial point on a disc — and
+//! every expected value below was derived first and the test written second.
+//! The metric used to be L1, under which the nearest point moves one
+//! coordinate wherever one can reach; that was retired with the anchors it
+//! ranked, because an optimizer stepping over a wall wants to be put back
+//! where it stepped from, not slid along the wall (`tests/regression_fixture.rs`,
+//! `repair_lands_axis_aligned_not_nearest`). The answer is a function of the
+//! constraints alone, with nothing else pulling on it; the disc's corners pin
+//! that.
 
 mod common;
 
@@ -111,23 +112,28 @@ fn in_box(system: &ConstraintSystem, point: &[f64]) -> bool {
         .all(|(variable, value)| variable.contains(*value))
 }
 
-/// L1 distance with every coordinate scaled by its box width: the metric
-/// `repair` claims to be near in.
-fn normalised_l1(system: &ConstraintSystem, a: &[f64], b: &[f64]) -> f64 {
+/// Euclidean distance over box-normalised coordinates, the metric `repair`
+/// promises "near" in.
+fn normalised_l2(system: &ConstraintSystem, a: &[f64], b: &[f64]) -> f64 {
     system
         .variables()
         .iter()
         .zip(a.iter().zip(b))
-        .map(|(variable, (x, y))| (x - y).abs() / (variable.upper_bound - variable.lower_bound))
-        .sum()
+        .map(|(variable, (x, y))| {
+            let scaled = (x - y) / (variable.upper_bound - variable.lower_bound);
+            scaled * scaled
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[pollster::test]
-async fn a_half_space_is_entered_along_its_steep_coordinate() -> anyhow::Result<()> {
-    // `2*x1 + x2 < 1` from (1, 1). Moving `x1` alone reaches the boundary at
-    // `x1 = 0`, a cost of 1; moving `x2` alone needs `x2 = -1`, a cost of 2.
-    // The L1 projection is the first, and nothing about the second coordinate
-    // should change at all.
+async fn a_half_space_is_entered_along_its_normal() -> anyhow::Result<()> {
+    // `2*x1 + x2 < 1` from (1, 1). The foot of the perpendicular is
+    // (0.2, 0.6): both coordinates move, in the ratio of the normal. The
+    // clamp alone would move `x1` to 0 and leave `x2` — a cost of 1 against
+    // the foot's 0.894 — and the projection from that landing slides it
+    // along the wall to the foot.
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
         &["2*x1 + x2 < 1"],
@@ -142,19 +148,20 @@ async fn a_half_space_is_entered_along_its_steep_coordinate() -> anyhow::Result<
         holds(&system, &repaired),
         "{repaired:?} violates the half-space"
     );
-    assert_eq!(repaired[1], 1.0, "the cheap coordinate was left alone");
     assert!(
-        repaired[0] < 0.0 && repaired[0] > -1e-9,
-        "x1 should land just inside the boundary at 0, got {}",
-        repaired[0]
+        (repaired[0] - 0.2).abs() < 1e-4 && (repaired[1] - 0.6).abs() < 1e-4,
+        "the foot of the normal is (0.2, 0.6), got {repaired:?}"
     );
     Ok(())
 }
 
 #[pollster::test]
-async fn a_disc_is_entered_where_the_diamond_touches_it() -> anyhow::Result<()> {
-    // From (2, 0.5) the L1 ball grows as a diamond, and its vertex reaches the
-    // unit disc at (sqrt(0.75), 0.5) before any edge does. Only `x` moves.
+async fn a_disc_is_entered_radially() -> anyhow::Result<()> {
+    // From (2, 0.5) the nearest point of the unit disc is straight toward
+    // its centre: (2, 0.5) / sqrt(4.25). The clamp alone lands at
+    // (sqrt(0.75), 0.5) — `y` already in range, only `x` moved — which is
+    // where the L1 diamond touches the disc, 0.14 farther than the radial
+    // point.
     //
     // Written with `sqr`; the next fixture is the same disc spelled `x^2`.
     let system = system(
@@ -171,15 +178,11 @@ async fn a_disc_is_entered_where_the_diamond_touches_it() -> anyhow::Result<()> 
         holds(&system, &repaired),
         "{repaired:?} is outside the disc"
     );
-    assert_eq!(
-        repaired[1], 0.5,
-        "y was already in range and should not move"
-    );
-    let expected = 0.75_f64.sqrt();
+    let scale = 4.25_f64.sqrt();
     assert!(
-        repaired[0] < expected && expected - repaired[0] < 1e-6,
-        "x should land just inside the circle at {expected}, got {}",
-        repaired[0]
+        (repaired[0] - 2.0 / scale).abs() < 1e-4 && (repaired[1] - 0.5 / scale).abs() < 1e-4,
+        "the radial point is {:?}, got {repaired:?}",
+        [2.0 / scale, 0.5 / scale]
     );
     Ok(())
 }
@@ -187,11 +190,8 @@ async fn a_disc_is_entered_where_the_diamond_touches_it() -> anyhow::Result<()> 
 #[pollster::test]
 async fn a_disc_spelled_with_a_power_is_entered_the_same_way() -> anyhow::Result<()> {
     // `x^2` is how every optimizer formulation spells it. Narrowing inverts a
-    // whole power through its root, so the clamp finds the landing the `sqr`
-    // spelling finds. Before it did, the front end had expanded `x^2` into a
-    // product fold nothing could invert, and without an interval for `x` this
-    // fell to the chord from the origin and landed on the radial point —
-    // feasible, but a tenth farther in L1 than the answer.
+    // whole power through its root, so the clamp's warm start is the one the
+    // `sqr` spelling gets, and the projection lands the same radial point.
     let system = system(
         variables(&[("x", -2.0, 2.0), ("y", -2.0, 2.0)]),
         &["x^2 + y^2 < 1"],
@@ -206,15 +206,11 @@ async fn a_disc_spelled_with_a_power_is_entered_the_same_way() -> anyhow::Result
         holds(&system, &repaired),
         "{repaired:?} is outside the disc"
     );
-    assert_eq!(
-        repaired[1], 0.5,
-        "y was already in range and should not move"
-    );
-    let expected = 0.75_f64.sqrt();
+    let scale = 4.25_f64.sqrt();
     assert!(
-        repaired[0] < expected && expected - repaired[0] < 1e-6,
-        "x should land just inside the circle at {expected}, got {}",
-        repaired[0]
+        (repaired[0] - 2.0 / scale).abs() < 1e-4 && (repaired[1] - 0.5 / scale).abs() < 1e-4,
+        "the radial point is {:?}, got {repaired:?}",
+        [2.0 / scale, 0.5 / scale]
     );
     Ok(())
 }
@@ -223,8 +219,10 @@ async fn a_disc_spelled_with_a_power_is_entered_the_same_way() -> anyhow::Result
 async fn a_driven_coordinate_is_not_privileged() -> anyhow::Result<()> {
     // `2*x1 + x2 == 3 +/- 0.001` from (3, 3). Driving `x2` to satisfy the
     // equality moves it to -2.999, a cost of 6; clamping `x1` moves it to
-    // 0.0005, a cost of 3. The equality classifies as driven, and repair must
-    // still pick the cheaper coordinate rather than the computed one.
+    // 0.0005, a cost of 3; the foot of the perpendicular on the slab's near
+    // face, (0.6, 1.8) shifted by the band, costs 2.68 and is the answer.
+    // The equality classifies as driven, and repair must still land the
+    // nearest point rather than the computed one.
     let system = system(
         variables(&[("x1", -5.0, 5.0), ("x2", -5.0, 5.0)]),
         &["2*x1 + x2 == 3 +/- 0.001"],
@@ -239,14 +237,12 @@ async fn a_driven_coordinate_is_not_privileged() -> anyhow::Result<()> {
         holds(&system, &repaired),
         "{repaired:?} is outside the slab"
     );
-    assert_eq!(
-        repaired[1], 3.0,
-        "x2 is the expensive coordinate and should not move"
-    );
+    // The near face is `2 x1 + x2 = 3.001`; its foot from (3, 3) is
+    // (3, 3) - (5.999 / 5) (2, 1).
+    let foot = [3.0 - 2.0 * 5.999 / 5.0, 3.0 - 5.999 / 5.0];
     assert!(
-        (repaired[0] - 0.0005).abs() < 1e-6,
-        "x1 should land at the slab's edge near 0.0005, got {}",
-        repaired[0]
+        (repaired[0] - foot[0]).abs() < 1e-3 && (repaired[1] - foot[1]).abs() < 1e-3,
+        "the foot of the normal on the near face is {foot:?}, got {repaired:?}"
     );
     Ok(())
 }
@@ -430,10 +426,10 @@ async fn repair_holds_its_contract_over_a_polytope() -> anyhow::Result<()> {
                 "{point:?} -> {repaired:?} then {twice:?}: not deterministic"
             ));
         }
-        let moved = normalised_l1(&system, &point, &repaired);
+        let moved = normalised_l2(&system, &point, &repaired);
         let nearest = clear_census
             .iter()
-            .map(|sample| normalised_l1(&system, &point, sample))
+            .map(|sample| normalised_l2(&system, &point, sample))
             .fold(f64::INFINITY, f64::min);
         if moved > nearest {
             complaints.push(format!(
@@ -552,9 +548,10 @@ async fn a_feasible_point_is_returned_untouched() -> anyhow::Result<()> {
 
 #[pollster::test]
 async fn a_half_space_is_entered_clear_of_its_wall() -> anyhow::Result<()> {
-    // The steep-coordinate fixture again, asked for a thousandth of the box.
-    // `x1` lands `CLEARANCE * 4` inside the wall at 0 rather than on it, `x2`
-    // still does not move, and every axis neighbour at that distance holds.
+    // The normal fixture again, asked for a thousandth of the box. The
+    // landing is the foot (0.2, 0.6) stepped inside so that every axis
+    // neighbour `CLEARANCE * 4` away holds: at least that far from the wall
+    // along the coordinate the wall is steepest in.
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
         &["2*x1 + x2 < 1"],
@@ -569,12 +566,10 @@ async fn a_half_space_is_entered_clear_of_its_wall() -> anyhow::Result<()> {
         has_clearance(&system, &repaired, CLEARANCE),
         "{repaired:?} lacks the clearance"
     );
-    assert_eq!(repaired[1], 1.0, "the cheap coordinate was left alone");
-    let expected = -CLEARANCE * 4.0;
+    let off_the_foot = ((repaired[0] - 0.2).powi(2) + (repaired[1] - 0.6).powi(2)).sqrt();
     assert!(
-        (repaired[0] - expected).abs() < 1e-12,
-        "x1 should land {expected} inside the wall at 0, got {}",
-        repaired[0]
+        off_the_foot < 4.0 * CLEARANCE * 4.0,
+        "should land within a few clearances of the foot (0.2, 0.6), got {repaired:?}"
     );
     Ok(())
 }
@@ -708,7 +703,7 @@ async fn a_feasible_point_without_clearance_is_moved_inward() -> anyhow::Result<
         has_clearance(&system, &repaired, CLEARANCE),
         "{repaired:?} lacks the clearance"
     );
-    let moved = normalised_l1(&system, &point, &repaired);
+    let moved = normalised_l2(&system, &point, &repaired);
     assert!(
         moved <= 2.0 * CLEARANCE + 1e-12,
         "{point:?} -> {repaired:?} moved {moved}, more than the clearance per coordinate"

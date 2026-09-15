@@ -21,9 +21,10 @@
 //! // `take` waits for them, `try_take` does not.
 //! let samples = region.take(256);
 //!
-//! // A point that is not a sample, brought onto the region near where it
-//! // was, `1e-12` box widths inside every wall. A function of the system,
-//! // the point and the clearance alone.
+//! // A point that is not a sample, brought onto the region at the nearest
+//! // feasible point (Euclidean, over box-normalised coordinates), `1e-12`
+//! // box widths inside every wall. A function of the system, the point
+//! // and the clearance alone.
 //! let repaired = region.repair(&[1.5, 1.5], 1e-12)?;
 //! # let _ = (samples, repaired);
 //! # Ok(())
