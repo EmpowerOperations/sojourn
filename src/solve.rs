@@ -614,9 +614,11 @@ impl FeasibleRegion {
     /// `ceil`, `sgn`, `%`, a computed subscript) — so a step over a wall is
     /// put back where it stepped from rather than slid along the wall to
     /// wherever one coordinate could reach. A constraint flat where the
-    /// point stands is walked in from a reference point found under a fixed
-    /// seed. Microseconds at fifty variables in a release build where the
-    /// gradients apply; the derivative-free fallback is tenths of a second.
+    /// point stands, or with a jump in it, is walked in from a reference
+    /// point found under a fixed seed and sampled around under another, so a
+    /// region that can be sampled is landed near. Microseconds at fifty
+    /// variables in a release build where the gradients apply; the
+    /// derivative-free fallbacks are milliseconds to tenths of a second.
     ///
     /// `clearance` is the room kept from every wall, as a fraction of each
     /// variable's box width: the result and each of its `2d` axis neighbours

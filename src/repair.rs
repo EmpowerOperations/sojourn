@@ -92,8 +92,28 @@
 //! and the projection then runs from that landing, where the constraint is
 //! well-scaled again, so the reference decides only which basin the answer is
 //! in and never where in it. Reached only when the projection from the point
-//! itself saw nothing feasible; `Stranded` now means the seed search found
-//! nothing either.
+//! itself saw nothing feasible.
+//!
+//! **Sample.** Whenever Newton declined — off the smooth path — beside the
+//! derivative-free solve: a box around the point, uniform draws in it judged
+//! one by one with their driven coordinates put on their surfaces, the box
+//! doubled while it holds nothing and shrunk onto the nearest hit once it
+//! does, for a fixed number of rounds; then the chord from the nearest hit
+//! toward the point. The backstop that needs no slice, no gradient and no
+//! continuity — only a region fat enough to sample over its free
+//! coordinates — which is exactly what a constraint with a *jump* in it
+//! leaves: `floor`, `%`, `sgn` defeat the clamp and Newton, COBYLA's landing
+//! is then wherever its evaluations happened to fall feasible, and a chord
+//! from the reference lands wherever it crossed in — 0.40 of the box away on
+//! a comb whose nearest cell sat at 0.20, 0.235 on a checkerboard whose
+//! nearest sat at 0.007, ten units away on a checkerboard beside a driven
+//! product (`tests/cvg_repair.rs`, the ball oracle across a jump). Sampling
+//! around the point finds the nearest cell, and the aggregator takes the
+//! nearer of it and the solver's. It cannot localise a thin region, and it
+//! cannot localise anything past a handful of dimensions; both of those are
+//! the projection's, which is why it waits for Newton to decline. Its draws
+//! come from a fixed seed, for the reason the reference's do. `Stranded`
+//! means the box and the seed search both found nothing.
 //!
 //! **Release.** Every stage can move a coordinate that, in hindsight, did not
 //! need to move — a clamp computed against a neighbour that then moved too, a
@@ -150,17 +170,20 @@
 //!
 //! # What is deliberately not here
 //!
-//! No randomness — not a draw, not a seed. No finite differences: the
+//! No randomness the caller can see: the draws the reference and the
+//! sampling box make come from constant seeds, so the answer is a function
+//! of the system, the point and the clearance. No finite differences: the
 //! gradients Newton reads are the tape's own reverse sweep, exact, and a
 //! constraint without one declines rather than being approximated at a
 //! vertex where an approximation is ill-defined. No anchors: nothing the
 //! caller has seen elsewhere may influence where a point lands, for the
-//! reason above. No brute force: it cannot localise in high dimension, and it
-//! would re-solve the find-a-first-point problem the whole module is built
-//! around on every call.
+//! reason above. No brute force *first*: it cannot localise a thin region
+//! or a high-dimensional one, and on the cases the projection handles it
+//! would re-solve the find-a-first-point problem on every call; it is the
+//! last stage, for the cases nothing else can read.
 
-use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
+use rand::{RngExt, SeedableRng};
 
 use crate::cvg::incidence::Row;
 use crate::cvg::{Cancellation, classify, interval, local, newton};
@@ -191,6 +214,24 @@ const CHORD_BITS: usize = 60;
 /// reason they are gone. The first start is the box centre and needs no
 /// draw; this seeds the ones after it.
 const REFERENCE_SEED: u64 = 0x5E_ED_0F_1D;
+
+/// The seed the sampling box draws from: a constant, for the same reason as
+/// [`REFERENCE_SEED`].
+const SAMPLING_SEED: u64 = 0xB0_0B_0F_5A;
+
+/// Rounds the sampling box gets: each doubles the box when it held nothing
+/// and shrinks it onto the nearest hit when it did.
+///
+/// The box starts at a sixty-fourth of every width and doubles to the whole
+/// declared box in six rounds; the rest shrink. Twenty is far past where
+/// shrinking stops finding nearer points at this many draws.
+const SAMPLING_ROUNDS: usize = 20;
+
+/// Draws per round of the sampling box, judged one by one.
+const SAMPLING_DRAWS: usize = 256;
+
+/// Where the sampling box starts, as a fraction of every width.
+const SAMPLING_RADIUS: f64 = 1.0 / 64.0;
 
 /// How far inward a landing may nudge, as a power of two in ulps.
 ///
@@ -312,11 +353,21 @@ pub(crate) fn repair(
             point,
             clearance,
         ));
+
+        // Off the smooth path — a constraint with a jump in it, or one too
+        // curved for Newton — a derivative-free landing may be anywhere the
+        // solver's evaluations happened to fall feasible; the sampling box
+        // around the point is the second opinion, and the aggregator picks.
+        // See the module doc.
+        if let Some(hit) = sampled(system, &widths, point, clearance) {
+            let chord = along_chord(system, &hit, point);
+            landings.extend(off_the_boundary(system, &widths, chord, point, clearance));
+        }
     }
 
-    // Nothing feasible seen: a constraint flat where the point stands, which
-    // no slice and no linear model can read. Walk in from a reference point
-    // instead — see the module doc for why this is not the anchors back.
+    // Nothing feasible seen at all: a constraint flat where the point
+    // stands, which no slice, no linear model and no box around the point
+    // can read. Walk in from a reference point instead — see the module doc.
     if landings.is_empty() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(REFERENCE_SEED);
         let reference = local::find_initial(
@@ -495,6 +546,63 @@ fn off_the_boundary(
     } else {
         None
     }
+}
+
+/// The nearest feasible point the sampling box finds around `point`: uniform
+/// draws in a box centred on it, the box doubled while it holds nothing and
+/// shrunk onto the nearest hit once it does, for a fixed number of rounds.
+///
+/// The backstop that needs no slice, no gradient and no continuity — only
+/// that the region be fat enough to sample *over the free coordinates*: a
+/// driven equality is not sampled but computed, every draw's driven
+/// coordinates put at the middle of their bands, so a band a millionth
+/// wide costs nothing. Draws are judged with the clearance. A hit is the box's answer;
+/// the chord from it toward the point refines along that one ray. Nothing
+/// past a handful of dimensions localises this way, and it is reached only
+/// when every stage that could has declined.
+fn sampled(
+    system: &ConstraintSystem,
+    widths: &[f64],
+    point: &[f64],
+    clearance: f64,
+) -> Option<Point> {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SAMPLING_SEED);
+    let mut radius = SAMPLING_RADIUS;
+    let mut best: Option<(f64, Point)> = None;
+    for _ in 0..SAMPLING_ROUNDS {
+        let mut found = false;
+        for _ in 0..SAMPLING_DRAWS {
+            let mut draw: Point = point
+                .iter()
+                .zip(widths)
+                .zip(system.variables())
+                .map(|((centre, width), variable)| {
+                    let step = radius * width;
+                    rng.random_range(centre - step..=centre + step)
+                        .clamp(variable.lower_bound, variable.upper_bound)
+                })
+                .collect();
+            // Driven coordinates onto their surfaces, at the middle of the
+            // band: a clamp to its edge lands an ulp outside and every draw
+            // fails, which is how a jump beside a driven equality stranded.
+            classify::centre(system, &mut draw);
+            if !system.is_feasible(&draw, clearance) {
+                continue;
+            }
+            found = true;
+            let at = distance(widths, &draw, point);
+            if best.as_ref().is_none_or(|(nearest, _)| at < *nearest) {
+                best = Some((at, draw));
+            }
+        }
+        radius = match &best {
+            // Shrink onto the nearest hit: it sits on the box's boundary.
+            Some((nearest, _)) if found => *nearest,
+            Some((nearest, _)) => nearest.min(radius),
+            None => (radius * 2.0).min(1.0),
+        };
+    }
+    best.map(|(_, hit)| hit)
 }
 
 /// The last feasible point along the segment from `reference` to `point`,

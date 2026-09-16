@@ -2738,10 +2738,26 @@ the ball of the repair's own radius, none feasible with the clearance may be nea
 test and not a stage because uniform points in a ball localise nothing past a handful of
 dimensions. It earned its keep on the first run.
 
-Follow-ups: the batched Jacobian (`CompiledGradient::eval`, written, unused) and the public
-`gradient` for Artemis's own gradient solvers — the latter one line when asked; `prune` over
-a ball as the low-dimensional global check; a true Newton with the constraint Hessians if
-the linear rate ever shows.
+Follow-ups: `prune` over a ball as the low-dimensional global check; a true Newton with the
+constraint Hessians if the linear rate ever shows.
+
+**2026-09-15, later still: the sampling box.** A hunt for a fixture every stage strands on
+found none — the reference path's feasibility search is hard to defeat on a fat region — but
+found the failure that matters instead: on a constraint with a jump (`floor`, `%`, `sgn`)
+every projector declines and the chord from the reference lands *wherever it crossed in*:
+0.40 of the box from the proposal on `floor(x1·100) % 7 == 0` where a cell sat at 0.20; 0.235
+on a two-comb checkerboard where one sat at 0.007. The ball oracle over jump shapes is the
+red test (`no_point_in_the_repairs_own_ball_is_nearer_across_a_jump`, allowance 5 % — a
+sampling method's, not a projection's). The backstop is the box you described: uniform
+draws around the point under `SAMPLING_SEED`, doubled from a sixty-fourth of the box while
+empty, shrunk onto the nearest hit once not, twenty rounds of 256 draws, then the chord from
+the nearest hit toward the point and the usual step off the wall. It runs beside the
+reference — only when clamp, Newton and COBYLA all produced nothing — and the aggregator
+picks. The comb now lands at 2.016 where the nearest cell is 2.000 away, the checkerboard at
+0.05 where the oracle's best was 0.07; about 20 ms a repair unoptimised on this path. The
+earlier rejection of a shrinking box stands for what it was about — thin regions, high
+dimension, and as the *first* mechanism; those are the projection's now. Nothing in this
+crate reaches `Stranded` on a fat region any more.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

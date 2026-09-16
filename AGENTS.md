@@ -295,7 +295,10 @@ where a biting constraint has no derivative or Newton did not converge —
 unless the clamp's landing is separable (bounds), where the axis projection
 already is the Euclidean one. A constraint flat where the point stands is
 walked in from a reference found by `local::find_initial` under a fixed seed,
-then projected. **Gradients are reverse-mode over the virtual tape**, one
+then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
+sampled around, a box doubling and shrinking under another fixed seed — the
+backstop for "if it can be sampled it is landed near", last because it cannot
+localise a thin or high-dimensional region. **Gradients are reverse-mode over the virtual tape**, one
 rule per instruction beside the instruction set, every partial from one
 backward sweep at a fixed multiple of an evaluation; a tape holding `floor`,
 `ceil`, `sgn`, `%` or a computed subscript has no gradient and everything

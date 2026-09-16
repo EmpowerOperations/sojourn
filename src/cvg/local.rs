@@ -331,18 +331,29 @@ impl CostFunction for &Landing<'_> {
 
     fn cost(&self, unit: &Vec<f64>) -> Result<f64, Infallible> {
         let point = self.cube.denormalised(unit);
-        let residuals = residuals(self.problem, &point);
-        let worst = residuals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let total: f64 = residuals.iter().sum();
+        let total: f64 = residuals(self.problem, &point).iter().sum();
 
-        // Judged here rather than trusted from the solver: inside the box,
-        // every residual `<= 0`, nothing non-finite — the oracle's own rule.
-        // The first such point ends the run.
-        let inside = unit.iter().all(|u| (0.0..=1.0).contains(u));
+        // Judged here rather than trusted from the solver, and judged with
+        // its driven coordinates put on their surfaces: a band a millionth
+        // wide is one COBYLA's steps never land in and `centre` lands in
+        // every time, so the candidate is the centred point and the cost is
+        // still the raw one, which is what the solver's models are of.
+        // Inside the box, every residual `<= 0`, nothing non-finite — the
+        // oracle's own rule. The first such point ends the run.
+        let mut candidate = point;
+        classify::centre(self.problem, &mut candidate);
+        let judged = residuals(self.problem, &candidate);
+        let worst = judged.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let inside = self
+            .problem
+            .variables
+            .iter()
+            .zip(&candidate)
+            .all(|(variable, value)| variable.contains(*value));
         if inside && worst <= 0.0 {
             let mut best = self.best.borrow_mut();
             if best.as_ref().is_none_or(|(deepest, _)| worst < *deepest) {
-                *best = Some((worst, point));
+                *best = Some((worst, candidate));
             }
             self.stop.set(true);
         }
