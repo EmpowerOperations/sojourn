@@ -2253,7 +2253,9 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       not declare) needs the problem and is still checked in `solve`. `Strategy`,
       `with_strategies` and `with_rng` stay `#[doc(hidden)]`: which strategy runs is the module's
       decision, and `Route` makes most of it at runtime from a probe rather than from
-      configuration.
+      configuration. (Later, 2026-09-16: the rng left the builder again — it was never a
+      setting with a default but the caller's stream, so it is a parameter of `solve`; see
+      "The rng at the API". `with_rng` is gone.)
       Tests drive it with `#[pollster::test]` — a dev-dependency, so nothing propagates to
       consumers. Chosen over `#[tokio::test]` because the body is synchronous and a reactor buys
       nothing, and because the crate's own tests then stand as proof that no runtime is required.
@@ -3024,10 +3026,24 @@ every candidate; an axis move can change four of 201). In order of expected payo
 - [ ] **Batch the shrink loop.** Judge several draws along the chord through the SIMD tile
       at once and take the first feasible in order; where the "SIMD × cores" question (rayon
       for brute force, a parked global pool or a per-call one) would land.
-- [ ] **The rng at the API.** A seed on the builder *and* on `sample` is unidiomatic;
+- [x] **The rng at the API.** A seed on the builder *and* on `sample` was unidiomatic;
       `solve(&system, &mut rng)`, `sample(existing, count, &mut rng)` — and `repair` needs
       none — is the standard shape, and makes "same generator state, same answer" the
-      caller's contract. Deferred until the surface settles.
+      caller's contract. Done 2026-09-16: `with_seed`/`with_rng` and the OS-entropy default
+      are gone, the builder is settings only and `Clone`, `solve` takes `&self`. Each door
+      draws one `Xoshiro256PlusPlus::from_rng(rng)` and the engine is as it was — nothing
+      past the boundary is generic, and the caller's generator advances by thirty-two bytes
+      per call whatever the search spends. `rand` is re-exported (`sojourn::rand`) since
+      `Rng` in the signature makes it a public dependency. The two constant seeds went too:
+      `REFERENCE_SEED` guarded a "function of the system alone" that did not hold (the
+      opening's own local solve, which usually *is* the reference, drew from the caller's
+      stream already), and a rule for "parameter here, constant there" was a paragraph to
+      justify. Now the region keeps one stream from the ladder, drawn last; the reference's
+      extra starts draw from it at `solve` and every repair's sampling box draws from a
+      clone, so a repair is a function of the region, the point and the clearance, and
+      everything the region does is a function of the region. Every seeded fixture's stream
+      changed once (the engine now seeds from drawn bytes rather than `seed_from_u64`
+      directly); no verdict moved.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

@@ -20,6 +20,8 @@ mod common;
 
 use anyhow::Context;
 use faer::Mat;
+use rand::SeedableRng;
+use rand::rngs::Xoshiro256PlusPlus;
 use sojourn::{
     ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable, Strategy,
 };
@@ -66,19 +68,23 @@ fn in_box(system: &ConstraintSystem, point: &[f64]) -> bool {
 }
 
 /// The solver every fixture here starts from: the test-sized budget, the CPU
-/// alone so the verdict is a function of the seed, and the seed.
+/// alone so the verdict is a function of the generator's state.
 fn solver() -> ConstraintSolver {
     ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_seed(SEED)
+}
+
+/// The generator every solve here draws from.
+fn rng() -> Xoshiro256PlusPlus {
+    Xoshiro256PlusPlus::seed_from_u64(SEED)
 }
 
 /// The region a solve returns, which is where `repair` lives. The fixture
 /// below hands it its own anchor, so the census is not what is being tested.
 fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
     solver()
-        .solve(system)
+        .solve(system, &mut rng())
         .context("the fixture should be satisfiable")
 }
 
@@ -96,10 +102,10 @@ fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()> {
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
     )?;
     let samples = solver()
-        .solve(&system)
+        .solve(&system, &mut rng())
         .context("a curve that sampling can reach should be found")?;
 
-    let points = samples.sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?;
+    let points = samples.sample(Mat::zeros(0, 0).as_ref(), WANTED, &mut rng())?;
     assert_eq!(points.ncols(), WANTED, "the stream ended early");
     for column in 0..points.ncols() {
         let point: Vec<f64> = (0..points.nrows())
@@ -119,7 +125,7 @@ fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()> {
 fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Result<()> {
     let source = "x1^1.234 > 1000000";
     let system = system(&[("x1", 0.0, 10.0)], &[source])?;
-    let verdict = solver().solve(&system);
+    let verdict = solver().solve(&system, &mut rng());
 
     let Err(because) = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
@@ -148,7 +154,7 @@ fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0), ("n", 1.0, 2.0)],
         &[source],
     )?;
-    let verdict = solver().solve(&system);
+    let verdict = solver().solve(&system, &mut rng());
 
     let Err(because) = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
@@ -179,9 +185,9 @@ fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
     )?;
     let region = solver()
         .with_strategies(vec![Strategy::LocalSolve, Strategy::HitAndRun])
-        .solve(&system)
+        .solve(&system, &mut rng())
         .context("the band is not empty")?;
-    let points = region.sample(Mat::zeros(0, 0).as_ref(), 4, SEED)?;
+    let points = region.sample(Mat::zeros(0, 0).as_ref(), 4, &mut rng())?;
     assert_eq!(
         points.ncols(),
         4,
@@ -263,7 +269,7 @@ fn a_chain_of_ninety_nine_equalities_is_matched_and_walked() -> anyhow::Result<(
 
     let started = std::time::Instant::now();
     let region = region(&system)?;
-    let design = region.sample(Mat::zeros(0, 0).as_ref(), 16, SEED)?;
+    let design = region.sample(Mat::zeros(0, 0).as_ref(), 16, &mut rng())?;
     let took = started.elapsed();
 
     assert_eq!(design.ncols(), 16);

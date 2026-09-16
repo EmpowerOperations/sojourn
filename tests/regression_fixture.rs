@@ -8,6 +8,8 @@
 mod common;
 
 use faer::Mat;
+use rand::SeedableRng;
+use rand::rngs::Xoshiro256PlusPlus;
 use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Strategy};
 
 /// The design seed, where a fixture asks for one; the solve seed is the
@@ -46,9 +48,14 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
 
     #[test]
     fn seed_2_streams_the_whole_request() -> anyhow::Result<()> {
-        let region = ConstraintSolver::new().with_seed(2).solve(&system()?)?;
+        let region =
+            ConstraintSolver::new().solve(&system()?, &mut Xoshiro256PlusPlus::seed_from_u64(2))?;
         let got = region
-            .sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?
+            .sample(
+                Mat::zeros(0, 0).as_ref(),
+                WANTED,
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            )?
             .ncols();
 
         assert_eq!(
@@ -62,9 +69,14 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
     #[test]
     fn every_other_seed_streams_the_same_slab() -> anyhow::Result<()> {
         for seed in (0..10u64).filter(|s| *s != 2) {
-            let region = ConstraintSolver::new().with_seed(seed).solve(&system()?)?;
+            let region = ConstraintSolver::new()
+                .solve(&system()?, &mut Xoshiro256PlusPlus::seed_from_u64(seed))?;
             let got = region
-                .sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?
+                .sample(
+                    Mat::zeros(0, 0).as_ref(),
+                    WANTED,
+                    &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+                )?
                 .ncols();
             assert_eq!(got, WANTED, "seed {seed} ended early");
         }
@@ -147,8 +159,10 @@ mod repair_lands_too_close_at_a_vertex {
     /// The solved region, which is where `repair` lives.
     fn region() -> anyhow::Result<FeasibleRegion> {
         ConstraintSolver::new()
-            .with_seed(0x50_50_1E_5E_ED)
-            .solve(&system()?)
+            .solve(
+                &system()?,
+                &mut Xoshiro256PlusPlus::seed_from_u64(0x50_50_1E_5E_ED),
+            )
             .context("the spring should be satisfiable")
     }
 
@@ -247,10 +261,15 @@ mod census_does_not_return_on_the_20_segment_beam {
     #[test]
     fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
         let region = ConstraintSolver::new()
-            .with_seed(0)
-            .solve(&stepped_beam(5)?)?;
+            .solve(&stepped_beam(5)?, &mut Xoshiro256PlusPlus::seed_from_u64(0))?;
         assert_eq!(
-            region.sample(Mat::zeros(0, 0).as_ref(), 256, SEED)?.ncols(),
+            region
+                .sample(
+                    Mat::zeros(0, 0).as_ref(),
+                    256,
+                    &mut Xoshiro256PlusPlus::seed_from_u64(SEED)
+                )?
+                .ncols(),
             256
         );
         Ok(())
@@ -269,11 +288,18 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// A test that needs its own timeout is a test at the wrong size.
     #[test]
     fn the_10_segment_beam_census_returns() -> anyhow::Result<()> {
-        let region = ConstraintSolver::new()
-            .with_seed(0)
-            .solve(&stepped_beam(10)?)?;
+        let region = ConstraintSolver::new().solve(
+            &stepped_beam(10)?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(0),
+        )?;
         assert_eq!(
-            region.sample(Mat::zeros(0, 0).as_ref(), 256, SEED)?.ncols(),
+            region
+                .sample(
+                    Mat::zeros(0, 0).as_ref(),
+                    256,
+                    &mut Xoshiro256PlusPlus::seed_from_u64(SEED)
+                )?
+                .ncols(),
             256
         );
         Ok(())
@@ -287,7 +313,7 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// What that coverage should be after a local seed is the next question
     /// (`docs/todo.md`); these tests pin what the seed itself costs.
     fn without_the_solver() -> ConstraintSolver {
-        ConstraintSolver::new().with_seed(0).with_strategies(vec![
+        ConstraintSolver::new().with_strategies(vec![
             Strategy::BruteSquad,
             Strategy::LocalSolve,
             Strategy::HitAndRun,
@@ -301,7 +327,10 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// 95 s before the first one, so this test asks for the opening alone.
     #[test]
     fn the_100_segment_beam_opens_by_local_solve() -> anyhow::Result<()> {
-        let verdict = without_the_solver().solve(&stepped_beam(100)?);
+        let verdict = without_the_solver().solve(
+            &stepped_beam(100)?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(0),
+        );
         assert!(
             verdict.is_ok(),
             "the beam is not empty (b = 5, h = 100 is feasible), yet: {verdict:?}"
@@ -314,9 +343,18 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// a debug build, most of it the walker's burn-in.
     #[test]
     fn the_30_segment_beam_census_returns_from_a_local_seed() -> anyhow::Result<()> {
-        let region = without_the_solver().solve(&stepped_beam(30)?)?;
+        let region = without_the_solver().solve(
+            &stepped_beam(30)?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(0),
+        )?;
         assert_eq!(
-            region.sample(Mat::zeros(0, 0).as_ref(), 64, SEED)?.ncols(),
+            region
+                .sample(
+                    Mat::zeros(0, 0).as_ref(),
+                    64,
+                    &mut Xoshiro256PlusPlus::seed_from_u64(SEED)
+                )?
+                .ncols(),
             64
         );
         Ok(())
@@ -370,8 +408,7 @@ mod repair_lands_axis_aligned_not_nearest {
 
     fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
         ConstraintSolver::new()
-            .with_seed(7)
-            .solve(system)
+            .solve(system, &mut Xoshiro256PlusPlus::seed_from_u64(7))
             .context("the fixture should be satisfiable")
     }
 
@@ -642,8 +679,10 @@ mod repair_strands_on_a_product_constraint {
     fn is_repaired(n: usize, point: &[f64]) -> anyhow::Result<()> {
         let system = keane(n)?;
         let region = ConstraintSolver::new()
-            .with_seed(0x50_50_1E_5E_ED)
-            .solve(&system)
+            .solve(
+                &system,
+                &mut Xoshiro256PlusPlus::seed_from_u64(0x50_50_1E_5E_ED),
+            )
             .context("Keane's region is nearly the whole box")?;
         let lifted = lifted(point);
         assert!(
@@ -736,7 +775,8 @@ mod a_wall_coordinate_in_no_constraint_stays_put {
 
     fn lands_nearest(n: usize, proposal: &[f64]) -> anyhow::Result<()> {
         let system = slab(n)?;
-        let region = ConstraintSolver::new().with_seed(7).solve(&system)?;
+        let region =
+            ConstraintSolver::new().solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(7))?;
         let repaired = match region.repair(proposal, CLEARANCE) {
             Ok(repaired) => repaired,
             Err(RepairError::Cramped { nearest, .. }) => nearest,

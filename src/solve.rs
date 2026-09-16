@@ -1,10 +1,10 @@
 //! The solve: a builder for how hard to search, and the region a search
 //! hands back.
 //!
-//! [`ConstraintSolver`] is every knob — the seed, the budgets, the strategy
-//! list — with a default for each, and one call,
-//! [`solve`](ConstraintSolver::solve), that runs the engine's opening to a
-//! verdict. [`FeasibleRegion`] is what a satisfied search returns: the
+//! [`ConstraintSolver`] is every knob — the budgets, the strategy list —
+//! with a default for each, and one call, [`solve`](ConstraintSolver::solve),
+//! that runs the engine's opening to a verdict under a generator the caller
+//! hands in. [`FeasibleRegion`] is what a satisfied search returns: the
 //! system it was solved over and the feasible points the opening found, from
 //! which a space-filling design is [`sample`](FeasibleRegion::sample)d and
 //! any point is [`repair`](FeasibleRegion::repair)ed. The verdicts say what a
@@ -12,23 +12,14 @@
 //! itself is `cvg`.
 
 use faer::{Mat, MatRef};
-use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
+use rand::{Rng, SeedableRng};
 
 use crate::cvg;
 use crate::cvg::walking::HitAndRunWalker;
 use crate::cvg::{Ladder, Opening, local};
 use crate::repair::RepairError;
 use crate::{ConstraintRef, ConstraintSystem, Point};
-
-/// The seed the reference point's local solve draws its extra starts from,
-/// when the opening did not run one.
-///
-/// A constant, so the reference is a function of the system alone: the same
-/// on every solve, on every machine, whatever the solver's own seed found.
-/// The first start is the box centre and needs no draw; this seeds the ones
-/// after it.
-const REFERENCE_SEED: u64 = 0x5E_ED_0F_1D;
 
 /// Why no sample was produced — and whether that is a proof or a shrug.
 ///
@@ -238,14 +229,16 @@ pub const DEFAULT_GPU_PROPOSAL_BUDGET: u64 = 30_000_000_000;
 /// the variable is set. Only read by builds with the `gpu` feature.
 pub const GPU_VARIABLE: &str = "SOJOURN_GPU";
 
-/// Everything a solve needs beyond the problem itself.
+/// Everything a solve needs beyond the problem and a generator.
 ///
-/// The randomness, any points the caller already believes in, and which
-/// strategies to use — all dependencies, all with defaults. They live here
+/// Any points the caller already believes in, which strategies to use, and
+/// how much each may spend — settings, each with a default. They live here
 /// rather than as parameters because there used to be three entry points
-/// (`solve`, `solve_with_rng`, `solve_with`) that differed only in how many of
-/// these they let you reach, and two of the three existed purely so the tests
-/// could get past the first.
+/// (`solve`, `solve_with_rng`, `solve_with`) that differed only in how many
+/// of them they let you reach. The generator is not among them: it is the
+/// caller's stream, not a setting with a default, and so it is a parameter
+/// of [`solve`](Self::solve) — seed one for a run, thread it through every
+/// call, and the run is reproducible.
 ///
 /// Construction cannot fail: nothing held here can be invalid on its own. What
 /// *can* be invalid — a constraint naming a variable the box does not declare —
@@ -256,20 +249,17 @@ pub const GPU_VARIABLE: &str = "SOJOURN_GPU";
 /// # fn example() -> anyhow::Result<()> {
 /// let system = ConstraintSystem::new(vec![InputVariable::new("x", -1.0, 1.0)], ["x > 0"])?;
 ///
-/// let region = sojourn::solve(&system)?;
+/// let mut rng = rand::rng();
+/// let region = sojourn::solve(&system, &mut rng)?;
 /// // One column per point, one row per variable — an input matrix as it
 /// // stands, no transpose.
-/// let design = region.sample(faer::Mat::zeros(1, 0).as_ref(), 16, 42)?;
+/// let design = region.sample(faer::Mat::zeros(1, 0).as_ref(), 16, &mut rng)?;
 /// # let _ = design;
 /// # Ok(())
 /// # }
 /// ```
-/// Deliberately not `Clone`, even though its generator is: two solvers sharing
-/// a stream would silently produce the same "random" points, and a `Clone`
-/// here would make that a one-word mistake.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConstraintSolver {
-    rng: Xoshiro256PlusPlus,
     known_feasible: Vec<Point>,
     strategies: Vec<Strategy>,
     budgets: Budgets,
@@ -277,8 +267,9 @@ pub struct ConstraintSolver {
 
 /// How much each rung of the ladder may spend before handing over.
 ///
-/// Every one a count rather than a clock, so that the same seed reaches the
-/// same verdict on every machine; the thread count changes only how soon.
+/// Every one a count rather than a clock, so that the same generator state
+/// reaches the same verdict on every machine; the thread count changes only
+/// how soon.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Budgets {
     /// See [`ConstraintSolver::with_proposal_budget`].
@@ -317,7 +308,6 @@ impl Default for Budgets {
 impl Default for ConstraintSolver {
     fn default() -> Self {
         Self {
-            rng: Xoshiro256PlusPlus::from_rng(&mut rand::rng()),
             known_feasible: Vec::new(),
             strategies: DEFAULT_STRATEGIES.to_vec(),
             budgets: Budgets::default(),
@@ -340,26 +330,6 @@ impl ConstraintSolver {
     #[must_use]
     pub fn with_known_feasible(mut self, points: Vec<Point>) -> Self {
         self.known_feasible = points;
-        self
-    }
-
-    /// Pins the randomness, so a run is reproducible.
-    ///
-    /// What a caller reproducing a run supplies. Every point the opening
-    /// finds is a function of this seed and the budgets, so two solves of
-    /// the same system under the same seed hold the same points. (A design
-    /// takes its own seed, [`sample`](FeasibleRegion::sample);
-    /// [`repair`](FeasibleRegion::repair) needs none.)
-    #[must_use]
-    pub fn with_seed(self, seed: u64) -> Self {
-        self.with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
-    }
-
-    /// Pins the generator itself, for a test that wants a particular stream.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_rng(mut self, rng: Xoshiro256PlusPlus) -> Self {
-        self.rng = rng;
         self
     }
 
@@ -456,10 +426,18 @@ impl ConstraintSolver {
 
     /// Finds a feasible region and hands back the points it found there.
     ///
+    /// Every point the opening finds is a function of `rng`'s state and the
+    /// budgets: two solves of the same system from the same state hold the
+    /// same points, on every machine. The engine draws its own stream from
+    /// `rng` once — thirty-two bytes, whatever the search then spends — so a
+    /// caller's later draws do not shift with a budget. `&mut rand::rng()`
+    /// for entropy; a seeded generator to reproduce a run. (A design draws
+    /// from the caller's generator too, [`sample`](FeasibleRegion::sample);
+    /// [`repair`](FeasibleRegion::repair) draws from none.)
+    ///
     /// Bounded by its budgets and by nothing else: a count of contractions
     /// for branch-and-prune, of evaluations for the local solve, of
-    /// proposals for brute force — never a clock, so the same seed reaches
-    /// the same verdict on every machine. That is also the shape of "this
+    /// proposals for brute force — never a clock. That is also the shape of "this
     /// may take a while": the budgets say how much may be spent, and a
     /// search that spends them without a point is [`Infeasibility::NotFound`]
     /// rather than a call that never returns. Milliseconds on most systems,
@@ -475,9 +453,14 @@ impl ConstraintSolver {
     /// could be found and nothing could be proved — [`Infeasibility`]
     /// says which and names the constraints involved. Nothing else is an
     /// error; see [`Infeasibility`] for what is a panic instead.
-    pub fn solve(self, system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
-        let mut ladder = Ladder::new(system, self.rng, &self.strategies, self.budgets);
-        let (verdict, progress) = cvg::open(system, &mut ladder, self.known_feasible);
+    pub fn solve<R: Rng + ?Sized>(
+        &self,
+        system: &ConstraintSystem,
+        rng: &mut R,
+    ) -> Result<FeasibleRegion, Infeasibility> {
+        let stream = Xoshiro256PlusPlus::from_rng(rng);
+        let mut ladder = Ladder::new(system, stream, &self.strategies, self.budgets);
+        let (verdict, progress) = cvg::open(system, &mut ladder, self.known_feasible.clone());
 
         let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
             indices.into_iter().map(|i| system.named(i)).collect()
@@ -488,10 +471,11 @@ impl ConstraintSolver {
             // the clone is nothing against the search.
             Opening::Satisfied { seeded } => {
                 let points = progress.into_points();
+                let (mut walker, mut kept) = ladder.into_kept();
                 // The reference a flat-constraint repair walks in from: the
                 // local solve's point from the box centre — the opening's own
-                // where it ran one, else one run here under a fixed seed. A
-                // probe hit would do for feasibility but not for this: a
+                // where it ran one, else one run here on the region's stream.
+                // A probe hit would do for feasibility but not for this: a
                 // random point of Keane's region can stand where the product
                 // is already nearly flat, and a chord from there lands the
                 // projection on ground it cannot read (1.3 s against 4 ms
@@ -499,25 +483,20 @@ impl ConstraintSolver {
                 // where no local solve lands.
                 let reference = seeded
                     .or_else(|| {
-                        local::find_initial(
-                            system,
-                            &system.declared(),
-                            local::STARTS,
-                            &mut Xoshiro256PlusPlus::seed_from_u64(REFERENCE_SEED),
-                        )
+                        local::find_initial(system, &system.declared(), local::STARTS, &mut kept)
                     })
                     .unwrap_or_else(|| points[0].clone());
                 // The walker's chains, burnt in once here rather than on
                 // every design: a function of the region, and the one cost
                 // of a solve that is not milliseconds at two hundred
                 // variables.
-                let mut walker = ladder.into_walker();
                 walker.burn_in(&points, system);
                 Ok(FeasibleRegion {
                     system: system.clone(),
                     points,
                     reference,
                     walker,
+                    kept,
                 })
             }
             Opening::Impossible { blamed } => Err(Infeasibility::Proved {
@@ -552,7 +531,9 @@ pub enum SampleError {
 /// A value, immutable: the engine's ladder and its progress lived for the
 /// opening and are gone. What is here is the system, every feasible point the
 /// opening ended with (the witness first), the reference a repair walks in
-/// from, and the walker with its chains already burnt in. From it a
+/// from, the walker with its chains already burnt in, and the one stream the
+/// region draws from after the opening — so everything a region does is a
+/// function of the region, and no constant seed hides anywhere. From it a
 /// space-filling design is [`sample`](Self::sample)d, and a point that
 /// is not one is brought to the region by [`repair`](Self::repair): a region
 /// that could not be solved has nothing to repair toward, which is why that
@@ -569,11 +550,16 @@ pub struct FeasibleRegion {
     points: Vec<Point>,
     /// A feasible point as far inside the region as a local solve from the
     /// box centre reaches: the reference a repair on a flat constraint walks
-    /// in from. A function of the system alone.
+    /// in from.
     reference: Point,
     /// The walker, its eight chains burnt in from `points` and its shape
     /// fitted, at `solve`. A design clones it and walks.
     walker: HitAndRunWalker,
+    /// The stream a repair's sampling box draws from — a clone per call, so
+    /// a repair is the same landing every time — as the reference's extra
+    /// starts left it. Drawn from the caller's generator at `solve`, like
+    /// everything else here.
+    kept: Xoshiro256PlusPlus,
 }
 
 impl std::fmt::Debug for FeasibleRegion {
@@ -624,10 +610,10 @@ impl FeasibleRegion {
     /// `ceil`, `sgn`, `%`, a computed subscript) — so a step over a wall is
     /// put back where it stepped from rather than slid along the wall to
     /// wherever one coordinate could reach. A constraint with a jump in it
-    /// is sampled around under a fixed seed, and one flat where the point
-    /// stands is walked in from a reference point a local solve found from
-    /// the box centre — a function of the system alone — so a region that
-    /// can be sampled is landed near. Microseconds at fifty
+    /// is sampled around, on a stream the region keeps, and one flat where
+    /// the point stands is walked in from a reference point a local solve
+    /// found from the box centre at `solve` — so a region that can be
+    /// sampled is landed near. Microseconds at fifty
     /// variables in a release build where the gradients apply; the
     /// derivative-free fallbacks are milliseconds to tenths of a second.
     ///
@@ -657,7 +643,13 @@ impl FeasibleRegion {
     /// negative or not finite. That is a caller mixing up systems, not a
     /// verdict about the point.
     pub fn repair(&self, point: &[f64], clearance: f64) -> Result<Point, RepairError> {
-        crate::repair::repair(&self.system, &self.reference, point, clearance)
+        crate::repair::repair(
+            &self.system,
+            &self.reference,
+            point,
+            clearance,
+            self.kept.clone(),
+        )
     }
 
     /// A space-filling design of `count` feasible points, spread away from
@@ -675,10 +667,12 @@ impl FeasibleRegion {
     /// # use sojourn::{ConstraintSystem, InputVariable};
     /// # fn example() -> anyhow::Result<()> {
     /// # let system = ConstraintSystem::new(vec![InputVariable::new("x", -1.0, 1.0)], ["x > 0"])?;
-    /// let region = sojourn::solve(&system)?;
+    /// # use rand::SeedableRng;
+    /// let mut rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(42);
+    /// let region = sojourn::solve(&system, &mut rng)?;
     /// let centre = region.repair(&[0.0], 1e-12)?;
     /// let existing = faer::Mat::from_fn(1, 1, |row, _| centre[row]);
-    /// let design = region.sample(existing.as_ref(), 9, 42)?;
+    /// let design = region.sample(existing.as_ref(), 9, &mut rng)?;
     /// // `centre` and the nine columns of `design` are the opening ten.
     /// # let _ = design;
     /// # Ok(())
@@ -691,9 +685,11 @@ impl FeasibleRegion {
     /// coordinates — the metric [`repair`](Self::repair) lands by. The pool
     /// is the region's own points, a round of uniform proposals, and
     /// hit-and-run from the region's chains, burnt in at `solve`, under
-    /// streams derived from `seed`; so the design is a function of this
-    /// region, `existing`, `count` and `seed`, and the same call gives the
-    /// same matrix. Not a Latin hypercube: a design of fewer points than
+    /// streams drawn from `rng` (thirty-two bytes of it, whatever the walk
+    /// then spends); so the design is a function of this region, `existing`,
+    /// `count` and `rng`'s state — the same state gives the same matrix, and
+    /// the same generator carried on gives the next design, spread from
+    /// whatever `existing` says. Not a Latin hypercube: a design of fewer points than
     /// variables — the usual case — has no useful stratification, and "far
     /// from what I have" is the whole requirement. Cost is
     /// `O(count² · dimensions)` in the selection plus the walk: milliseconds
@@ -710,11 +706,11 @@ impl FeasibleRegion {
     /// caller mixing up systems, not a verdict about the points. A matrix
     /// with no columns — `Mat::zeros(0, 0)` will do — is nothing to spread
     /// from.
-    pub fn sample(
+    pub fn sample<R: Rng + ?Sized>(
         &self,
         existing: MatRef<'_, f64>,
         count: usize,
-        seed: u64,
+        rng: &mut R,
     ) -> Result<Mat<f64>, SampleError> {
         let rows = self.system.variables.len();
         assert!(
@@ -731,7 +727,7 @@ impl FeasibleRegion {
             &self.points,
             &anchors,
             count,
-            seed,
+            Xoshiro256PlusPlus::from_rng(rng),
         );
         let found = Mat::from_fn(rows, chosen.len(), |row, column| chosen[column][row]);
         if chosen.len() < count {

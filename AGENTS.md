@@ -157,8 +157,9 @@ that decides gets brute force: the same sampler on every core for a proposal
 budget (`with_proposal_budget`, default a billion), and an empty search is
 `Infeasibility::NotFound`, which claims nothing — a contradiction too thin or
 too algebraic for an enclosure ends there, and `docs/todo.md` records the
-classes. What brute force finds is a function of the seed and the budget, never
-of the thread count — keep it that way (the batch is the unit of randomness).
+classes. What brute force finds is a function of the generator's state and the
+budget, never of the thread count — keep it that way (the batch is the unit of
+randomness).
 `Strategy` is a test-only configuration, not a user-facing one. Pool tests
 run with `common::PROPOSAL_BUDGET`, a million under debug, because the
 default takes minutes on an unoptimised tape. The opening's state is a value:
@@ -166,12 +167,22 @@ default takes minutes on an unoptimised tape. The opening's state is a value:
 `absorb`/`extend`, never a field; what it ends with is the region's `points`.
 `ConstraintSystem` is immutable and compiled once; `Ladder` holds only the
 strategies' streams and knobs and lives for one opening. Keep it that way —
-the only `&mut` in the search is an RNG or a walker's chain. A design
-(`cvg::design`, `FeasibleRegion::sample`) is a pure function of the region,
-the caller's existing points, the count and a seed: a fresh sampler and
-walker per call, a pool of candidates, farthest-first selection in
-box-normalised Euclidean distance. Not a Latin hypercube — a design of fewer
-points than variables has no useful stratification.
+the only `&mut` in the search is an RNG or a walker's chain. **The generator
+is the caller's**: `solve` and `sample` take `&mut impl rand::Rng` and draw
+their own `Xoshiro256PlusPlus` from it once at the door, thirty-two bytes
+whatever the search then spends, so nothing past the boundary is generic and
+the caller's later draws do not shift with a budget. Everything the region
+does afterwards is a function of the region: it keeps one stream from the
+ladder (drawn last, after the strategies' and the burn-in's) for its
+reference point's extra starts and for every repair's sampling box, which
+draws from a clone — so `repair` is the same landing every call, and no
+constant seed hides anywhere in the crate. A design (`cvg::design`, `FeasibleRegion::sample`) is a pure
+function of the region, the caller's existing points, the count and the
+generator's state: a fresh sampler and a clone of the region's walker per
+call, a pool of candidates, farthest-first selection in box-normalised
+Euclidean distance; the same generator carried on gives the next design. Not
+a Latin hypercube — a design of fewer points than variables has no useful
+stratification.
 
 **An equality is read before it is searched.** `cvg::classify` reads
 `a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
@@ -321,8 +332,8 @@ where a biting constraint has no derivative or Newton did not converge —
 unless the clamp's landing is separable (bounds), where the axis projection
 already is the Euclidean one. A constraint flat where the point stands is
 walked in from the region's reference — a local solve from the box centre,
-run once by `solve`, a function of the system alone — then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
-sampled around, a box doubling and shrinking under another fixed seed — the
+run once by `solve` — then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
+sampled around, a box doubling and shrinking on a clone of the region's stream — the
 backstop for "if it can be sampled it is landed near", last because it cannot
 localise a thin or high-dimensional region. **Gradients are reverse-mode over the virtual tape**, one
 rule per instruction beside the instruction set, every partial from one

@@ -145,6 +145,10 @@ pub(crate) struct Ladder {
     /// list says: a design is always walked. Drawn after the strategies'
     /// streams, so their draws are what they were.
     burn_in: Xoshiro256PlusPlus,
+    /// The stream the region keeps for what it does after the opening: the
+    /// reference point's extra starts and every repair's sampling box. Drawn
+    /// last, for the same reason.
+    kept: Xoshiro256PlusPlus,
 }
 
 impl std::fmt::Debug for Ladder {
@@ -171,6 +175,7 @@ impl Ladder {
             local: None,
             prune: None,
             burn_in: Xoshiro256PlusPlus::seed_from_u64(0),
+            kept: Xoshiro256PlusPlus::seed_from_u64(0),
         };
         // Each strategy gets its own stream, derived from the one passed in and
         // drawn in list order, so that adding or removing a strategy does not
@@ -195,13 +200,15 @@ impl Ladder {
             }
         }
         ladder.burn_in = Xoshiro256PlusPlus::from_rng(&mut rng);
+        ladder.kept = Xoshiro256PlusPlus::from_rng(&mut rng);
         ladder
     }
 
-    /// The walker the region will burn in and keep, once the opening is
-    /// done with the ladder.
-    pub(crate) fn into_walker(self) -> HitAndRunWalker {
-        HitAndRunWalker::new(self.burn_in)
+    /// What the region keeps once the opening is done with the ladder: the
+    /// walker it will burn in, and the stream its reference and its repairs
+    /// draw from.
+    pub(crate) fn into_kept(self) -> (HitAndRunWalker, Xoshiro256PlusPlus) {
+        (HitAndRunWalker::new(self.burn_in), self.kept)
     }
 
     /// Whether the walker will do most of the delivering, judged on the
@@ -479,8 +486,8 @@ pub(crate) fn open(
 /// first because it is unbiased and on a region it reaches it is the whole
 /// pool; the walker is what reaches a region sampling cannot. The walker is
 /// the region's, its chains burnt in at `solve`, cloned and reseeded here;
-/// the proposals and the walk draw from streams derived from `seed`, so the
-/// pool is a function of the region and the seed. Then farthest-first: each
+/// the proposals and the walk draw from streams derived from `rng`, so the
+/// pool is a function of the region and the stream. Then farthest-first: each
 /// choice is the pool point whose nearest neighbour among `existing` and the
 /// choices so far is farthest, in box-normalised Euclidean distance, the
 /// metric `repair` lands by. With nothing to spread from, the first choice is
@@ -499,13 +506,12 @@ pub(crate) fn design(
     held: &[Point],
     existing: &[Point],
     count: usize,
-    seed: u64,
+    mut rng: Xoshiro256PlusPlus,
 ) -> Vec<Point> {
     let _span = tracing::debug_span!("design", count, existing = existing.len()).entered();
     if count == 0 || held.is_empty() {
         return Vec::new();
     }
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut sampler = RandomSampler::new(
         &problem.variables,
         Xoshiro256PlusPlus::from_rng(&mut rng),
@@ -614,14 +620,20 @@ mod tests {
     #[test]
     fn brute_force_seeds_the_walker_when_the_probe_is_empty() {
         let verdict = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_threads(2)
-            .solve(&one_in_a_million());
+            .solve(
+                &one_in_a_million(),
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            );
 
         let region = verdict.expect("brute force should have found the region");
         let delivered = region
-            .sample(faer::Mat::zeros(1, 0).as_ref(), 10, SEED)
+            .sample(
+                faer::Mat::zeros(1, 0).as_ref(),
+                10,
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            )
             .expect("a slab has ten distinct points");
         assert_eq!(delivered.ncols(), 10);
         for column in 0..10 {
@@ -641,10 +653,10 @@ mod tests {
     /// decide is handed to brute force.
     #[test]
     fn the_seeders_go_first_and_brute_force_takes_what_they_cannot_decide() {
-        let by_seeders = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .with_proposal_budget(0)
-            .solve(&one_in_a_million());
+        let by_seeders = ConstraintSolver::new().with_proposal_budget(0).solve(
+            &one_in_a_million(),
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
         assert!(
             by_seeders.is_ok(),
             "the contraction or the local solve should have seeded the region with no brute \
@@ -663,7 +675,6 @@ mod tests {
         )
         .expect("the fixture binds");
         let by_brute_force = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![
                 Strategy::BruteSquad,
                 Strategy::HitAndRun,
@@ -671,11 +682,15 @@ mod tests {
             ])
             .with_proposal_budget(1_000_000)
             .with_threads(2)
-            .solve(&opaque);
+            .solve(&opaque, &mut Xoshiro256PlusPlus::seed_from_u64(SEED));
         let region = by_brute_force
             .expect("brute force should have taken over from what nothing could conclude on");
         let delivered = region
-            .sample(faer::Mat::zeros(2, 0).as_ref(), 5, SEED)
+            .sample(
+                faer::Mat::zeros(2, 0).as_ref(),
+                5,
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            )
             .expect("a slab has five distinct points");
         assert_eq!(delivered.ncols(), 5);
         for column in 0..5 {
@@ -709,11 +724,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let verdict = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_prune_budget(64)
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(&hard);
+            .solve(&hard, &mut Xoshiro256PlusPlus::seed_from_u64(SEED));
         let took = started.elapsed();
         assert!(
             matches!(verdict, Err(Infeasibility::NotFound { .. })),
@@ -728,11 +742,13 @@ mod tests {
     #[test]
     fn a_zero_budget_is_the_old_behaviour() {
         let verdict = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(&one_in_a_million());
+            .solve(
+                &one_in_a_million(),
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            );
 
         assert!(
             matches!(verdict, Err(Infeasibility::NotFound { .. })),

@@ -11,11 +11,14 @@
 //!     ["x^2 + y^2 < 1", "x + y > 0.5"],
 //! )?;
 //!
-//! // The defaults. For anything else — a pinned seed, a budget, a strategy
-//! // list — build the solver yourself: `ConstraintSolver::new().with_seed(42)
-//! // .solve(&system)`. Bounded by its budgets, all counts; the region it
-//! // returns is a value holding the feasible points the search found.
-//! let region = sojourn::solve(&system)?;
+//! // Under the default budgets; for a budget or a strategy list build the
+//! // solver yourself, `ConstraintSolver::new()...solve(&system, &mut rng)`.
+//! // The generator is yours: entropy here, a seeded one to reproduce a run,
+//! // the same one threaded through every call. Bounded by its budgets, all
+//! // counts; the region it returns is a value holding the feasible points
+//! // the search found.
+//! let mut rng = rand::rng();
+//! let region = sojourn::solve(&system, &mut rng)?;
 //!
 //! // A point that is not a sample, brought onto the region at the nearest
 //! // feasible point (Euclidean, over box-normalised coordinates), `1e-12`
@@ -26,9 +29,9 @@
 //! // A space-filling design: one column per point, one row per variable, in
 //! // the order declared, spread away from the points handed in and from
 //! // each other. A function of the region, those points, the count and the
-//! // seed.
+//! // generator's state; the same generator again gives the next design.
 //! let existing = faer::Mat::from_fn(2, 1, |row, _| centre[row]);
-//! let design = region.sample(existing.as_ref(), 9, 42)?;
+//! let design = region.sample(existing.as_ref(), 9, &mut rng)?;
 //! # let _ = design;
 //! # Ok(())
 //! # }
@@ -90,6 +93,12 @@ pub use solve::{
 };
 pub use system::{ConstraintRef, ConstraintSystem, InputVariable, Point, SystemError};
 
+/// The `rand` this crate's `solve` and `sample` take their generator through,
+/// re-exported so a consumer on another `rand` need not match versions by
+/// hand: `sojourn::rand::rng()` for entropy,
+/// `sojourn::rand::rngs::Xoshiro256PlusPlus::seed_from_u64(..)` to reproduce.
+pub use rand;
+
 // Test plumbing: reachable, undocumented, unpromised. Each exists so that a
 // fixture in `tests/` can pin one strategy or measure one stage alone.
 #[doc(hidden)]
@@ -114,6 +123,9 @@ pub fn is_legal_variable_name(name: &str) -> bool {
 ///
 /// # Errors
 /// As [`ConstraintSolver::solve`].
-pub fn solve(system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
-    ConstraintSolver::new().solve(system)
+pub fn solve<R: rand::Rng + ?Sized>(
+    system: &ConstraintSystem,
+    rng: &mut R,
+) -> Result<FeasibleRegion, Infeasibility> {
+    ConstraintSolver::new().solve(system, rng)
 }

@@ -126,11 +126,14 @@ fn assert_explores(case: Case<'_>) {
         .expect("a fixture's constraints should bind to its own box");
 
     let pool = ConstraintSolver::new()
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", case.what));
 
-    let design = match pool.sample(Mat::zeros(0, 0).as_ref(), case.wanted, SEED) {
+    let design = match pool.sample(
+        Mat::zeros(0, 0).as_ref(),
+        case.wanted,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    ) {
         Ok(design) => design,
         Err(SampleError::Degenerate { found, .. }) => found,
     };
@@ -579,14 +582,17 @@ fn both_arms_of_a_product_receive_points() {
         .expect("binds to its own box");
 
     let solution = ConstraintSolver::new()
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))
         .expect("a cross through the origin is satisfiable");
     let samples = solution;
 
     let points = columns(
         &samples
-            .sample(Mat::zeros(0, 0).as_ref(), 400, SEED)
+            .sample(
+                Mat::zeros(0, 0).as_ref(),
+                400,
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            )
             .expect("a cross has four hundred distinct points"),
     );
     let on_arm = |axis: usize| {
@@ -775,13 +781,16 @@ fn the_tolerance_floor_is_where_it_was_left() {
         // An `Err` here is the region being empty or unfound at this
         // tolerance, which is the case being searched for; anything else a
         // solve can fail with is a bug and would be, at any tolerance.
-        let Ok(pool) = ConstraintSolver::new()
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .solve(&system)
+        let Ok(pool) =
+            ConstraintSolver::new().solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))
         else {
             break;
         };
-        let design = match pool.sample(Mat::zeros(0, 0).as_ref(), 100, SEED) {
+        let design = match pool.sample(
+            Mat::zeros(0, 0).as_ref(),
+            100,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        ) {
             Ok(design) => design,
             Err(SampleError::Degenerate { found, .. }) => found,
         };

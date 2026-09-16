@@ -239,13 +239,11 @@ impl fmt::Display for Outcome {
 /// read the moment the region reports it has one.
 fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
     let sources = family.sources(p);
-    let solver = ConstraintSolver::new()
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
-        .with_strategies(SAMPLING_ONLY.to_vec());
+    let solver = ConstraintSolver::new().with_strategies(SAMPLING_ONLY.to_vec());
 
     let system = system(&sources);
     let start = Instant::now();
-    match solver.solve(&system) {
+    match solver.solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(seed)) {
         Ok(region) => {
             let elapsed = start.elapsed();
 
@@ -337,9 +335,11 @@ fn without_a_prover_an_empty_region_is_not_found_rather_than_proved() {
     let verdict = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .with_strategies(SAMPLING_ONLY.to_vec())
-        .solve(&system(&constraints));
+        .solve(
+            &system(&constraints),
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
 
     match verdict {
         Err(Infeasibility::NotFound { unexpressed }) => {

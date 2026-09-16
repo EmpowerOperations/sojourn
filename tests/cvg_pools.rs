@@ -148,15 +148,21 @@ fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so() -> an
     let pool = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(inputs.clone(), &[source])?)
+        .solve(
+            &system(inputs.clone(), &[source])?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        )
         .expect("solving should not fail");
 
     // The points are real. Checked here rather than trusted, because the pool
     // filtering its own output is the thing under test: the emitter never put
     // this constraint to a solver, so nothing but the filter stands between a
     // proposed point and the caller.
-    let points = columns(&pool.sample(Mat::zeros(0, 0).as_ref(), 5, SEED)?);
+    let points = columns(&pool.sample(
+        Mat::zeros(0, 0).as_ref(),
+        5,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
     assert_eq!(points.len(), 5);
     for point in &points {
         let bindings = [("x", point[0]), ("y", point[1])];
@@ -179,10 +185,13 @@ fn a_region_that_is_one_point_designs_one_point_and_says_so() -> anyhow::Result<
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
 
-    let verdict = region.sample(Mat::zeros(0, 0).as_ref(), 5, SEED);
+    let verdict = region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        5,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    );
 
     let Err(SampleError::Degenerate { found, wanted }) = verdict else {
         panic!("a point-sized region should be degenerate, got {verdict:?}");
@@ -210,11 +219,14 @@ fn a_design_spreads_away_from_what_the_caller_already_has() -> anyhow::Result<()
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
     let centre = Mat::zeros(2, 1);
 
-    let design = region.sample(centre.as_ref(), 8, SEED)?;
+    let design = region.sample(
+        centre.as_ref(),
+        8,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?;
 
     assert_eq!(design.ncols(), 8);
     let mut all = columns(&design);
@@ -252,10 +264,13 @@ fn a_design_smaller_than_the_dimension_is_still_a_design() -> anyhow::Result<()>
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
 
-    let design = region.sample(Mat::zeros(0, 0).as_ref(), 5, SEED)?;
+    let design = region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        5,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?;
 
     assert_eq!(design.ncols(), 5);
     let points = columns(&design);
@@ -279,10 +294,13 @@ fn the_pieces_of_a_region_each_receive_a_point() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
 
-    let design = region.sample(Mat::zeros(0, 0).as_ref(), 4, SEED)?;
+    let design = region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        4,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?;
 
     let points = columns(&design);
     assert_eq!(points.len(), 4);
@@ -299,41 +317,47 @@ fn the_pieces_of_a_region_each_receive_a_point() -> anyhow::Result<()> {
 
 /// The same seeds give the same design, run to run.
 ///
-/// One seeded generator for the opening and one for the design, so the
-/// matrix is a function of the system and the two seeds. If this ever
+/// One generator state for the opening and one for the design, so the
+/// matrix is a function of the system and the two states. If this ever
 /// fails, every seeded expectation in the suite is resting on luck.
 #[test]
-fn the_same_seed_designs_the_same_points() -> anyhow::Result<()> {
+fn the_same_generator_state_designs_the_same_points() -> anyhow::Result<()> {
     let mut runs = Vec::new();
     for _ in 0..2 {
         let pool = ConstraintSolver::new()
             .with_proposal_budget(common::PROPOSAL_BUDGET)
             .with_gpu(false)
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .solve(&system(
-                vec![
-                    InputVariable::new("x1", 0.0, 10.0),
-                    InputVariable::new("x2", 0.0, 10.0),
-                ],
-                &["x1 < x2"],
-            )?)
+            .solve(
+                &system(
+                    vec![
+                        InputVariable::new("x1", 0.0, 10.0),
+                        InputVariable::new("x2", 0.0, 10.0),
+                    ],
+                    &["x1 < x2"],
+                )?,
+                &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+            )
             .expect("solving should not fail");
         runs.push(columns(&pool.sample(
             Mat::zeros(0, 0).as_ref(),
             500,
-            SEED,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
         )?));
     }
 
     assert_eq!(runs[0].len(), 500);
-    assert_eq!(runs[0], runs[1], "the same seed produced different points");
+    assert_eq!(
+        runs[0], runs[1],
+        "the same generator state produced different points"
+    );
     Ok(())
 }
 
 /// One region, several designs: the walker's chains were burnt in at
-/// `solve` and every design walks from them, so two calls with one seed give
-/// one matrix — a design is still a function of the region and its
-/// arguments — and two with different seeds give different, feasible ones.
+/// `solve` and every design walks from them, so two calls from one generator
+/// state give one matrix — a design is still a function of the region and
+/// its arguments — and one generator carried through two calls gives two
+/// different, feasible ones: the next batch.
 #[test]
 fn two_designs_from_one_region_share_their_chains() -> anyhow::Result<()> {
     let sources = &["x^2 + y^2 < 1"];
@@ -341,24 +365,28 @@ fn two_designs_from_one_region_share_their_chains() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
 
-    let first = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED)?;
-    let again = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED)?;
-    let other = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED + 1)?;
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
+    let first = region.sample(Mat::zeros(0, 0).as_ref(), 12, &mut rng)?;
+    let next = region.sample(Mat::zeros(0, 0).as_ref(), 12, &mut rng)?;
+    let again = region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        12,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?;
 
     assert_eq!(
         columns(&first),
         columns(&again),
-        "one region, one seed, one design"
+        "one region, one generator state, one design"
     );
     assert_ne!(
         columns(&first),
-        columns(&other),
-        "another seed is another design"
+        columns(&next),
+        "the generator carried on is the next design"
     );
-    for point in columns(&other) {
+    for point in columns(&next) {
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
     }
     Ok(())
@@ -375,11 +403,13 @@ fn contradictory_constraints_are_reported_as_unsatisfiable() -> anyhow::Result<(
     let solution = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(
-            vec![InputVariable::new("x", 0.0, 10.0)],
-            &["x > 8", "x < 2"],
-        )?);
+        .solve(
+            &system(
+                vec![InputVariable::new("x", 0.0, 10.0)],
+                &["x > 8", "x < 2"],
+            )?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
 
     let Err(because) = solution else {
         panic!("expected Unsatisfiable, got {solution:?}");
@@ -427,8 +457,7 @@ fn a_backwards_comparison_is_blamed_together_with_what_it_contradicts() -> anyho
     let verdict = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED));
 
     let Err(because) = verdict else {
         panic!("expected Unsatisfiable, got {verdict:?}");
@@ -472,14 +501,16 @@ fn a_thin_contradiction_is_not_found_rather_than_proved() -> anyhow::Result<()> 
     let verdict = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(
-            vec![
-                InputVariable::new("x", -1.0, 1.0),
-                InputVariable::new("y", -1.0, 1.0),
-            ],
-            &["x + y <= 1", "x + y >= 1.000000001"],
-        )?);
+        .solve(
+            &system(
+                vec![
+                    InputVariable::new("x", -1.0, 1.0),
+                    InputVariable::new("y", -1.0, 1.0),
+                ],
+                &["x + y <= 1", "x + y >= 1.000000001"],
+            )?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
 
     let Err(Infeasibility::NotFound { unexpressed }) = verdict else {
         panic!("a contradiction too thin for an enclosure was reported {verdict:?}");
@@ -502,14 +533,16 @@ fn an_algebraic_contradiction_is_not_found_rather_than_proved() -> anyhow::Resul
     let verdict = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(
-            vec![
-                InputVariable::new("x", -1.0, 1.0),
-                InputVariable::new("y", -1.0, 1.0),
-            ],
-            &["x*x - 2*x*y + y*y < 0"],
-        )?);
+        .solve(
+            &system(
+                vec![
+                    InputVariable::new("x", -1.0, 1.0),
+                    InputVariable::new("y", -1.0, 1.0),
+                ],
+                &["x*x - 2*x*y + y*y < 0"],
+            )?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
 
     assert!(
         matches!(verdict, Err(Infeasibility::NotFound { .. })),
@@ -525,11 +558,13 @@ fn a_satisfiable_problem_is_not_blamed_on_anything() -> anyhow::Result<()> {
     let solution = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system(
-            vec![InputVariable::new("x", 0.0, 10.0)],
-            &["x > 8", "x < 9"],
-        )?);
+        .solve(
+            &system(
+                vec![InputVariable::new("x", 0.0, 10.0)],
+                &["x > 8", "x < 9"],
+            )?,
+            &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+        );
     assert!(solution.is_ok(), "got {solution:?}");
     Ok(())
 }
@@ -546,9 +581,12 @@ fn power_with_variable_as_exponent() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -564,9 +602,12 @@ fn a_deeply_transcendental_constraint() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -589,9 +630,12 @@ fn sine_over_multiple_periods() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -607,9 +651,12 @@ fn a_simple_inequality() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -627,9 +674,12 @@ fn logarithms() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -645,9 +695,12 @@ fn modulo_with_a_symbolic_divisor() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -664,9 +717,12 @@ fn equality_with_a_loose_tolerance() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -686,9 +742,12 @@ fn sine_below_zero() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -715,9 +774,12 @@ fn simple_arithmetic() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -738,9 +800,12 @@ fn roots() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -753,9 +818,12 @@ fn power() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -779,9 +847,12 @@ fn absolute_value() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -807,9 +878,12 @@ fn modulo() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -824,9 +898,12 @@ fn constants() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -843,9 +920,12 @@ fn signum() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -868,9 +948,12 @@ fn dynamic_variable_lookup() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())
@@ -891,9 +974,12 @@ fn ceiling_and_floor() -> anyhow::Result<()> {
     let region = ConstraintSolver::new()
         .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_gpu(false)
-        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(&system)?;
-    let points = columns(&region.sample(Mat::zeros(0, 0).as_ref(), REQUESTED, SEED)?);
+        .solve(&system, &mut Xoshiro256PlusPlus::seed_from_u64(SEED))?;
+    let points = columns(&region.sample(
+        Mat::zeros(0, 0).as_ref(),
+        REQUESTED,
+        &mut Xoshiro256PlusPlus::seed_from_u64(SEED),
+    )?);
 
     assert_ten_feasible(&system, sources, &points);
     Ok(())

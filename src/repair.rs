@@ -134,9 +134,9 @@
 //!
 //! # What is deliberately not here
 //!
-//! No randomness the caller can see: the draws the reference and the
-//! sampling box make come from constant seeds, so the answer is a function
-//! of the system, the point and the clearance. No finite differences: the
+//! No randomness the caller can see: the sampling box draws from a clone of
+//! the stream the region keeps, so the answer is a function of the region,
+//! the point and the clearance. No finite differences: the
 //! gradients Newton reads are the tape's own reverse sweep, exact, and a
 //! constraint without one declines rather than being approximated at a
 //! vertex where an approximation is ill-defined. No anchors: nothing the
@@ -146,8 +146,8 @@
 //! would re-solve the find-a-first-point problem on every call; it is the
 //! last stage, for the cases nothing else can read.
 
+use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
-use rand::{RngExt, SeedableRng};
 
 use crate::cvg::incidence::{ConstraintId, Row};
 use crate::cvg::{classify, hc4, local, newton, normalised_distance as distance};
@@ -188,14 +188,6 @@ const COBYLA_CHEAP: usize = 8;
 /// bracket, so this is a budget in bits and sixty is past where an `f64`
 /// parameter in `[0, 1]` can still be halved.
 const CHORD_BITS: usize = 60;
-
-/// The seed the sampling box draws from.
-///
-/// A constant, and deliberately so: `repair` is a function of the region,
-/// the point and the clearance — the same landing on every call, on every
-/// machine — and a landing that depended on what had been sampled since
-/// would carry the bias the anchors had and the reason they are gone.
-const SAMPLING_SEED: u64 = 0xB0_0B_0F_5A;
 
 /// Rounds the sampling box gets: each doubles the box when it held nothing
 /// and shrinks it onto the nearest hit when it did.
@@ -250,6 +242,7 @@ pub(crate) fn repair(
     reference: &[f64],
     point: &[f64],
     clearance: f64,
+    stream: Xoshiro256PlusPlus,
 ) -> Result<Point, RepairError> {
     let dimensions = system.variables().len();
     assert_eq!(
@@ -352,7 +345,7 @@ pub(crate) fn repair(
     // found nothing, since its landing may be anywhere its evaluations fell
     // feasible and it costs a hundred times the box. See the module doc.
     if !landings.iter().any(|(_, landing)| landing.is_clear()) {
-        let hit = sampled(system, &widths, point, clearance);
+        let hit = sampled(system, &widths, point, clearance, stream);
         if let Some(hit) = &hit {
             let chord = along_chord(system, hit, point);
             landings.extend(
@@ -608,6 +601,11 @@ fn backed_off(
 /// draws in a box centred on it, the box doubled while it holds nothing and
 /// shrunk onto the nearest hit once it does, for a fixed number of rounds.
 ///
+/// `rng` is the region's own stream, a clone the caller made: the same
+/// landing on every call, on every machine, and a landing that depended on
+/// what had been sampled since would carry the bias the anchors had and the
+/// reason they are gone.
+///
 /// The backstop that needs no slice, no gradient and no continuity — only
 /// that the region be fat enough to sample *over the free coordinates*: a
 /// driven equality is not sampled but computed, every draw's driven
@@ -621,9 +619,9 @@ fn sampled(
     widths: &[f64],
     point: &[f64],
     clearance: f64,
+    mut rng: Xoshiro256PlusPlus,
 ) -> Option<Point> {
     let _span = tracing::debug_span!("sample").entered();
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SAMPLING_SEED);
     let mut radius = SAMPLING_RADIUS;
     let mut best: Option<(f64, Point)> = None;
     for _ in 0..SAMPLING_ROUNDS {
