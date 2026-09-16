@@ -398,6 +398,7 @@ pub(crate) fn nearest(
     target: &[f64],
     clearance: f64,
 ) -> Projected {
+    let _span = tracing::debug_span!("cobyla").entered();
     let dimensions = problem.variables.len();
     let cube = Cube::over(&problem.declared());
     let projection = Projection {
@@ -423,11 +424,11 @@ pub(crate) fn nearest(
     let clear = projection.clear.into_inner();
     let feasible = projection.feasible.into_inner();
     tracing::debug!(
+        stage = "cobyla",
         evaluations = result.cost_evals(),
         reason = ?result.reason,
         clear = clear.is_some(),
         feasible = feasible.is_some(),
-        "projection"
     );
     Projected {
         clear: clear.map(|(_, point)| point),

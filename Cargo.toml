@@ -36,6 +36,9 @@ antlr-rust-codegen = "0.34"
 
 [dev-dependencies]
 anyhow = "1.0"
+# Reads the engine's own `tracing` in a test: `RUST_LOG=sojourn=debug` and a
+# stage-by-stage account of a repair or an opening comes out on stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = { version = "1.0.1", features = ["macro"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }

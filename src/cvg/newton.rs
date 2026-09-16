@@ -88,10 +88,23 @@ fn active_set_rounds(rows: usize) -> usize {
     rows + 8
 }
 
+/// A converged projection: the point, on the boundary of the constraints
+/// active there, and the direction *into* the region from it.
+pub(crate) struct Landing {
+    pub(crate) point: Point,
+    /// The negated sum of the active constraints' unit normals, in the
+    /// caller's coordinates: the bisector of the wedge they make, which
+    /// enters every one of them — where the KKT direction `p → x*` need not,
+    /// on a sharp wedge like the spring's vertex, where one wall's normal is
+    /// far steeper than the other's and the weighted sum leans out of it.
+    pub(crate) inward: Vec<f64>,
+}
+
 /// The nearest point of `system`'s feasible set to `target`, sought from
 /// `from`, on the boundary of the constraints active there; `None` where
 /// the method does not apply or does not converge.
-pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -> Option<Point> {
+pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -> Option<Landing> {
+    let _span = tracing::debug_span!("newton").entered();
     let dimensions = system.variables.len();
     let constraints = system.constraints.len();
     let rows = constraints + 2 * dimensions;
@@ -165,22 +178,43 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
     // A row the residual could not be evaluated on is one the method cannot
     // reason about.
     if (0..rows).any(|row| residual(row, from, &u).is_none()) {
+        tracing::debug!(stage = "newton", declined = "a residual faults");
         return None;
     }
 
+    let mut iterations = 0;
+    let mut round = 0;
+    let declined = |why: &'static str, iterations: usize, round: usize, active: usize| {
+        tracing::debug!(
+            stage = "newton",
+            declined = why,
+            iterations,
+            rounds = round,
+            active
+        );
+    };
     for _ in 0..active_set_rounds(rows) {
+        round += 1;
         // Newton on the active set, from where the point stands.
         let mut multipliers: Vec<f64> = vec![0.0; active.len()];
         let mut converged = false;
         for _ in 0..NEWTON_ITERATIONS {
+            iterations += 1;
             let x = denormalised(&u);
             let k = active.len();
             let mut jacobian = Mat::<f64>::zeros(k, dimensions);
             let mut rhs = Col::<f64>::zeros(k);
             for (i, row) in active.iter().enumerate() {
-                let g = residual(*row, &x, &u)?;
+                let Some(g) = residual(*row, &x, &u) else {
+                    declined("a residual faults", iterations, round, active.len());
+                    return None;
+                };
+                let Some(partials) = gradient(*row, &x) else {
+                    declined("no gradient", iterations, round, active.len());
+                    return None;
+                };
                 let mut j_dot_step = 0.0;
-                for (coordinate, partial) in gradient(*row, &x)? {
+                for (coordinate, partial) in partials {
                     jacobian[(i, coordinate)] += partial;
                 }
                 for coordinate in 0..dimensions {
@@ -195,6 +229,7 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
                 let jjt = &jacobian * jacobian.transpose();
                 let lambda = jjt.partial_piv_lu().solve(&rhs);
                 if lambda.iter().any(|value| !value.is_finite()) {
+                    declined("a singular solve", iterations, round, active.len());
                     return None;
                 }
                 let pull = jacobian.transpose() * &lambda;
@@ -214,6 +249,7 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
             }
         }
         if !converged {
+            declined("no convergence", iterations, round, active.len());
             return None;
         }
 
@@ -232,13 +268,46 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
             .filter(|row| !active.contains(row))
             .any(|row| residual(row, &x, &u).is_none())
         {
+            declined("a residual faults", iterations, round, active.len());
             return None;
         }
         if joining.is_empty() {
-            return Some(x);
+            tracing::debug!(
+                stage = "newton",
+                iterations,
+                rounds = round,
+                active = active.len(),
+                "converged"
+            );
+            // The bisector: each active row's unit normal in the cube, summed
+            // and negated, then scaled back to the caller's coordinates.
+            let mut inward = vec![0.0; dimensions];
+            for row in &active {
+                let partials = gradient(*row, &x)?;
+                let norm = partials
+                    .iter()
+                    .map(|(_, partial)| partial * partial)
+                    .sum::<f64>()
+                    .sqrt();
+                if norm > 0.0 {
+                    for (coordinate, partial) in partials {
+                        inward[coordinate] -= partial / norm;
+                    }
+                }
+            }
+            for (direction, w) in inward.iter_mut().zip(&width) {
+                *direction *= w;
+            }
+            return Some(Landing { point: x, inward });
         }
         active.extend(joining);
     }
+    declined(
+        "the active set did not settle",
+        iterations,
+        round,
+        active.len(),
+    );
     None
 }
 
@@ -263,7 +332,9 @@ mod tests {
             ],
             &["2*x1 + x2 < 1"],
         );
-        let landed = nearest(&system, &[1.0, 1.0], &[1.0, 1.0]).expect("applies");
+        let landed = nearest(&system, &[1.0, 1.0], &[1.0, 1.0])
+            .expect("applies")
+            .point;
         assert!(close(&landed, &[0.2, 0.6], 1e-12), "{landed:?}");
     }
 
@@ -277,7 +348,9 @@ mod tests {
             ],
             &["x^2 + y^2 < 1"],
         );
-        let landed = nearest(&system, &[2.0, 0.5], &[2.0, 0.5]).expect("applies");
+        let landed = nearest(&system, &[2.0, 0.5], &[2.0, 0.5])
+            .expect("applies")
+            .point;
         let scale = 4.25_f64.sqrt();
         assert!(
             close(&landed, &[2.0 / scale, 0.5 / scale], 1e-12),
@@ -295,7 +368,9 @@ mod tests {
             ],
             &["x1 < 0.5", "x2 < 0.5"],
         );
-        let landed = nearest(&system, &[1.0, 1.0], &[1.0, 1.0]).expect("applies");
+        let landed = nearest(&system, &[1.0, 1.0], &[1.0, 1.0])
+            .expect("applies")
+            .point;
         assert!(close(&landed, &[0.5, 0.5], 1e-12), "{landed:?}");
     }
 
@@ -312,7 +387,9 @@ mod tests {
         );
         // From (1, 0): the foot on `x1 + x2 = 0.2` is (0.6, -0.4), below the
         // box; with `x2 >= 0` active the answer is (0.2, 0).
-        let landed = nearest(&system, &[1.0, 0.0], &[1.0, 0.0]).expect("applies");
+        let landed = nearest(&system, &[1.0, 0.0], &[1.0, 0.0])
+            .expect("applies")
+            .point;
         assert!(close(&landed, &[0.2, 0.0], 1e-12), "{landed:?}");
     }
 
@@ -330,7 +407,9 @@ mod tests {
             // — the second's multiplier comes out negative and it leaves.
             &["x1 + x2 < 1", "x1 + 2*x2 < 2"],
         );
-        let landed = nearest(&system, &[1.5, 1.5], &[1.5, 1.5]).expect("applies");
+        let landed = nearest(&system, &[1.5, 1.5], &[1.5, 1.5])
+            .expect("applies")
+            .point;
         assert!(close(&landed, &[0.5, 0.5], 1e-12), "{landed:?}");
     }
 
@@ -346,7 +425,9 @@ mod tests {
             &["floor(x1) < 3", "x2 < 1"],
         );
         assert!(nearest(&system, &[5.0, 5.0], &[5.0, 5.0]).is_none());
-        let landed = nearest(&system, &[1.0, 5.0], &[1.0, 5.0]).expect("the floor is not active");
+        let landed = nearest(&system, &[1.0, 5.0], &[1.0, 5.0])
+            .expect("the floor is not active")
+            .point;
         assert!(close(&landed, &[1.0, 1.0], 1e-12), "{landed:?}");
     }
 
@@ -360,8 +441,8 @@ mod tests {
             ],
             &["x^2 + y^2 < 1", "x + y > 0.5"],
         );
-        let once = nearest(&system, &[1.2, 1.2], &[1.2, 1.2]);
-        let twice = nearest(&system, &[1.2, 1.2], &[1.2, 1.2]);
+        let once = nearest(&system, &[1.2, 1.2], &[1.2, 1.2]).map(|landing| landing.point);
+        let twice = nearest(&system, &[1.2, 1.2], &[1.2, 1.2]).map(|landing| landing.point);
         assert_eq!(once, twice);
         assert!(once.is_some());
     }

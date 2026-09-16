@@ -16,111 +16,75 @@
 //! alternatives it displaced are written up in `docs/todo.md` under *Repair
 //! for Artemis*; this is the shape that survived.
 //!
-//! # Clamp, project, and — on a flat constraint — walk in from a reference
+//! # The stages, and the order they run in
 //!
-//! **Clamp.** Every coordinate has a conditional slice — the interval it may
-//! occupy with the others held where they are, from [`interval::slice`] — and
-//! clamping into it is the exact axis projection onto that coordinate's
-//! constraints. Clamps are applied cheapest first, cumulatively, and the point
-//! is judged after each. A driven coordinate gets no special treatment here —
-//! it is one more coordinate with a slice. The settled-mask ordering in
-//! `retract` is for travelling along a surface, not for landing on it once.
+//! Every stage that lands hands its point to an aggregator; the nearest with
+//! the clearance wins, released first (a coordinate reverted to the caller's
+//! value can only come nearer). "Nearest" is Euclidean over box-normalised
+//! coordinates — the consumer's metric, and human intuition's; the taxicab
+//! metric an earlier design measured in preferred a landing that moved one
+//! coordinate over a nearer one that moved two, an axis bias an optimizer
+//! must not be fed. The stages, cheapest and most exact first:
 //!
-//! A clamp lands at the caller's clearance inside the bound, and *on* the
-//! bound when the clearance is zero, because a bound is the answer: Artemis
-//! measured coordinates sitting exactly at a bound coming out several times
-//! more accurate than ones a tolerance away. The slice is a superset padded
-//! outward by a few ulps, so a landing on the bound itself nudges inward by a
-//! doubling ladder of ulps until the coordinate's own constraints pass.
+//! **Clamp** — where cheap. Each coordinate has a conditional slice, the
+//! interval it may occupy with the others held ([`interval::slice`]);
+//! clamping into it is the axis projection onto that coordinate's
+//! constraints. A slice narrows against every constraint naming the
+//! coordinate, so the clamp costs a walk of each such constraint's tree per
+//! coordinate per sweep — cheap where constraints are local
+//! ([`CLAMP_LOCAL`]), and skipped where one is dense (the beam's deflection
+//! names two hundred), which is also where no single-coordinate clamp could
+//! land. Where the moved coordinates are *separable* — every constraint
+//! naming one names it alone, as bounds do — the axis move is the exact
+//! Euclidean projection and is returned outright, on the bound at zero
+//! clearance (Artemis measured coordinates *at* a bound as more accurate).
+//! Otherwise the landing is a candidate and its reach the derivative-free
+//! solve's start.
 //!
-//! The clamp is the whole answer where the feasible set is *separable* on the
-//! coordinates it moved — every constraint naming one of them names it alone,
-//! as bounds do — because there the axis projection is the Euclidean one. It
-//! used to be the whole answer wherever it landed at all, which made the
-//! metric taxicab: on a slab the point moved one coordinate by the whole gap
-//! where two should each have moved half, `√2` farther, every time; a step a
-//! hundredth over a curved wall was slid along the wall to wherever one
-//! coordinate could reach, up to half again as far. An optimizer stepping over
-//! a wall wants to be put back where it stepped from (`tests/regression_fixture.rs`,
-//! `repair_lands_axis_aligned_not_nearest`). Everywhere else the clamp's
-//! landing is a candidate and the warm start.
+//! **Newton** — the projection, from the point. Newton on the KKT system
+//! over the active set ([`newton::nearest`]), with the gradients the tape's
+//! reverse sweep provides: exact in one step on a linear constraint, a few
+//! on a curved one, microseconds at fifty variables. It declines where a
+//! constraint that bites has no derivative or the iteration will not
+//! converge. A clear landing here is the answer — the aggregator returns
+//! before the derivative-free stages run at all, so the smooth case pays
+//! only Newton. The landing depends on the constraints and the point and on
+//! nothing else, which is the property the consumer needs and the one an
+//! earlier design lacked: it chorded from *anchors* the caller supplied, so
+//! every landing was dragged toward the census — a disc corner at 45° landed
+//! at 17°, where a projection lands it at 45°.
 //!
-//! **Project.** The feasible point nearest the caller's, `min ‖u − p‖²` over
-//! the unit cube subject to every constraint, from the clamp's landing when
-//! it landed and from wherever the clamp got to when it did not. Two solvers,
-//! in order. [`newton::nearest`] first: Newton on the KKT system over the
-//! active set, with the gradients the tape's reverse sweep provides — exact
-//! in one step on a linear constraint, a handful on a curved one, microseconds
-//! at fifty variables — and it declines wherever a constraint that bites has
-//! no derivative or the iteration does not converge. Then [`local::nearest`],
-//! COBYLA, derivative-free, only where Newton declined or its landing could
-//! not be stepped off the walls: it needs no gradient and pays `O(d²m)` per
-//! iteration for that, and it is not run beside a successful Newton because
-//! on a smooth piece Newton is exact and COBYLA cannot beat it, on a
-//! nonconvex one both are local, and the difference is a thousandfold in
-//! cost. From a feasible warm start either solve slides along the boundary to
-//! the Euclidean foot. The landing depends on the constraints and the point
-//! and on nothing else. That is the property the consumer needs, and the one
-//! an earlier design lacked: it bisected a chord from the nearest of a set of
-//! *anchors* the caller supplied, so every landing was a convex combination of
-//! the proposal and a census point — every coordinate dragged toward wherever
-//! the census happened to be — and over thousands of repairs the optimizer was
-//! herded toward the census rather than along the boundary its objective
-//! preferred. Measured on a disc with anchors clustered at angle zero: the
-//! corner at 45° landed at 17°. A projection lands it at 45°.
+//! **Sample and the derivative-free solve** — off the smooth path, where
+//! Newton declined: a jump (`floor`, `%`, `sgn`) or a curvature Newton could
+//! not settle. The sampling box first — uniform draws around the point,
+//! driven coordinates on their surfaces, the box doubled while empty and
+//! shrunk onto the nearest hit, then a chord from that hit — because it
+//! needs no slice, gradient or continuity, only a region fat enough to
+//! sample over its free coordinates, which is what a jump leaves. Then
+//! COBYLA ([`local::nearest`]), where the box found nothing *or* the
+//! dimension is small ([`COBYLA_CHEAP`]): the box shrinks onto the first
+//! branch it meets and can miss a nearer one on a thin many-branched region
+//! (`(x+2)(x-1) == 0`), where COBYLA's linear models on a smooth constraint
+//! do not, and there it is cheap; past a handful of dimensions the regions
+//! that reach here are fat ones the box handles and COBYLA is the last
+//! resort, `O(d²m)` an iteration. The box across a jump: 0.40 of the box
+//! from the proposal became the nearest cell (`tests/cvg_repair.rs`, the ball
+//! oracle across a jump).
 //!
-//! A landing with the clearance gets the clamp stage again, which from a
-//! feasible point is precisely "step each coordinate its clearance off the
-//! nearest wall" and a no-op where it already has it. A landing that is
-//! feasible but without the clearance — where no slice can read a wall, as
-//! narrowing declines a real exponent — is backed off along the projection's
-//! own direction, `p → x*` continued inward, in doublings of the clearance
-//! until the oracle passes: that direction is the boundary's normal at the
-//! landing, which is the inward direction a chord used to stand in for.
+//! **Reference** — nothing feasible seen at all: a constraint flat where the
+//! point stands (Keane's `0.75 − ∏xᵢ` with a coordinate at `1e-11` is `0.75`
+//! to fifty digits every way), which no slice, model or box around the point
+//! reads. A feasible point to walk *in* from, from [`local::find_initial`]
+//! under a fixed seed — a function of the system, not of what the region
+//! sampled — a chord bisected from it to the point, and the projection from
+//! that landing, where the constraint is well-scaled again; so the reference
+//! decides only which basin, never where in it. `Stranded` means this found
+//! nothing either.
 //!
-//! **Reference.** A constraint can be flat where the point stands — Keane's
-//! `0.75 − ∏xᵢ` with seven coordinates at `1e-11` is `0.75` to fifty digits
-//! in every direction — and then no slice reads a wall and no linear model
-//! moves: nothing feasible is seen at all. No local method sees a flat
-//! constraint; what is needed is a feasible point to walk *in* from. It comes
-//! from [`local::find_initial`] over the declared box under a fixed seed, so
-//! that it is a function of the system alone — the same reference on every
-//! call, on every machine — and not of anything the region sampled, which is
-//! how this differs from the anchors: they were the caller's census, arbitrary
-//! and different every run, and they were used *first*. The chord from the
-//! reference to the point is bisected to the last feasible point along it,
-//! and the projection then runs from that landing, where the constraint is
-//! well-scaled again, so the reference decides only which basin the answer is
-//! in and never where in it. Reached only when the projection from the point
-//! itself saw nothing feasible.
-//!
-//! **Sample.** Whenever Newton declined — off the smooth path — beside the
-//! derivative-free solve: a box around the point, uniform draws in it judged
-//! one by one with their driven coordinates put on their surfaces, the box
-//! doubled while it holds nothing and shrunk onto the nearest hit once it
-//! does, for a fixed number of rounds; then the chord from the nearest hit
-//! toward the point. The backstop that needs no slice, no gradient and no
-//! continuity — only a region fat enough to sample over its free
-//! coordinates — which is exactly what a constraint with a *jump* in it
-//! leaves: `floor`, `%`, `sgn` defeat the clamp and Newton, COBYLA's landing
-//! is then wherever its evaluations happened to fall feasible, and a chord
-//! from the reference lands wherever it crossed in — 0.40 of the box away on
-//! a comb whose nearest cell sat at 0.20, 0.235 on a checkerboard whose
-//! nearest sat at 0.007, ten units away on a checkerboard beside a driven
-//! product (`tests/cvg_repair.rs`, the ball oracle across a jump). Sampling
-//! around the point finds the nearest cell, and the aggregator takes the
-//! nearer of it and the solver's. It cannot localise a thin region, and it
-//! cannot localise anything past a handful of dimensions; both of those are
-//! the projection's, which is why it waits for Newton to decline. Its draws
-//! come from a fixed seed, for the reason the reference's do. `Stranded`
-//! means the box and the seed search both found nothing.
-//!
-//! **Release.** Every stage can move a coordinate that, in hindsight, did not
-//! need to move — a clamp computed against a neighbour that then moved too, a
-//! projection that carried every coordinate when one constraint was active. So
-//! the last thing done to any candidate is to put each moved coordinate back
-//! where it was, one at a time, keeping every reversion that keeps the
-//! clearance; the nearest candidate after that is the answer.
+//! A boundary landing — a chord's, or a Newton one — is stepped inside by
+//! [`stepped_inside`] / [`off_the_boundary`]: along the inward direction in
+//! hand (Newton's wedge bisector, or the chord's own), and failing that the
+//! clamp, in doublings of the clearance until the oracle passes.
 //!
 //! # Clearance: a deliberate step inside, not an ulp
 //!
@@ -185,7 +149,7 @@
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 
-use crate::cvg::incidence::Row;
+use crate::cvg::incidence::{ConstraintId, Row};
 use crate::cvg::{Cancellation, classify, interval, local, newton};
 use crate::{ConstraintSystem, Point};
 
@@ -198,6 +162,27 @@ use crate::{ConstraintSystem, Point};
 /// do not describe — a gap or a corner the projection has to find its way
 /// round.
 const CLAMP_SWEEPS: usize = 8;
+
+/// The most coordinates a constraint may name for the clamp to be run.
+///
+/// A slice narrows against every constraint naming its coordinate, so the
+/// clamp's cost per sweep is a walk of each such constraint's tree per
+/// coordinate. A constraint naming this few is cheap to clamp against; one
+/// naming many — the beam's deflection names two hundred — is not, and is
+/// also one no single-coordinate clamp can land on, so the clamp is skipped
+/// there and the projection does the work. Sixteen: a wide constraint, but
+/// far short of the dense ones where the cost bites.
+const CLAMP_LOCAL: usize = 16;
+
+/// The most dimensions at which the derivative-free solve runs as a cross-
+/// check beside the sampling box, rather than only when the box fails.
+///
+/// COBYLA costs about `d²m` an iteration, so it is cheap here and dear past
+/// it; and here is where the box is weakest — it cannot localise a thin,
+/// many-branched region and shrinks onto the first branch it meets, where
+/// COBYLA on a smooth constraint finds the nearest. Past this the regions
+/// that reach the box are fat ones it handles, and COBYLA is the last resort.
+const COBYLA_CHEAP: usize = 8;
 
 /// Bisection steps along the chord from a reference point. Each halves the
 /// bracket, so this is a budget in bits and sixty is past where an `f64`
@@ -281,8 +266,10 @@ pub(crate) fn repair(
         "a clearance is a non-negative fraction of the box width, not {clearance}"
     );
 
+    let _span = tracing::debug_span!("repair", dimensions, clearance).entered();
     let current: Point = point.to_vec();
     if system.is_feasible(&current, clearance) {
+        tracing::debug!(stage = "unchanged", "already has the clearance");
         return Ok(current);
     }
 
@@ -292,76 +279,114 @@ pub(crate) fn repair(
         .map(|variable| variable.upper_bound - variable.lower_bound)
         .collect();
 
-    // Every landing any stage produced; the nearest with the clearance is the
-    // answer, the nearest feasible one without it the consolation.
-    let mut landings: Vec<Landing> = Vec::new();
+    // Every landing any stage produced, labelled by the stage; the nearest
+    // with the clearance is the answer, the nearest feasible one without it
+    // the consolation.
+    let mut landings: Vec<(&'static str, Landing)> = Vec::new();
 
-    // The clamp: a candidate where it lands, and where it does not, still the
-    // right side of every constraint a slice could read, which is where the
-    // projection starts from either way.
-    let start = match clamped(system, &widths, current, clearance) {
-        Ok(landed) => {
-            // Where every constraint that names a coordinate the clamp moved
-            // names that coordinate alone — bounds — the feasible set is a
-            // product of one-dimensional sets on those coordinates and the
-            // axis projection *is* the Euclidean one: nothing for the
-            // projection to improve, and at two hundred bounds a solve it
-            // would spend minutes on.
-            let separable = landed
-                .iter()
-                .zip(point)
-                .enumerate()
-                .filter(|(_, (moved, was))| moved != was)
-                .all(|(coordinate, _)| {
-                    system
-                        .incidence
-                        .naming(Row(coordinate))
-                        .iter()
-                        .all(|id| system.incidence.rows_of(*id).len() == 1)
-                });
-            if separable {
-                return Ok(released(system, landed, point, clearance));
+    // The clamp, where it is cheap. A slice narrows against every constraint
+    // naming the coordinate, so a constraint that names many coordinates
+    // costs a walk of its whole tree per coordinate per sweep — ninety
+    // milliseconds at two hundred variables under one dense constraint — and
+    // that same constraint is one no single-coordinate clamp can satisfy, so
+    // the work is spent only to fail. Where every constraint is local the
+    // clamp is cheap, and where it is *separable* it is the exact Euclidean
+    // projection (the axis move is the whole answer), landed on the bound and
+    // returned outright. Otherwise its landing is a candidate and its reach
+    // the derivative-free solve's start.
+    let clamp_cheap = (0..system.constraints.len())
+        .all(|index| system.incidence.rows_of(ConstraintId(index)).len() <= CLAMP_LOCAL);
+    let start = if clamp_cheap {
+        match clamped(system, &widths, current.clone(), clearance) {
+            Ok(landed) => {
+                let separable = landed
+                    .iter()
+                    .zip(point)
+                    .enumerate()
+                    .filter(|(_, (moved, was))| moved != was)
+                    .all(|(coordinate, _)| {
+                        system
+                            .incidence
+                            .naming(Row(coordinate))
+                            .iter()
+                            .all(|id| system.incidence.rows_of(*id).len() == 1)
+                    });
+                if separable {
+                    tracing::debug!(stage = "clamp", separable = true, "landed");
+                    return Ok(released(system, landed, point, clearance));
+                }
+                tracing::debug!(stage = "clamp", landed = true);
+                landings.push(("clamp", Landing::Clear(landed.clone())));
+                landed
             }
-            landings.push(Landing::Clear(landed.clone()));
-            landed
-        }
-        Err(reached) => {
-            if system.is_feasible(&reached, 0.0) {
-                landings.push(Landing::Feasible(reached.clone()));
+            Err(reached) => {
+                let feasible = system.is_feasible(&reached, 0.0);
+                tracing::debug!(stage = "clamp", landed = false, feasible);
+                if feasible {
+                    landings.push(("clamp", Landing::Feasible(reached.clone())));
+                }
+                reached
             }
-            reached
         }
+    } else {
+        current
     };
 
-    // The projection, always otherwise: from the clamp's landing it slides
-    // along the boundary to the Euclidean foot, which the clamp — an axis
-    // projection — reaches only where one coordinate is the whole answer.
-    // "Nearest" is measured to the caller's point throughout. Newton on the
-    // KKT system first, exact and cheap where every active constraint has a
-    // gradient; the derivative-free solve only where it declined or its
-    // landing could not be stepped off the walls.
-    if let Some(landing) = newton::nearest(system, &start, point)
-        && let Some(landing) = off_the_boundary(system, &widths, landing, point, clearance)
+    // Newton on the KKT system, from the point, wherever every violated
+    // constraint has a gradient: exact where it converges, and where a dense
+    // constraint made the clamp too expensive to run this is the only
+    // projection there is.
+    let differentiable = system.constraints.iter().all(|constraint| {
+        constraint.compiled.gradient().is_some()
+            || constraint
+                .compiled
+                .eval_row(point)
+                .is_ok_and(|residual| residual <= 0.0)
+    });
+    if differentiable
+        && let Some(landing) = newton::nearest(system, point, point)
+        && let Some(landing) = stepped_inside(system, &widths, landing, point, clearance)
     {
-        landings.push(landing);
+        landings.push(("newton", landing));
     }
-    if !landings.iter().any(Landing::is_clear) {
-        landings.extend(stepped_off(
-            system,
-            &widths,
-            local::nearest(system, &start, point, clearance),
-            point,
-            clearance,
-        ));
+    if landings.iter().any(|(_, landing)| landing.is_clear()) {
+        return nearest_of(system, &widths, landings, point, clearance);
+    }
 
-        // Off the smooth path — a constraint with a jump in it, or one too
-        // curved for Newton — a derivative-free landing may be anywhere the
-        // solver's evaluations happened to fall feasible; the sampling box
-        // around the point is the second opinion, and the aggregator picks.
-        // See the module doc.
-        if let Some(hit) = sampled(system, &widths, point, clearance) {
-            let chord = along_chord(system, &hit, point);
-            landings.extend(off_the_boundary(system, &widths, chord, point, clearance));
+    // Off the smooth path — a constraint with a jump in it (`floor`, `%`,
+    // `sgn`), or one too curved for Newton to converge on. The sampling box
+    // around the point first: cheap, blind to jumps, needs only a region fat
+    // enough to sample; then the derivative-free solve, only where the box
+    // found nothing, since its landing may be anywhere its evaluations fell
+    // feasible and it costs a hundred times the box. See the module doc.
+    if !landings.iter().any(|(_, landing)| landing.is_clear()) {
+        let hit = sampled(system, &widths, point, clearance);
+        if let Some(hit) = &hit {
+            let chord = along_chord(system, hit, point);
+            landings.extend(
+                off_the_boundary(system, &widths, chord, point, clearance)
+                    .map(|landing| ("sample", landing)),
+            );
+        }
+        // The derivative-free solve: where the box found nothing it is the
+        // last resort, and in low dimension it is a cheap cross-check the box
+        // needs — the box shrinks onto the first band it finds and can miss a
+        // nearer one on a thin, many-branched region (`(x+2)(x-1) == 0`),
+        // where COBYLA's linear models, on a smooth constraint, do not. Past
+        // a handful of dimensions it is neither cheap nor better than the box
+        // on the fat regions that reach here, so it waits for the box to fail.
+        if hit.is_none() || dimensions <= COBYLA_CHEAP {
+            landings.extend(
+                stepped_off(
+                    system,
+                    &widths,
+                    local::nearest(system, &start, point, clearance),
+                    point,
+                    clearance,
+                )
+                .into_iter()
+                .map(|landing| ("cobyla", landing)),
+            );
         }
     }
 
@@ -377,50 +402,83 @@ pub(crate) fn repair(
             &mut rng,
             &Cancellation::never(),
         );
+        tracing::debug!(stage = "reference", found = reference.is_some());
         if let Some(reference) = reference {
             let chord = along_chord(system, &reference, point);
-            landings.extend(stepped_off(
-                system,
-                &widths,
-                local::nearest(system, &chord, point, clearance),
-                point,
-                clearance,
-            ));
+            landings.extend(
+                stepped_off(
+                    system,
+                    &widths,
+                    local::nearest(system, &chord, point, clearance),
+                    point,
+                    clearance,
+                )
+                .into_iter()
+                .map(|landing| ("reference", landing)),
+            );
             // The projection could not leave the chord's landing either — flat
             // again — so the landing itself, stepped off its walls, stands.
-            if !landings.iter().any(Landing::is_clear) {
-                landings.push(match clamped(system, &widths, chord.clone(), clearance) {
-                    Ok(clear) => Landing::Clear(clear),
-                    Err(_) => Landing::Feasible(chord),
-                });
+            if !landings.iter().any(|(_, landing)| landing.is_clear()) {
+                landings.push((
+                    "reference",
+                    match clamped(system, &widths, chord.clone(), clearance) {
+                        Ok(clear) => Landing::Clear(clear),
+                        Err(_) => Landing::Feasible(chord),
+                    },
+                ));
             }
         }
     }
 
-    // Every candidate is released before it is measured: reverting a
-    // coordinate to the caller's value can only bring it nearer.
+    nearest_of(system, &widths, landings, point, clearance)
+}
+
+/// The aggregator: every candidate released — reverting a coordinate to the
+/// caller's value can only bring it nearer — and the Euclidean-nearest with
+/// the clearance is the answer, the nearest feasible one without it the
+/// consolation.
+fn nearest_of(
+    system: &ConstraintSystem,
+    widths: &[f64],
+    landings: Vec<(&'static str, Landing)>,
+    point: &[f64],
+    clearance: f64,
+) -> Result<Point, RepairError> {
     let mut best: Option<(f64, Point)> = None;
     let mut cramped: Option<(f64, Point)> = None;
-    for landing in landings {
+    let mut winner = "none";
+    for (stage, landing) in landings {
         match landing {
             Landing::Clear(candidate) => {
                 let candidate = released(system, candidate, point, clearance);
-                nearer(&mut best, distance(&widths, &candidate, point), candidate);
+                let at = distance(widths, &candidate, point);
+                tracing::debug!(stage, clear = true, at);
+                if best.as_ref().is_none_or(|(nearest, _)| at < *nearest) {
+                    winner = stage;
+                }
+                nearer(&mut best, at, candidate);
             }
             Landing::Feasible(candidate) => {
-                nearer(
-                    &mut cramped,
-                    distance(&widths, &candidate, point),
-                    candidate,
-                );
+                let at = distance(widths, &candidate, point);
+                tracing::debug!(stage, clear = false, at);
+                nearer(&mut cramped, at, candidate);
             }
         }
     }
 
     match (best, cramped) {
-        (Some((_, landed)), _) => Ok(landed),
-        (None, Some((_, nearest))) => Err(RepairError::Cramped { nearest, clearance }),
-        (None, None) => Err(RepairError::Stranded),
+        (Some((at, landed)), _) => {
+            tracing::debug!(winner, at, "repaired");
+            Ok(landed)
+        }
+        (None, Some((at, nearest))) => {
+            tracing::debug!(at, "cramped");
+            Err(RepairError::Cramped { nearest, clearance })
+        }
+        (None, None) => {
+            tracing::debug!("stranded");
+            Err(RepairError::Stranded)
+        }
     }
 }
 
@@ -492,23 +550,35 @@ fn stepped_off(
     landings
 }
 
-/// A landing on the boundary — Newton's, which is there by construction, or
-/// a derivative-free one judged feasible without the clearance — stepped
-/// inside.
+/// A Newton landing stepped inside: along the wedge's bisector, which the
+/// projection hands over with the point, then the ways every other landing
+/// goes.
+fn stepped_inside(
+    system: &ConstraintSystem,
+    widths: &[f64],
+    landing: newton::Landing,
+    point: &[f64],
+    clearance: f64,
+) -> Option<Landing> {
+    if let Some(clear) = backed_off(system, widths, &landing.point, &landing.inward, clearance) {
+        return Some(Landing::Clear(clear));
+    }
+    off_the_boundary(system, widths, landing.point, point, clearance)
+}
+
+/// A landing on the boundary — a chord's, or a derivative-free one judged
+/// feasible without the clearance — stepped inside.
 ///
-/// The clamp first: from a feasible point it is precisely "step each
-/// coordinate its clearance off the nearest wall". Where no slice can read
-/// the wall — narrowing declines a real exponent — the only inward direction
-/// in hand is the projection's own: back off along `point -> landing`,
-/// continued past the landing, in doublings of the clearance until the
-/// oracle is satisfied. That direction is `−Σ λᵢ ∇gᵢ`, the boundary's normal
-/// at the landing, which is what makes a small step along it the least the
-/// clearance can cost. The first rung that passes is within a factor of two
-/// of the least back-off, which at this scale is all the precision the
-/// answer can use. Where nothing passes, the consolation is the clamp's own
-/// result if it stayed feasible — the middle of a slab beats its edge — and
-/// the landing itself if that is; a landing a hair outside with nothing
-/// inside it is no landing at all.
+/// The ladder first, along `point -> landing` continued past the landing:
+/// that direction is `−Σ λᵢ ∇gᵢ`, the boundary's normal at a projection's
+/// landing, and the chord's own direction at a chord's — the one inward
+/// direction in hand where no slice can read a wall. Then the clamp, which
+/// from a feasible point is precisely "step each coordinate its clearance
+/// off the nearest wall" — and costs a narrowing per coordinate per
+/// constraint, which is why it is second. Where nothing passes, the
+/// consolation is the clamp's own result if it stayed feasible — the middle
+/// of a slab beats its edge — and the landing itself if that is; a landing a
+/// hair outside with nothing inside it is no landing at all.
 fn off_the_boundary(
     system: &ConstraintSystem,
     widths: &[f64],
@@ -516,29 +586,19 @@ fn off_the_boundary(
     point: &[f64],
     clearance: f64,
 ) -> Option<Landing> {
+    let _span = tracing::debug_span!("off_the_boundary").entered();
+    let inward: Vec<f64> = landing
+        .iter()
+        .zip(point)
+        .map(|(to, from)| to - from)
+        .collect();
+    if let Some(clear) = backed_off(system, widths, &landing, &inward, clearance) {
+        return Some(Landing::Clear(clear));
+    }
     let reached = match clamped(system, widths, landing.clone(), clearance) {
         Ok(clear) => return Some(Landing::Clear(clear)),
         Err(reached) => reached,
     };
-    let length = distance(widths, &landing, point);
-    let unit = if clearance > 0.0 && length > 0.0 {
-        clearance / length
-    } else {
-        0.0
-    };
-    let mut rung = unit;
-    while unit > 0.0 && rung < 1.0 {
-        let mut probe: Point = point
-            .iter()
-            .zip(&landing)
-            .map(|(from, to)| from + (1.0 + rung) * (to - from))
-            .collect();
-        classify::settle(system, &mut probe);
-        if system.is_feasible(&probe, clearance) {
-            return Some(Landing::Clear(probe));
-        }
-        rung *= 2.0;
-    }
     if system.is_feasible(&reached, 0.0) {
         Some(Landing::Feasible(reached))
     } else if system.is_feasible(&landing, 0.0) {
@@ -546,6 +606,39 @@ fn off_the_boundary(
     } else {
         None
     }
+}
+
+/// The ladder: `landing` moved along `inward` in doublings, from the
+/// clearance — or from an ulp's worth of the box where none was asked for,
+/// since a landing on a strict boundary is a hair outside it — until the
+/// oracle passes, or the move would be a whole box. The first rung that
+/// passes is within a factor of two of the least back-off, which at this
+/// scale is all the precision the answer can use.
+fn backed_off(
+    system: &ConstraintSystem,
+    widths: &[f64],
+    landing: &[f64],
+    inward: &[f64],
+    clearance: f64,
+) -> Option<Point> {
+    let length = distance(widths, inward, &vec![0.0; inward.len()]);
+    if length.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        return None;
+    }
+    let mut rung = clearance.max(f64::EPSILON) / length;
+    while rung < 1.0 {
+        let mut probe: Point = landing
+            .iter()
+            .zip(inward)
+            .map(|(at, direction)| at + rung * direction)
+            .collect();
+        classify::settle(system, &mut probe);
+        if system.is_feasible(&probe, clearance) {
+            return Some(probe);
+        }
+        rung *= 2.0;
+    }
+    None
 }
 
 /// The nearest feasible point the sampling box finds around `point`: uniform
@@ -566,6 +659,7 @@ fn sampled(
     point: &[f64],
     clearance: f64,
 ) -> Option<Point> {
+    let _span = tracing::debug_span!("sample").entered();
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(SAMPLING_SEED);
     let mut radius = SAMPLING_RADIUS;
     let mut best: Option<(f64, Point)> = None;
@@ -602,6 +696,13 @@ fn sampled(
             None => (radius * 2.0).min(1.0),
         };
     }
+    tracing::debug!(
+        stage = "sample",
+        hit = best.is_some(),
+        radius,
+        rounds = SAMPLING_ROUNDS,
+        draws = SAMPLING_ROUNDS * SAMPLING_DRAWS
+    );
     best.map(|(_, hit)| hit)
 }
 
@@ -612,6 +713,7 @@ fn sampled(
 /// bracketed just the same — the feasible end is always a probe that passed,
 /// or the reference itself.
 fn along_chord(system: &ConstraintSystem, reference: &[f64], point: &[f64]) -> Point {
+    let _span = tracing::debug_span!("chord").entered();
     let mut landed: Point = reference.to_vec();
     let (mut lower, mut upper) = (0.0_f64, 1.0_f64);
     for _ in 0..CHORD_BITS {
@@ -648,6 +750,7 @@ fn clamped(
     from: Point,
     clearance: f64,
 ) -> Result<Point, Point> {
+    let _span = tracing::debug_span!("clamp").entered();
     let mut current = from;
     for _ in 0..CLAMP_SWEEPS {
         // Every coordinate's clamp, with what it costs, from the point as it
@@ -776,6 +879,7 @@ fn released(
     original: &[f64],
     clearance: f64,
 ) -> Point {
+    let _span = tracing::debug_span!("release").entered();
     for coordinate in 0..candidate.len() {
         let moved = candidate[coordinate];
         if moved == original[coordinate] {

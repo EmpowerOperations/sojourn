@@ -2754,10 +2754,38 @@ empty, shrunk onto the nearest hit once not, twenty rounds of 256 draws, then th
 the nearest hit toward the point and the usual step off the wall. It runs beside the
 reference — only when clamp, Newton and COBYLA all produced nothing — and the aggregator
 picks. The comb now lands at 2.016 where the nearest cell is 2.000 away, the checkerboard at
-0.05 where the oracle's best was 0.07; about 20 ms a repair unoptimised on this path. The
-earlier rejection of a shrinking box stands for what it was about — thin regions, high
-dimension, and as the *first* mechanism; those are the projection's now. Nothing in this
-crate reaches `Stranded` on a fat region any more.
+0.05 where the oracle's best was 0.07. The earlier rejection of a shrinking box stands for
+what it was about — thin regions, high dimension, and as the *first* mechanism; those are the
+projection's now. Nothing in this crate reaches `Stranded` on a fat region any more.
+
+**2026-09-16: latency, telemetry, and the stage order.** Z3 is gone and the batch stream has
+no user, so the async on `solve` is a shape left over from both; before reshaping it, a clear
+performance picture. A `tracing` span per stage of `repair` (and per Newton/COBYLA run),
+carrying counts — iterations, active-set rounds, evaluations, draws, and which stage won —
+at `debug`, so `RUST_LOG=sojourn=debug` gives a stage-by-stage account and a span-timing
+subscriber gives the clock without a clock in our code (`tracing-subscriber` is a
+dev-dependency for exactly that). The trace found three wrong-shaped latencies, all order,
+not capability, all now fixed:
+
+- *Keane-50, 400 ms → 3.7 ms.* COBYLA spent its whole budget on the flat product before the
+  box (1 ms) got a turn. The box now runs first off the smooth path; COBYLA follows only where
+  the box found nothing, or the dimension is small (`COBYLA_CHEAP`), where it is a cheap
+  cross-check the box needs on a thin many-branched region and the box would otherwise
+  shrink-lock onto the wrong branch (`(x+2)(x-1) == 0` regressed exactly there mid-change).
+- *beam-100 hair, 187 ms → 3.8 ms.* The clamp spent 90 ms narrowing the deflection constraint
+  (names 200 coordinates) per coordinate per sweep, only to fail — no single-coordinate clamp
+  satisfies it. The clamp is now skipped where any constraint names more than `CLAMP_LOCAL`
+  coordinates; Newton from the point does the work.
+- *spring vertex, 2.3 ms → 59 µs.* Newton converges there in fourteen iterations; it now runs
+  from the point first and its clear landing is returned before COBYLA or the box.
+
+So the order is: clamp (where cheap, exact where separable) → Newton from the point (return
+if clear) → box then COBYLA (off the smooth path) → reference (nothing feasible at all). Newton
+returns its wedge bisector as the inward direction, because `p → x*` leans out of a sharp
+wedge like the spring's. Repair latency on Artemis's shapes is now tens of microseconds to a
+few milliseconds. The async question is next: `repair` is bounded by counts and belongs
+synchronous; `solve`'s opening can still be 375 ms at 200 variables and brute force is
+unbounded, so its shape is the open one.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),
