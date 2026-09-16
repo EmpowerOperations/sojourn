@@ -26,11 +26,11 @@
 //!
 //! # What is deliberately not here
 //!
-//! Rows C (`x2 == x1 + x2/2 - x3/x4`, driven after gathering linear terms), D
-//! (`abs(x1) == 1`, two branches) and E (an under-determined system, where which
-//! variables get driven is a choice) classify as [`Shape::Opaque`]. They are
+//! Rows C (`x2 == x1 + x2/2 - x3/x4`, driven after gathering linear terms) and
+//! D (`abs(x1) == 1`, two branches) classify as [`Shape::Opaque`]. They are
 //! named in the taxonomy and not yet analysed, and saying so is better than
-//! guessing at them.
+//! guessing at them. Row E — which variables an under-determined system
+//! drives — is [`plan`]'s matching.
 //!
 //! Row F — `x == sin(x)`, the variable inside and outside a function no solver
 //! will take — is [`Shape::Implicit`], and is refused by
@@ -289,39 +289,68 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
         return Shape::Implicit { variable };
     }
 
-    // Both orders, since `y == sin(x)` and `sin(x) == y` say the same thing.
-    for (candidate, other) in [(lhs, rhs), (rhs, lhs)] {
-        let Kind::Global(variable) = candidate.kind else {
-            continue;
-        };
-        debug_assert!(
-            !mentions(other, variable),
-            "a shared variable is settled above"
-        );
+    let Some(variable) = drivable(constraint).first().copied() else {
+        return Shape::Opaque;
+    };
+    // Pinned is the bare variable against a side naming nothing: `x1 == pi`.
+    let pinned = [(lhs, rhs), (rhs, lhs)]
+        .into_iter()
+        .any(|(candidate, other)| {
+            matches!(candidate.kind, Kind::Global(found) if found == variable)
+                && globals(other).is_empty()
+        });
+    if pinned {
+        Shape::Pinned { variable }
+    } else {
+        Shape::Driven { variable }
+    }
+}
 
-        return if globals(other).is_empty() {
-            Shape::Pinned { variable }
-        } else {
-            Shape::Driven { variable }
-        };
+/// Every variable the equality can be solved for, best first.
+///
+/// A bare side comes first — `y == x1 + x2` drives `y`, the whole other side
+/// its definition — and then every variable that occurs exactly once under
+/// operators [`reaches`] can undo, in schema order so the list does not
+/// wander. Empty for anything that is not an equality, or is implicit in a
+/// variable, or holds a computed subscript. [`shape`] reports the first;
+/// [`plan`] chooses among them, since which of `x1 + x2 == 3`'s two a system
+/// drives depends on what its other equations want.
+pub(crate) fn drivable(constraint: &Ast) -> Vec<GlobalId> {
+    if constraint.contains_dynamic_lookup || !constraint.is_constraint {
+        return Vec::new();
+    }
+    let Program { body, .. } = &constraint.program;
+    if !body.assignments.is_empty() {
+        return Vec::new();
+    }
+    let Kind::NearEq { lhs, rhs, .. } = &body.result.kind else {
+        return Vec::new();
+    };
+    if globals(lhs).intersection(&globals(rhs)).next().is_some() {
+        return Vec::new();
     }
 
-    // No side is a bare variable, so try to make one: peel the operators around
-    // a variable that occurs exactly once and move them to the other side.
-    // Schema order rather than discovery order, so the choice does not wander.
+    let mut found: Vec<GlobalId> = Vec::new();
+    // Both orders, since `y == sin(x)` and `sin(x) == y` say the same thing.
+    for side in [lhs, rhs] {
+        if let Kind::Global(variable) = side.kind {
+            found.push(variable);
+        }
+    }
+    // Peel the operators around a variable that occurs exactly once and move
+    // them to the other side.
     let mut candidates: Vec<GlobalId> = globals(&body.result).into_iter().collect();
     candidates.sort_unstable();
     for variable in candidates {
-        if occurrences(&body.result, variable) != 1 {
+        if found.contains(&variable) || occurrences(&body.result, variable) != 1 {
             continue;
         }
         let side = if mentions(lhs, variable) { lhs } else { rhs };
         if reaches(side, variable) {
-            return Shape::Driven { variable };
+            found.push(variable);
         }
     }
-
-    Shape::Opaque
+    found
 }
 
 /// Whether the operators between `side`'s root and `variable` can all be
@@ -414,46 +443,77 @@ fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
 ///
 /// # Which drives are taken
 ///
-/// Not all of them. A variable can only be defined once, a definition must not
-/// depend on itself however indirectly, and a variable the schema does not name
-/// cannot be a coordinate. Every drive refused this way leaves its constraint
-/// exactly as it was — **no constraint is ever dropped**, because the walker
-/// still checks feasibility against all of them. A refused drive costs
-/// efficiency and can never cost correctness.
+/// Each equality drives at most one variable and each variable is driven by
+/// at most one equality: a matching in the bipartite graph of equations and
+/// the variables each can isolate ([`drivable`]), and a maximum one, so that
+/// `x1 + x2 == 3` beside `x1 + x3 == 2` drives two variables rather than
+/// fighting over `x1` and driving none. Kuhn's augmenting paths — equations
+/// in order, candidates in order, so the choice is deterministic — which is
+/// polynomial (equations × edges) and nothing at the sizes a schema has.
+///
+/// A definition must not depend on itself however indirectly, and a variable
+/// the schema does not name cannot be a coordinate. Every drive refused this
+/// way leaves its constraint exactly as it was — **no constraint is ever
+/// dropped**, because the walker still checks feasibility against all of
+/// them. A refused drive costs efficiency and can never cost correctness.
 pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
-    // Position in the schema, and the positions its value is computed from.
-    let mut definitions: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    // Per equation, the schema positions it could drive, best first.
+    let candidates: Vec<Vec<usize>> = constraints
+        .iter()
+        .map(|constraint| {
+            drivable(constraint)
+                .into_iter()
+                .filter_map(|variable| position_in(schema, constraint, variable))
+                .collect()
+        })
+        .collect();
 
-    for constraint in constraints {
-        // Pinned and driven are handled identically here: a pinned variable is
-        // a driven one that happens to depend on nothing.
-        let (Shape::Driven { variable } | Shape::Pinned { variable }) = shape(constraint) else {
-            continue;
-        };
-
-        let Some(position) = position_in(schema, constraint, variable) else {
-            continue;
-        };
-        // Defined twice. Only one definition can hold, and choosing between them
-        // is row E's matching problem rather than something to decide by which
-        // constraint was written first — so take neither, and let both stay
-        // ordinary constraints.
-        if definitions.contains_key(&position) {
-            definitions.remove(&position);
-            continue;
+    // The matching: which equation, if any, drives each position. An
+    // equation takes the first candidate it can, evicting a holder that can
+    // move to another of its own candidates.
+    let mut holder: Vec<Option<usize>> = vec![None; schema.len()];
+    fn assign(
+        equation: usize,
+        candidates: &[Vec<usize>],
+        holder: &mut [Option<usize>],
+        visited: &mut [bool],
+    ) -> bool {
+        for &position in &candidates[equation] {
+            if visited[position] {
+                continue;
+            }
+            visited[position] = true;
+            if holder[position].is_none_or(|other| assign(other, candidates, holder, visited)) {
+                holder[position] = Some(equation);
+                return true;
+            }
         }
-
-        // Everything the constraint names except the driven variable itself.
-        // The definition is the rest of the equality rearranged, so it reads
-        // exactly those — and knowing *which* is all the ordering below needs,
-        // which is why nothing has to build the rearrangement to find out.
-        let dependencies: BTreeSet<usize> = globals(&constraint.program.body.result)
-            .into_iter()
-            .filter(|global| *global != variable)
-            .filter_map(|global| position_in(schema, constraint, global))
-            .collect();
-        definitions.insert(position, dependencies);
+        false
     }
+    for equation in 0..constraints.len() {
+        let mut visited = vec![false; schema.len()];
+        assign(equation, &candidates, &mut holder, &mut visited);
+    }
+
+    // Position in the schema, and the positions its value is computed from:
+    // everything the equation names except the driven variable itself. The
+    // definition is the rest of the equality rearranged, so it reads exactly
+    // those — and knowing *which* is all the ordering below needs, which is
+    // why nothing has to build the rearrangement to find out.
+    let definitions: BTreeMap<usize, BTreeSet<usize>> = holder
+        .iter()
+        .enumerate()
+        .filter_map(|(position, equation)| equation.map(|equation| (position, equation)))
+        .map(|(position, equation)| {
+            let constraint = &constraints[equation];
+            let dependencies = globals(&constraint.program.body.result)
+                .into_iter()
+                .filter_map(|global| position_in(schema, constraint, global))
+                .filter(|dependency| *dependency != position)
+                .collect();
+            (position, dependencies)
+        })
+        .collect();
 
     // Evaluation order, by repeatedly taking a definition whose dependencies are
     // all either free or already ordered. What is left over when nothing more
@@ -868,19 +928,58 @@ mod tests {
         );
     }
 
-    /// Two definitions of one variable. Choosing between them is row E's matching
-    /// problem; picking the first written would be arbitrary, so neither is
-    /// taken. What must *not* happen is one constraint quietly ceasing to apply.
+    /// Two definitions of one variable, and the matching resolves it: the
+    /// first equation can just as well drive `x`, so `y` goes to the second
+    /// and both equations drive. Not by source order — the first written
+    /// gave way — and never by dropping a constraint.
     #[test]
-    fn a_variable_driven_twice_is_driven_once_or_not_at_all() {
+    fn a_variable_wanted_twice_is_matched_to_one_equation_each() {
         let plan = plan_over(
             &["x", "y", "z"],
             &["y == x + 1 +/- 0.001", "y == z * 2 +/- 0.001"],
-        );
-        assert!(
-            plan.is_none(),
-            "an ambiguous definition should not be resolved by source order"
-        );
+        )
+        .expect("both equations should drive");
+        // `y` from `z`, then `x` from `y`.
+        assert_eq!(plan.driven(), [1, 0]);
+        assert_eq!(plan.free(), &[2]);
+    }
+
+    /// Row E's case: two equations both able to drive `x1`, and the matching
+    /// gives one of them its other variable instead. Three variables, two
+    /// equations, one left free.
+    #[test]
+    fn two_equations_wanting_the_same_variable_are_matched() {
+        let plan = plan_over(
+            &["x1", "x2", "x3"],
+            &["x1 + x2 == 3 +/- 0.001", "x1 + x3 == 2 +/- 0.001"],
+        )
+        .expect("both equations should drive");
+        assert_eq!(plan.driven().len(), 2);
+        assert_eq!(plan.free().len(), 1);
+    }
+
+    /// A variable wanted by two equations that can drive nothing else is
+    /// driven once, and the other equation stays an ordinary constraint.
+    #[test]
+    fn an_equation_with_nothing_left_to_drive_stays_a_constraint() {
+        let plan = plan_over(&["x"], &["x == 1 +/- 0.001", "x == 2 +/- 0.001"]).expect("one pins");
+        assert_eq!(plan.driven(), [0]);
+    }
+
+    /// A hundred variables under ninety-nine chained equations: the matching
+    /// drives ninety-nine and leaves one free, in a chain order the walker
+    /// can evaluate.
+    #[test]
+    fn a_long_chain_is_matched_and_ordered() {
+        let names: Vec<String> = (1..=100).map(|i| format!("x{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let sources: Vec<String> = (1..100)
+            .map(|i| format!("x{i} + x{} == 1 +/- 0.001", i + 1))
+            .collect();
+        let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let plan = plan_over(&names, &sources).expect("the chain drives");
+        assert_eq!(plan.driven().len(), 99);
+        assert_eq!(plan.free().len(), 1);
     }
 
     /// Nothing to drive is the common case and must not cost the caller a plan

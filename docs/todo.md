@@ -397,7 +397,8 @@ thing to read, and is the first work item rather than an admission.
       `a == b +/- t`, covering six structurally different things. A, B and D are
       driven or reached; C and F turned out to be one row and are **refused**, a
       variable on both sides making the equality implicit in it; E is green
-      through isolation rather than through matching, which is still unbuilt.
+      through isolation, and since 2026-09-16 through matching where isolation
+      alone would have two equations fight over one variable.
 
       What made it work was not the labels. It was **driving**: the walker moves
       the free coordinates and computes the rest, so a point on a measure-zero
@@ -1546,14 +1547,23 @@ through in the tests' own doc comments.
       a different variable on its own and `plan`'s existing topological order
       handled the dependency between them.
 
-      **Matching is still unbuilt**, and the test passing does not say it is
-      unnecessary — only that this system did not need a choice made for it.
-      The case that says otherwise now exists and is red: `x1 + x2 == 3` with
-      `x1 + x3 == 2`, where both equations would drive `x1`, `plan` refuses to
-      choose between them and drives neither, and three variables under two
-      equations are left entirely free. Three occupied cells of forty.
-      Interval propagation does not rescue it — the conditional slice of one
-      coordinate on a measure-zero set is a point.
+      **Matching, built 2026-09-16.** The case that needed it: `x1 + x2 == 3`
+      with `x1 + x3 == 2`, where both equations would drive `x1`, `plan`
+      refused to choose between them and drove neither, and three variables
+      under two equations were left entirely free — twelve occupied cells of
+      forty. Now `classify::drivable` lists every variable an equality can be
+      solved for (bare side first, then whatever `reaches` can peel, in schema
+      order) and `plan` takes a maximum bipartite matching of equations to
+      variables by Kuhn's augmenting paths — equations in order, candidates in
+      order, so it is deterministic — and hands the result to the same
+      topological ordering as before, which still refuses a cycle. Polynomial,
+      equations × edges; a chain of ninety-nine equations over a hundred
+      variables matches and orders in the noise of a 70 ms solve
+      (`torture_tests::a_chain_of_ninety_nine_equalities_is_matched_and_walked`;
+      the 13 s that test costs in debug is the walker retracting ninety-nine
+      coordinates a step through burn-in, not the matching). A variable wanted
+      by two equations that can drive nothing else is driven once and the other
+      equation stays a constraint, as before.
       `Driven by:`
       `cvg_equalities::two_equations_wanting_the_same_variable_strand_each_other`
 

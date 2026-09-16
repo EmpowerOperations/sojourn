@@ -234,3 +234,59 @@ fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A hundred variables under ninety-nine chained equalities, `x_i + x_{i+1}
+/// == 1` at `1e-6`: one degree of freedom, and every other coordinate driven
+/// from it in a chain ninety-nine deep. What this pins is that the matching
+/// in `classify::plan` — every equation wanting the variable its neighbour
+/// wants too — and the ordering after it stay cheap at this size, and that
+/// the whole pipeline then moves along the line rather than sitting on its
+/// seed: the design's free coordinate spans the box.
+///
+/// The ceiling is a watchdog in the five-sigma sense, not a budget. Measured:
+/// the matching and the solve are 70 ms in a debug build; the design is 13 s
+/// there and 2 s in release, all of it the walker's burn-in — two thousand
+/// steps on eight chains, twice, each step retracting ninety-nine driven
+/// coordinates through their slices. Reaching the ceiling means the matching
+/// or the ordering went combinatorial, which is the thing this is here to
+/// catch.
+#[test]
+fn a_chain_of_ninety_nine_equalities_is_matched_and_walked() -> anyhow::Result<()> {
+    const WIDTH: f64 = 0.000_001;
+    let names: Vec<String> = (1..=100).map(|i| format!("x{i}")).collect();
+    let variables: Vec<(&str, f64, f64)> = names.iter().map(|n| (n.as_str(), 0.0, 1.0)).collect();
+    let sources: Vec<String> = (1..100)
+        .map(|i| format!("x{i} + x{} == 1 +/- {WIDTH}", i + 1))
+        .collect();
+    let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let system = system(&variables, &sources)?;
+
+    let started = std::time::Instant::now();
+    let region = region(&system)?;
+    let design = region.sample(Mat::zeros(0, 0).as_ref(), 16, SEED)?;
+    let took = started.elapsed();
+
+    assert_eq!(design.ncols(), 16);
+    let mut lowest = f64::INFINITY;
+    let mut highest = f64::NEG_INFINITY;
+    for column in 0..design.ncols() {
+        let point: Vec<f64> = (0..design.nrows())
+            .map(|row| design[(row, column)])
+            .collect();
+        assert!(
+            in_box(&system, &point) && holds(&system, &point),
+            "{point:?}"
+        );
+        lowest = lowest.min(point[0]);
+        highest = highest.max(point[0]);
+    }
+    assert!(
+        highest - lowest > 0.5,
+        "x1 spans only {lowest}..{highest}: the chain was not walked along"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "matching and walking a chain of ninety-nine took {took:?}"
+    );
+    Ok(())
+}

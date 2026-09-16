@@ -24,8 +24,9 @@
 //! **Rows A and B are green as of the classifier** ([`cvg::classify`]) — a
 //! variable alone on one side of an equality is computed from the others rather
 //! than searched for, which is what lets a walker move along a measure-zero
-//! surface instead of jittering beside it. Rows C, D and E classify as `Opaque`
-//! and are still red, which is the whole point of keeping them here.
+//! surface instead of jittering beside it. Row E is green through the matching
+//! in `classify::plan`. Rows C and D classify as `Opaque` and are still red,
+//! which is the whole point of keeping them here.
 //!
 //! Case F — implicit, `sin(x) == x/2` — is deliberately absent. No use case has
 //! turned up for `x == f(x)`, and Newton is a lot of machinery to carry for a
@@ -841,23 +842,20 @@ fn an_equality_under_a_function_is_driven_through_its_inverse() {
     });
 }
 
-/// **Red on purpose: the case bipartite matching exists for.**
+/// **The case bipartite matching exists for**, green since it was built.
 ///
-/// Both equations name `x1` and each would drive it. `plan` refuses to choose —
-/// picking by which constraint was written first is not a reading — so it
-/// drives neither, and three variables under two equations are left entirely
-/// free. An axis move then has to hold a point on a line by moving one
-/// coordinate, which it cannot, and the walk occupies **three cells of forty**.
+/// Both equations name `x1` and each could drive it. `plan` used to refuse
+/// to choose — picking by which constraint was written first is not a
+/// reading — and drove neither, leaving three variables under two equations
+/// entirely free: an axis move then has to hold a point on a line by moving
+/// one coordinate, which it cannot, and the walk occupied **twelve cells of
+/// forty**. Now `plan` matches equations to the variables each can isolate,
+/// so one equation drives `x1` and the other its remaining variable, and
+/// the one degree of freedom left is walked along.
 ///
-/// Choosing correctly means driving `x1` from one equation and `x2` or `x3`
-/// from the other. That is a matching problem over a bipartite graph of
-/// equations and variables, and `docs/todo.md` has carried it as unbuilt since row E
-/// went green without needing it. This is the case that says it is still
-/// wanted: row E happened not to need a choice made, and this one does.
-///
-/// Interval propagation does not rescue it, for the reason a Gibbs sweep cannot
-/// traverse a chain of tight equalities: the conditional slice of one
-/// coordinate on a measure-zero set is a point.
+/// Interval propagation would not have rescued it, for the reason a Gibbs
+/// sweep cannot traverse a chain of tight equalities: the conditional slice
+/// of one coordinate on a measure-zero set is a point.
 #[test]
 fn two_equations_wanting_the_same_variable_strand_each_other() {
     assert_explores(Case {
