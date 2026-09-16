@@ -30,7 +30,22 @@
 //! D (`abs(x1) == 1`, two branches) classify as [`Shape::Opaque`]. They are
 //! named in the taxonomy and not yet analysed, and saying so is better than
 //! guessing at them. Row E — which variables an under-determined system
-//! drives — is [`plan`]'s matching.
+//! drives — is [`plans`]'s matching.
+//!
+//! # A disjunction is several plans
+//!
+//! `x1 * x2 == 0` is two arms, `x1 = 0` for any `x2` or `x2 = 0` for any `x1`,
+//! and a parametrisation describes one arm: drive `x1` and every point lands
+//! on the first. So a system keeps **every** plan its matchings admit and
+//! chooses among them per point, by [`tightest`]: the plan whose driven
+//! coordinates the others pin hardest. On the `x2 = 0` arm at `(0.7, 0)` the
+//! slice of `x2` given `x1` is `±t/0.7` where the slice of `x1` given `x2` is
+//! the whole box, so "drive `x2`" is that arm's own parametrisation and a
+//! chain under it stays on the arm. This keeps a chain where it was seeded;
+//! seeding the other arm is the bisection's coverage, which reaches pieces
+//! in low dimension and not past a handful. The general answer — a walk in
+//! the tangent space of the constraints, projected back by Newton — is
+//! recorded in `docs/todo.md` and not built.
 //!
 //! Row F — `x == sin(x)`, the variable inside and outside a function no solver
 //! will take — is [`Shape::Implicit`], and is refused by
@@ -72,7 +87,7 @@ pub(crate) enum Shape {
     /// [`SystemError::Implicit`](crate::SystemError::Implicit).
     ///
     /// "Implicit" rather than "cyclic": a cycle is a mutual dependency *between*
-    /// equations, which [`plan`] handles by driving neither. One equation that
+    /// equations, which [`plans`] handles by driving neither. One equation that
     /// cannot be solved for the variable it names is the textbook implicit
     /// form.
     ///
@@ -125,6 +140,11 @@ impl Plan {
     pub(crate) fn driven(&self) -> &[usize] {
         &self.driven
     }
+
+    /// Whether this plan computes `coordinate` rather than moving it.
+    pub(crate) fn drives(&self, coordinate: usize) -> bool {
+        self.free.binary_search(&coordinate).is_err()
+    }
 }
 
 /// Recomputes every driven coordinate of `point` from the free ones, in place.
@@ -166,8 +186,13 @@ impl Plan {
 /// Order still matters, and for the same reason: a driven coordinate may be
 /// defined in terms of another, and `slice` reads the point as it stands,
 /// so computing them out of order reads a stale value.
-pub(crate) fn retract(system: &ConstraintSystem, point: &mut Point, rng: &mut Xoshiro256PlusPlus) {
-    drive(system, point, |slice, _| {
+pub(crate) fn retract(
+    system: &ConstraintSystem,
+    plan: &Plan,
+    point: &mut Point,
+    rng: &mut Xoshiro256PlusPlus,
+) {
+    drive(system, plan, point, |slice, _| {
         if slice.width() > 0.0 {
             rng.random_range(slice.lo()..=slice.hi())
         } else {
@@ -184,9 +209,13 @@ pub(crate) fn retract(system: &ConstraintSystem, point: &mut Point, rng: &mut Xo
 /// point, near a given one, and must produce the same point every time it
 /// is asked — so it moves each driven coordinate the least distance that
 /// puts it inside its band, and no further. Same order, same settled mask,
-/// same silence on an empty slice, for the same reasons.
+/// same silence on an empty slice, for the same reasons. Under the
+/// [`tightest`] plan, which is the deterministic choice a repair wants.
 pub(crate) fn settle(system: &ConstraintSystem, point: &mut Point) {
-    drive(system, point, |slice, value| {
+    let Some(plan) = tightest(system, point).first().copied() else {
+        return;
+    };
+    drive(system, &system.plans[plan], point, |slice, value| {
         value.clamp(slice.lo(), slice.hi())
     });
 }
@@ -201,9 +230,13 @@ pub(crate) fn settle(system: &ConstraintSystem, point: &mut Point) {
 /// padding. A value already inside is kept because a slice is not always a
 /// band: through `abs` it is the hull of two bands, whose centre is in
 /// neither, and a box that has been split down to one of them has its
-/// centre there already. Deterministic, which a seed also wants.
+/// centre there already. Deterministic, which a seed also wants, under the
+/// [`tightest`] plan.
 pub(crate) fn centre(system: &ConstraintSystem, point: &mut Point) {
-    drive(system, point, |slice, value| {
+    let Some(plan) = tightest(system, point).first().copied() else {
+        return;
+    };
+    drive(system, &system.plans[plan], point, |slice, value| {
         if slice.contains(value) {
             value
         } else {
@@ -232,12 +265,10 @@ pub(crate) fn centre(system: &ConstraintSystem, point: &mut Point) {
 /// be.
 fn drive(
     system: &ConstraintSystem,
+    plan: &Plan,
     point: &mut Point,
     mut place: impl FnMut(interval::Interval, f64) -> f64,
 ) {
-    let Some(plan) = &system.plan else {
-        return;
-    };
     let mut settled = vec![true; point.len()];
     for driven in plan.driven() {
         settled[*driven] = false;
@@ -251,6 +282,57 @@ fn drive(
         settled[driven] = true;
     }
 }
+
+/// The plans that pin `point` hardest: indices into the system's plans, in
+/// order, every one that ties for it. Empty where nothing is driven.
+///
+/// A dry run of [`drive`] under each plan, summing how wide each driven
+/// coordinate's slice is as a fraction of its box (an empty slice, or a
+/// slice the constraints cannot narrow, counts as the whole box); the
+/// smallest sum wins. On an arm of a disjunction the arm's own
+/// parametrisation is the one whose driven coordinate is held to a band,
+/// where the other plan's is held to nothing, so this is what selects the
+/// branch a point is on. At the crossing every plan ties — the point is on
+/// every branch — and all are returned: a deterministic caller takes the
+/// first, and a walker seeding several chains there spreads them across the
+/// tie. With one plan there is nothing to score and nothing is spent.
+pub(crate) fn tightest(system: &ConstraintSystem, point: &Point) -> Vec<usize> {
+    if system.plans.len() <= 1 {
+        return (0..system.plans.len()).collect();
+    }
+    let mut scores: Vec<f64> = Vec::with_capacity(system.plans.len());
+    for plan in &system.plans {
+        let mut settled = vec![true; point.len()];
+        for driven in plan.driven() {
+            settled[*driven] = false;
+        }
+        let mut score = 0.0;
+        for driven in plan.driven().iter().copied() {
+            let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
+            let variable = &system.variables[driven];
+            let width = variable.upper_bound - variable.lower_bound;
+            score += if slice.is_empty() || width <= 0.0 {
+                1.0
+            } else {
+                (slice.width() / width).min(1.0)
+            };
+            settled[driven] = true;
+        }
+        scores.push(score);
+    }
+    let least = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    scores
+        .iter()
+        .enumerate()
+        .filter(|(_, score)| **score <= least + TIE)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// How close two plans' scores must be to tie in [`tightest`]: a rounding
+/// slack on sums of box fractions, far below any difference that means a
+/// different branch.
+const TIE: f64 = 1e-9;
 
 /// The shape of one constraint.
 ///
@@ -313,7 +395,7 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
 /// operators [`reaches`] can undo, in schema order so the list does not
 /// wander. Empty for anything that is not an equality, or is implicit in a
 /// variable, or holds a computed subscript. [`shape`] reports the first;
-/// [`plan`] chooses among them, since which of `x1 + x2 == 3`'s two a system
+/// [`plans`] chooses among them, since which of `x1 + x2 == 3`'s two a system
 /// drives depends on what its other equations want.
 pub(crate) fn drivable(constraint: &Ast) -> Vec<GlobalId> {
     if constraint.contains_dynamic_lookup || !constraint.is_constraint {
@@ -436,10 +518,19 @@ fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
     }
 }
 
-/// The split the walker consumes, over a whole system.
-///
-/// Returns `None` when nothing is driven, so a caller can keep its existing path
-/// rather than carry an empty plan through it.
+/// How many plans a system keeps. A disjunction has a plan per branch and
+/// a long chain of equations has one per choice of free variable; a handful
+/// is every branch any fixture has, and each costs the walker a dry drive
+/// per chain start.
+const PLANS: usize = 8;
+
+/// How many partial matchings the search for plans may visit before it
+/// keeps what it has. The first plan is found without backtracking and the
+/// rest usually a backtrack apart; this bounds the pathological case.
+const PLAN_SEARCH: usize = 4096;
+
+/// The splits the walker consumes, over a whole system: one per maximum
+/// matching, deduplicated, best first. Empty when nothing is driven.
 ///
 /// # Which drives are taken
 ///
@@ -447,16 +538,19 @@ fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
 /// at most one equality: a matching in the bipartite graph of equations and
 /// the variables each can isolate ([`drivable`]), and a maximum one, so that
 /// `x1 + x2 == 3` beside `x1 + x3 == 2` drives two variables rather than
-/// fighting over `x1` and driving none. Kuhn's augmenting paths — equations
-/// in order, candidates in order, so the choice is deterministic — which is
-/// polynomial (equations × edges) and nothing at the sizes a schema has.
+/// fighting over `x1` and driving none. Kuhn's augmenting paths give the
+/// size; a depth-first enumeration — equations in order, candidates in
+/// order, so the result is deterministic — gives every matching of that size
+/// up to [`PLANS`]. Two matchings with the same driven set are one plan,
+/// because [`drive`] narrows a coordinate against every constraint naming
+/// it, not against the equation that claimed it.
 ///
 /// A definition must not depend on itself however indirectly, and a variable
 /// the schema does not name cannot be a coordinate. Every drive refused this
 /// way leaves its constraint exactly as it was — **no constraint is ever
 /// dropped**, because the walker still checks feasibility against all of
 /// them. A refused drive costs efficiency and can never cost correctness.
-pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
+pub(crate) fn plans(constraints: &[Ast], schema: &Schema) -> Vec<Plan> {
     // Per equation, the schema positions it could drive, best first.
     let candidates: Vec<Vec<usize>> = constraints
         .iter()
@@ -468,9 +562,9 @@ pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
         })
         .collect();
 
-    // The matching: which equation, if any, drives each position. An
-    // equation takes the first candidate it can, evicting a holder that can
-    // move to another of its own candidates.
+    // The size of a maximum matching: which equation, if any, drives each
+    // position. An equation takes the first candidate it can, evicting a
+    // holder that can move to another of its own candidates.
     let mut holder: Vec<Option<usize>> = vec![None; schema.len()];
     fn assign(
         equation: usize,
@@ -494,61 +588,136 @@ pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
         let mut visited = vec![false; schema.len()];
         assign(equation, &candidates, &mut holder, &mut visited);
     }
+    let size = holder.iter().flatten().count();
+    if size == 0 {
+        return Vec::new();
+    }
 
-    // Position in the schema, and the positions its value is computed from:
-    // everything the equation names except the driven variable itself. The
-    // definition is the rest of the equality rearranged, so it reads exactly
-    // those — and knowing *which* is all the ordering below needs, which is
-    // why nothing has to build the rearrangement to find out.
-    let definitions: BTreeMap<usize, BTreeSet<usize>> = holder
-        .iter()
-        .enumerate()
-        .filter_map(|(position, equation)| equation.map(|equation| (position, equation)))
-        .map(|(position, equation)| {
-            let constraint = &constraints[equation];
-            let dependencies = globals(&constraint.program.body.result)
-                .into_iter()
-                .filter_map(|global| position_in(schema, constraint, global))
-                .filter(|dependency| *dependency != position)
-                .collect();
-            (position, dependencies)
-        })
-        .collect();
+    // Every matching of that size, in order: each equation tries its
+    // candidates first and then takes nothing, so the first found is the
+    // one an equation-by-equation greedy choice makes.
+    fn enumerate(
+        equation: usize,
+        matched: usize,
+        size: usize,
+        candidates: &[Vec<usize>],
+        taken: &mut Vec<Option<usize>>,
+        found: &mut Vec<Vec<Option<usize>>>,
+        visited: &mut usize,
+    ) {
+        if found.len() >= PLANS || *visited >= PLAN_SEARCH {
+            return;
+        }
+        *visited += 1;
+        if matched + (candidates.len() - equation) < size {
+            return;
+        }
+        if equation == candidates.len() {
+            if matched == size {
+                found.push(taken.clone());
+            }
+            return;
+        }
+        for &position in &candidates[equation] {
+            if taken[position].is_some() {
+                continue;
+            }
+            taken[position] = Some(equation);
+            enumerate(
+                equation + 1,
+                matched + 1,
+                size,
+                candidates,
+                taken,
+                found,
+                visited,
+            );
+            taken[position] = None;
+        }
+        enumerate(
+            equation + 1,
+            matched,
+            size,
+            candidates,
+            taken,
+            found,
+            visited,
+        );
+    }
+    let mut matchings: Vec<Vec<Option<usize>>> = Vec::new();
+    let mut visited = 0;
+    enumerate(
+        0,
+        0,
+        size,
+        &candidates,
+        &mut vec![None; schema.len()],
+        &mut matchings,
+        &mut visited,
+    );
+    if matchings.is_empty() {
+        matchings.push(holder);
+    }
 
-    // Evaluation order, by repeatedly taking a definition whose dependencies are
-    // all either free or already ordered. What is left over when nothing more
-    // can be taken is a cycle, and every member of it stays undriven.
-    let mut ordered: Vec<usize> = Vec::new();
-    let mut settled: BTreeSet<usize> = BTreeSet::new();
-    loop {
-        let ready: Vec<usize> = definitions
+    let mut plans: Vec<Plan> = Vec::new();
+    for holder in matchings {
+        // Position in the schema, and the positions its value is computed
+        // from: everything the equation names except the driven variable
+        // itself. The definition is the rest of the equality rearranged, so it
+        // reads exactly those — and knowing *which* is all the ordering below
+        // needs, which is why nothing has to build the rearrangement.
+        let definitions: BTreeMap<usize, BTreeSet<usize>> = holder
             .iter()
-            .filter(|(position, _)| !settled.contains(position))
-            .filter(|(_, dependencies)| {
-                dependencies
-                    .iter()
-                    .all(|d| settled.contains(d) || !definitions.contains_key(d))
+            .enumerate()
+            .filter_map(|(position, equation)| equation.map(|equation| (position, equation)))
+            .map(|(position, equation)| {
+                let constraint = &constraints[equation];
+                let dependencies = globals(&constraint.program.body.result)
+                    .into_iter()
+                    .filter_map(|global| position_in(schema, constraint, global))
+                    .filter(|dependency| *dependency != position)
+                    .collect();
+                (position, dependencies)
             })
-            .map(|(position, _)| *position)
             .collect();
-        if ready.is_empty() {
-            break;
+
+        // Evaluation order, by repeatedly taking a definition whose
+        // dependencies are all either free or already ordered. What is left
+        // over when nothing more can be taken is a cycle, and every member of
+        // it stays undriven.
+        let mut driven: Vec<usize> = Vec::new();
+        let mut settled: BTreeSet<usize> = BTreeSet::new();
+        loop {
+            let ready: Vec<usize> = definitions
+                .iter()
+                .filter(|(position, _)| !settled.contains(position))
+                .filter(|(_, dependencies)| {
+                    dependencies
+                        .iter()
+                        .all(|d| settled.contains(d) || !definitions.contains_key(d))
+                })
+                .map(|(position, _)| *position)
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for position in ready {
+                settled.insert(position);
+                driven.push(position);
+            }
         }
-        for position in ready {
-            settled.insert(position);
-            ordered.push(position);
+        if driven.is_empty() {
+            continue;
         }
+        let free: Vec<usize> = (0..schema.len())
+            .filter(|position| !settled.contains(position))
+            .collect();
+        if plans.iter().any(|plan| plan.free == free) {
+            continue;
+        }
+        plans.push(Plan { driven, free });
     }
-
-    let driven = ordered;
-    if driven.is_empty() {
-        return None;
-    }
-
-    let taken: BTreeSet<usize> = driven.iter().copied().collect();
-    let free = (0..schema.len()).filter(|p| !taken.contains(p)).collect();
-
-    Some(Plan { driven, free })
+    plans
 }
 
 /// Where `variable` sits in the schema, given the constraint that named it.
@@ -855,19 +1024,18 @@ mod tests {
     // The system level
     // -----------------------------------------------------------------------
 
-    fn plan_over(names: &[&str], sources: &[&str]) -> Option<Plan> {
+    fn plans_over(names: &[&str], sources: &[&str]) -> Vec<Plan> {
         let schema = Schema::for_names(names);
         let constraints: Vec<Ast> = sources.iter().map(|s| parse(s)).collect();
-        plan(&constraints, &schema)
+        plans(&constraints, &schema)
     }
 
     #[test]
     fn two_independent_drives_are_both_taken() {
-        let plan = plan_over(
-            &["x1", "x2", "x3", "x4"],
-            &["x1 == sqrt(x2) +/- 0.001", "x3 == cbrt(x4) +/- 0.001"],
-        )
-        .expect("both should drive");
+        let names = &["x1", "x2", "x3", "x4"];
+        let sources = &["x1 == sqrt(x2) +/- 0.001", "x3 == cbrt(x4) +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next()
+            .expect("both should drive");
 
         let driven = plan.driven();
         assert_eq!(driven, [0, 2]);
@@ -878,11 +1046,10 @@ mod tests {
     /// reads whatever `y` happened to hold, so the order is not cosmetic.
     #[test]
     fn a_chain_of_drives_is_ordered() {
-        let plan = plan_over(
-            &["x", "y", "z"],
-            &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"],
-        )
-        .expect("both should drive");
+        let names = &["x", "y", "z"];
+        let sources = &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next()
+            .expect("both should drive");
 
         let driven = plan.driven();
         assert_eq!(driven, [1, 2], "y must be computed before z");
@@ -899,11 +1066,10 @@ mod tests {
     /// `y`.
     #[test]
     fn evaluation_order_beats_declaration_order() {
-        let plan = plan_over(
-            &["z", "y", "x"],
-            &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"],
-        )
-        .expect("both should drive");
+        let names = &["z", "y", "x"];
+        let sources = &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next()
+            .expect("both should drive");
 
         let driven = plan.driven();
         assert_eq!(
@@ -918,30 +1084,74 @@ mod tests {
     /// both constraints stay in force.
     #[test]
     fn a_cycle_between_drives_is_refused() {
+        let names = &["x", "y"];
+        let sources = &["y == x + 1 +/- 0.001", "x == y + 1 +/- 0.001"];
         assert!(
-            plan_over(
-                &["x", "y"],
-                &["y == x + 1 +/- 0.001", "x == y + 1 +/- 0.001"]
-            )
-            .is_none(),
+            plans_over(names, sources).into_iter().next().is_none(),
             "a cycle should drive nothing"
         );
     }
 
-    /// Two definitions of one variable, and the matching resolves it: the
-    /// first equation can just as well drive `x`, so `y` goes to the second
-    /// and both equations drive. Not by source order — the first written
-    /// gave way — and never by dropping a constraint.
+    /// Two definitions of one variable, and the matching resolves it every
+    /// way: the first equation takes `y` and the second falls back to `z`,
+    /// the second takes `y` and the first falls back to `x`, or neither
+    /// takes `y`. Three plans, both equations driving in each, and never a
+    /// constraint dropped.
     #[test]
     fn a_variable_wanted_twice_is_matched_to_one_equation_each() {
-        let plan = plan_over(
+        let plans = plans_over(
             &["x", "y", "z"],
             &["y == x + 1 +/- 0.001", "y == z * 2 +/- 0.001"],
-        )
-        .expect("both equations should drive");
-        // `y` from `z`, then `x` from `y`.
-        assert_eq!(plan.driven(), [1, 0]);
-        assert_eq!(plan.free(), &[2]);
+        );
+        assert_eq!(plans.len(), 3, "{plans:?}");
+        // `y` from `x`, then `z` from `y`; free `x`.
+        assert_eq!(plans[0].driven(), [1, 2]);
+        assert_eq!(plans[0].free(), &[0]);
+        // `y` from `z`, then `x` from `y`; free `z`.
+        assert_eq!(plans[1].driven(), [1, 0]);
+        assert_eq!(plans[1].free(), &[2]);
+        // And `x` and `z` both from `y`; free `y`.
+        assert_eq!(plans[2].driven(), [0, 2]);
+        assert_eq!(plans[2].free(), &[1]);
+    }
+
+    /// A product that must vanish is a disjunction, and each arm is a plan:
+    /// drive `x1` (the `x1 = 0` arm) or drive `x2` (the `x2 = 0` arm).
+    #[test]
+    fn a_vanishing_product_has_a_plan_per_arm() {
+        let plans = plans_over(&["x1", "x2"], &["x1 * x2 == 0 +/- 0.000000001"]);
+        assert_eq!(plans.len(), 2, "{plans:?}");
+        assert_eq!(plans[0].driven(), [0]);
+        assert_eq!(plans[1].driven(), [1]);
+    }
+
+    /// The plan a point selects is the arm it stands on: on `x2 = 0` the
+    /// slice of `x2` given `x1` is a band and the slice of `x1` given
+    /// `x2 = 0` is the whole box, so driving `x2` pins the point and driving
+    /// `x1` does not.
+    #[test]
+    fn the_tightest_plan_is_the_arm_the_point_is_on() {
+        let system = crate::system::tests::system(
+            vec![
+                crate::InputVariable::new("x1", -2.0, 2.0),
+                crate::InputVariable::new("x2", -2.0, 2.0),
+            ],
+            &["x1 * x2 == 0 +/- 0.000000001"],
+        );
+        let drives_x1 = system.plans[0].driven() == [0];
+        assert!(drives_x1, "{:?}", system.plans);
+        assert_eq!(tightest(&system, &vec![0.7, 0.0]), [1], "on the x2 = 0 arm");
+        assert_eq!(tightest(&system, &vec![0.0, 0.7]), [0], "on the x1 = 0 arm");
+        // At the crossing both plans pin nothing: the point is on both arms.
+        assert_eq!(tightest(&system, &vec![0.0, 0.0]), [0, 1]);
+    }
+
+    /// Matchings that drive the same coordinates are one plan: `x1 + x2 == 3`
+    /// alone admits driving either, which is two plans, and `x1 == pi` one.
+    #[test]
+    fn plans_are_distinct_by_what_they_drive() {
+        assert_eq!(plans_over(&["x1", "x2"], &["x1 + x2 == 3 +/- 0.001"]).len(), 2);
+        assert_eq!(plans_over(&["x1", "x2"], &["x1 == pi +/- 0.001"]).len(), 1);
     }
 
     /// Row E's case: two equations both able to drive `x1`, and the matching
@@ -949,11 +1159,10 @@ mod tests {
     /// equations, one left free.
     #[test]
     fn two_equations_wanting_the_same_variable_are_matched() {
-        let plan = plan_over(
-            &["x1", "x2", "x3"],
-            &["x1 + x2 == 3 +/- 0.001", "x1 + x3 == 2 +/- 0.001"],
-        )
-        .expect("both equations should drive");
+        let names = &["x1", "x2", "x3"];
+        let sources = &["x1 + x2 == 3 +/- 0.001", "x1 + x3 == 2 +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next()
+            .expect("both equations should drive");
         assert_eq!(plan.driven().len(), 2);
         assert_eq!(plan.free().len(), 1);
     }
@@ -962,7 +1171,9 @@ mod tests {
     /// driven once, and the other equation stays an ordinary constraint.
     #[test]
     fn an_equation_with_nothing_left_to_drive_stays_a_constraint() {
-        let plan = plan_over(&["x"], &["x == 1 +/- 0.001", "x == 2 +/- 0.001"]).expect("one pins");
+        let names = &["x"];
+        let sources = &["x == 1 +/- 0.001", "x == 2 +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next().expect("one pins");
         assert_eq!(plan.driven(), [0]);
     }
 
@@ -977,16 +1188,21 @@ mod tests {
             .map(|i| format!("x{i} + x{} == 1 +/- 0.001", i + 1))
             .collect();
         let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
-        let plan = plan_over(&names, &sources).expect("the chain drives");
-        assert_eq!(plan.driven().len(), 99);
-        assert_eq!(plan.free().len(), 1);
+        let plans = plans_over(&names, &sources);
+        assert!(!plans.is_empty() && plans.len() <= PLANS, "{}", plans.len());
+        for plan in &plans {
+            assert_eq!(plan.driven().len(), 99);
+            assert_eq!(plan.free().len(), 1);
+        }
     }
 
     /// Nothing to drive is the common case and must not cost the caller a plan
     /// it then has to check.
     #[test]
     fn a_system_with_nothing_driven_has_no_plan() {
-        assert!(plan_over(&["x1", "x2", "x3"], &["x1 + x2 > 20 - x3^2"]).is_none());
+        let names = &["x1", "x2", "x3"];
+        let sources = &["x1 + x2 > 20 - x3^ 2"];
+        assert!(plans_over(names, sources).is_empty());
     }
 
     /// Row A across every dimension: both pinned, nothing left free. Legal, and
@@ -994,7 +1210,9 @@ mod tests {
     /// length.
     #[test]
     fn a_fully_pinned_system_leaves_nothing_free() {
-        let plan = plan_over(&["x1", "x2"], &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"])
+        let names = &["x1", "x2"];
+        let sources = &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"];
+        let plan = plans_over(names, sources).into_iter().next()
             .expect("both should pin");
         assert_eq!(plan.free(), &[] as &[usize]);
         assert_eq!(plan.driven().len(), 2);

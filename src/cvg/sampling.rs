@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 
 use super::classify;
 use super::progress::Trial;
@@ -274,14 +274,17 @@ impl RandomSampler {
                 // seed-finding path, which no oracle reads. The rng is seeded
                 // per batch, so brute force stays a function of the seed and the
                 // budget rather than of the thread count.
-                // Every driven coordinate recomputed per column; a problem
-                // without an equality pays nothing here.
-                if problem.plan.is_some() {
+                // Every driven coordinate recomputed per column, under a plan
+                // drawn per column — a branch chosen at random, which is what
+                // a seed search wants; a problem without an equality pays
+                // nothing here.
+                if !problem.plans.is_empty() {
                     let rows = candidates.nrows();
                     for column in 0..candidates.ncols() {
                         let mut point: Point =
                             (0..rows).map(|row| candidates[(row, column)]).collect();
-                        classify::retract(problem, &mut point, &mut rng);
+                        let plan = &problem.plans[rng.random_range(0..problem.plans.len())];
+                        classify::retract(problem, plan, &mut point, &mut rng);
                         for (row, value) in point.into_iter().enumerate() {
                             candidates[(row, column)] = value;
                         }

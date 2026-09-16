@@ -164,9 +164,10 @@ pub struct ConstraintSystem {
     /// is how a constraint is proved to bind, so the tape is kept rather than
     /// made again.
     pub(crate) constraints: Vec<Constraint>,
-    /// Which coordinates are computed from the others, when any are. See
-    /// [`classify`].
-    pub(crate) plan: Option<classify::Plan>,
+    /// Which coordinates are computed from the others, when any are: one
+    /// plan per way of choosing, empty when nothing is driven. See
+    /// [`classify`], and [`classify::tightest`] for how a point picks one.
+    pub(crate) plans: Vec<classify::Plan>,
     /// Which constraints name which coordinates, both ways round.
     ///
     /// `slice` narrows one coordinate per move and needs only the constraints
@@ -215,7 +216,7 @@ pub enum SystemError {
     /// is the same fixture written the other way round and passes.
     ///
     /// Not to be confused with a *cycle*, which is a mutual dependency between
-    /// two equations — `x1 == f(x2)` with `x2 == g(x1)`. `classify::plan` meets
+    /// two equations — `x1 == f(x2)` with `x2 == g(x1)`. `classify::plans` meets
     /// those and drives neither; they are legal, just not reducible.
     ///
     /// Refused at construction because the alternative is worse: a solver call
@@ -312,7 +313,7 @@ impl ConstraintSystem {
             compiled.push(tape);
         }
 
-        let plan = classify::plan(&resolved, &schema);
+        let plans = classify::plans(&resolved, &schema);
 
         // What counts as affected by *any* move, whichever coordinate it
         // touched. Both entries here are soundness rather than efficiency.
@@ -333,10 +334,8 @@ impl ConstraintSystem {
         // names one of those is in play whichever axis was swept. Read off the
         // naming direction, which is why the graph is built before this.
         let incidence = Incidence::of(&resolved, &schema);
-        if let Some(plan) = &plan {
-            for driven in plan.driven() {
-                always.extend_from_slice(incidence.naming(Row(*driven)));
-            }
+        for driven in plans.iter().flat_map(|plan| plan.driven()) {
+            always.extend_from_slice(incidence.naming(Row(*driven)));
         }
         let incidence = incidence.with_always(&always);
 
@@ -349,7 +348,7 @@ impl ConstraintSystem {
         Ok(Self {
             variables,
             constraints,
-            plan,
+            plans,
             incidence,
         })
     }

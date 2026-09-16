@@ -1039,6 +1039,20 @@ never finished or run. Treat it as a design sketch, not as behaviour to reproduc
 
 Ideas with no test behind them yet. Each waits for a fixture that wants it.
 
+- **A walk on the manifold, by Newton.** Driving parametrises an equality's surface one
+  coordinate at a time, which is why a coupled pair (`x1 + x2 == 3` with `x1 - x2 == 1`)
+  drives neither and a disjunction needs a plan per branch. The general move is the
+  manifold one: at a point on `{g = 0}`, step in the tangent space — the null space of the
+  Jacobian, which the tape's reverse sweep gives for a few evaluations whatever the
+  dimension — and project back with Newton on the KKT system (`cvg/newton.rs`), about one
+  repair per step (Zappa, Holmes-Cerfon & Goodman 2018, *Monte Carlo on manifolds*). It
+  follows an arm of a disjunction by construction and switches only at the crossing, where
+  the gradient vanishes; it subsumes driving for every smooth equality and handles the
+  coupled ones; jumps (`floor`, `%`, `sgn`) keep retraction. The band `±t` becomes an
+  offset off the centre line, fine for a design and a question for a uniform sample. Not
+  built: no formulation has arrived with coupled or branching equalities at a dimension the
+  bisection cannot seed.
+
 - **Smooth proxies for the jumps.** `floor`, `ceil`, `sgn` and `%` have no useful derivative,
   so a constraint using one is compiled without a gradient and its projection falls to COBYLA.
   The lie worth considering: a continuous, differentiable proxy — a staircase with sigmoid
@@ -1710,7 +1724,7 @@ ones no reference can reach.
       accumulate. Building the reservoir now would be building an instrument
       with nothing to measure.
 
-- [ ] **Driving assumes the feasible set is a graph over the free coordinates.**
+- [x] **Driving assumes the feasible set is a graph over the free coordinates.**
       `x_driven = f(x_free)` is a *function*, so where the set is not a graph
       one branch gets parametrised and the rest are unreachable. `x1 * x2 == 0`
       is the case: a cross of two arms of equal measure, driven as `x1 = 0/x2`,
@@ -1718,6 +1732,26 @@ ones no reference can reach.
       `x2 = 0` the variable `x1` is unconstrained, so no function of `x2` gives
       it. A chain on the second arm can only move `x2`, and moving it leaves the
       set. Measured 394 of 400 points on one arm, 7 on the other.
+
+      **Fixed 2026-09-16, as branch selection by plan.** The matching admits
+      several maximum matchings and each is a plan; `classify::plans` keeps up to
+      eight (deduplicated by driven set — `drive` narrows against every constraint
+      naming a coordinate, so two matchings with the same driven set are one
+      plan). `classify::tightest` picks, per point, the plan whose driven
+      coordinates the others pin hardest — a dry drive summing slice widths as
+      box fractions. On the `x2 = 0` arm at `(0.7, 0)` the slice of `x2` given
+      `x1` is `±t/0.7` and the slice of `x1` given `x2 = 0` is the whole box, so
+      "drive `x2`" is that arm's own parametrisation; a chain under it moves `x1`
+      and stays. At the crossing every plan ties and the walker spreads the
+      chains seeded there across the tie, which is what this fixture needed: the
+      opening's only point is the origin (the box centre is feasible), so all
+      eight chains start on both arms at once. Now 19 and 22 of 40. `settle` and
+      `centre` take the first tied plan; brute force draws a plan per candidate.
+      With one plan every path is what it was, which the seeded fixtures check.
+
+      The honest limit: this keeps a chain on the arm it was seeded on, and the
+      seeds are the opening's — the bisection's coverage in low dimension, and
+      nothing past a handful. The general mechanism is in Speculation below.
 
       Every point is feasible; coverage is what breaks, which makes it row D's
       branch problem in different clothes.

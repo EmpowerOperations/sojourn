@@ -194,6 +194,8 @@ pub(crate) struct HitAndRunWalker {
     /// The coordinates worth moving, fixed for the problem: every coordinate
     /// unless some are driven, in which case moving those directly walks off
     /// the surface that defines them and retraction overwrites the move anyway.
+    /// The union over the problem's plans; a chain moves only its own plan's
+    /// free coordinates, and the shape is fitted over the union.
     movable: Vec<usize>,
     /// The region's shape, fitted once the chains have burnt in; `None` until
     /// then, and afterwards if there was nothing to fit or it would not factor.
@@ -313,6 +315,10 @@ fn thinning_for(dimensions: usize) -> usize {
 struct Chain {
     point: Point,
     steps: usize,
+    /// The plan this chain moves under, chosen where it started as the one
+    /// that pinned its start hardest — on a disjunction, the arm it is on.
+    /// An index into the problem's plans; `None` where nothing is driven.
+    plan: Option<usize>,
 }
 
 impl HitAndRunWalker {
@@ -366,10 +372,18 @@ impl HitAndRunWalker {
         let dimensions = existing[0].len();
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * dimensions);
         let cadence = thinning_for(dimensions);
-        self.movable = problem
-            .plan
-            .as_ref()
-            .map_or_else(|| (0..dimensions).collect(), |plan| plan.free().to_vec());
+        self.movable = if problem.plans.is_empty() {
+            (0..dimensions).collect()
+        } else {
+            let mut union: Vec<usize> = problem
+                .plans
+                .iter()
+                .flat_map(|plan| plan.free().iter().copied())
+                .collect();
+            union.sort_unstable();
+            union.dedup();
+            union
+        };
         let mut states: Vec<Vec<f64>> = Vec::new();
 
         // Selection is quadratic in the candidate count, and `existing` grows
@@ -403,9 +417,14 @@ impl HitAndRunWalker {
             };
             chosen.push(start);
 
+            // The plan that pins the start hardest; where several tie — the
+            // start is on every branch at once, a crossing — the chains
+            // seeded there are spread across them.
+            let tied = classify::tightest(problem, start);
             let mut chain = Chain {
                 point: start.clone(),
                 steps: 0,
+                plan: (!tied.is_empty()).then(|| tied[self.chains.len() % tied.len()]),
             };
             for step in 0..burn_in {
                 chain.point = advance(
@@ -413,6 +432,7 @@ impl HitAndRunWalker {
                     step,
                     &mut self.rng,
                     problem,
+                    chain.plan.map(|plan| &problem.plans[plan]),
                     &self.movable,
                     self.transform.as_ref(),
                 );
@@ -443,6 +463,7 @@ impl HitAndRunWalker {
                         chain.steps,
                         &mut self.rng,
                         problem,
+                        chain.plan.map(|plan| &problem.plans[plan]),
                         &self.movable,
                         self.transform.as_ref(),
                     );
@@ -489,12 +510,14 @@ impl HitAndRunWalker {
                 let index = emitted % self.chains.len();
                 let mut point = std::mem::take(&mut self.chains[index].point);
                 let mut steps = self.chains[index].steps;
+                let plan = self.chains[index].plan.map(|plan| &problem.plans[plan]);
                 for _ in 0..thinning {
                     point = advance(
                         point,
                         steps,
                         &mut self.rng,
                         problem,
+                        plan,
                         &self.movable,
                         self.transform.as_ref(),
                     );
@@ -543,17 +566,23 @@ fn advance(
     step: usize,
     rng: &mut Xoshiro256PlusPlus,
     problem: &ConstraintSystem,
+    plan: Option<&classify::Plan>,
     movable: &[usize],
     transform: Option<&Preconditioner>,
 ) -> Point {
     let dimensions = from.len();
+    // The chain's own free coordinates: `movable` where there is one plan or
+    // none, a subset of it where the chain is on one branch of several.
+    let free: &[usize] = plan.map_or(movable, classify::Plan::free);
 
-    if movable.is_empty() {
+    if free.is_empty() {
         // Every coordinate is driven, so there is no chord to draw — but the
         // bands still have width, and a Gibbs sweep over them is a legitimate
         // move. `TopCorner200DAsEqualities` is entirely this case.
         let mut candidate = from.clone();
-        classify::retract(problem, &mut candidate, rng);
+        if let Some(plan) = plan {
+            classify::retract(problem, plan, &mut candidate, rng);
+        }
         return if problem.is_feasible(&candidate, 0.0) {
             candidate
         } else {
@@ -563,7 +592,7 @@ fn advance(
 
     // Swept in order rather than picked at random: a random scan needs
     // `d ln d` moves to touch every coordinate, a sweep needs `d`.
-    let swept = movable[step % movable.len()];
+    let swept = free[step % free.len()];
     let along_axis = rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY;
 
     let direction = if along_axis {
@@ -573,7 +602,9 @@ fn advance(
     } else {
         // On the sphere until the shape is known, then bent to it. Bending a
         // unit vector and normalising is bending the raw draw and normalising,
-        // so the sphere draw is the same draw either way.
+        // so the sphere draw is the same draw either way. A coordinate the
+        // chain's plan drives gets no component: the move is in the plan's
+        // free coordinates, and retraction would overwrite it anyway.
         let unit = random_direction(rng, movable.len());
         let shaped = match transform {
             Some(transform) => transform.direction(&unit),
@@ -581,7 +612,9 @@ fn advance(
         };
         let mut direction = vec![0.0; dimensions];
         for (slot, component) in movable.iter().zip(shaped) {
-            direction[*slot] = component;
+            if plan.is_none_or(|plan| !plan.drives(*slot)) {
+                direction[*slot] = component;
+            }
         }
         direction
     };
@@ -607,9 +640,11 @@ fn advance(
             .zip(&direction)
             .map(|(value, component)| value + step * component)
             .collect();
-        // Back onto the surface. A no-op when nothing is driven, and never
-        // trusted: the judgement below is unchanged in what it concludes.
-        classify::retract(problem, &mut candidate, rng);
+        // Back onto the surface. Nothing to do when nothing is driven, and
+        // never trusted: the judgement below is unchanged in what it concludes.
+        if let Some(plan) = plan {
+            classify::retract(problem, plan, &mut candidate, rng);
+        }
 
         if problem.is_feasible(&candidate, 0.0) {
             return candidate;

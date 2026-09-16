@@ -25,8 +25,8 @@
 //! variable alone on one side of an equality is computed from the others rather
 //! than searched for, which is what lets a walker move along a measure-zero
 //! surface instead of jittering beside it. Row E is green through the matching
-//! in `classify::plan`. Rows C and D classify as `Opaque` and are still red,
-//! which is the whole point of keeping them here.
+//! in `classify::plans`, and a product that must vanish through a plan per
+//! arm. Rows C and D classify as `Opaque`.
 //!
 //! Case F — implicit, `sin(x) == x/2` — is deliberately absent. No use case has
 //! turned up for `x == f(x)`, and Newton is a lot of machinery to carry for a
@@ -555,10 +555,12 @@ fn two_coupled_equalities_are_traversed() {
 /// does span its whole range. Only looking at the arms together shows it.
 ///
 /// Measured at 394 of 400 points on one arm and 7 on the other, against the
-/// even split the geometry says. Left red deliberately: the fix is a choice
-/// between refusing to drive where a divisor can vanish — which would give up
-/// cases that are perfectly fine — and treating it as branch selection, and
-/// that is not a decision to make from one example.
+/// even split the geometry says. Green since branch selection by plan: the
+/// matching admits a plan per arm, a point takes the plan that pins it
+/// hardest — the arm it stands on — and at the crossing, which is the only
+/// point the opening finds here, the walker spreads its chains across both.
+/// The other choice, refusing to drive where a divisor can vanish, would have
+/// given up cases that are perfectly fine.
 #[test]
 fn both_arms_of_a_product_receive_points() {
     /// The share of the sample each arm must hold. They are of equal measure,

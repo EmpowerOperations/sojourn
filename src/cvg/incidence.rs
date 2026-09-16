@@ -20,7 +20,7 @@
 //!
 //! This graph may certainly contain them: `c0 - x1 - c1 - x2 - c0` is two
 //! constraints sharing two variables, which is ordinary. The graph where a
-//! cycle *means* something is the dependency graph `classify::plan` derives
+//! cycle *means* something is the dependency graph `classify::plans` derives
 //! from a set of drives, and it is refused there.
 
 use crate::{Ast, Schema};

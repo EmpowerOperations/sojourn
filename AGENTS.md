@@ -177,9 +177,15 @@ points than variables has no useful stratification.
 `a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
 or `Opaque`. A `Driven` variable is one the walker *computes* rather than
 searches, which is what lets it move along a measure-zero surface instead of
-jittering beside it — `classify::plan` turns a system into the schema positions
+jittering beside it — `classify::plans` turns a system into the schema positions
 the walker moves and the ones it computes, in evaluation order, and `classify::retract`
-applies it. Three rules hold the whole thing up:
+applies one. *Plans*, plural: each equality lists every variable it can be solved
+for (`classify::drivable`), a maximum bipartite matching decides who drives what,
+and every matching of that size is a plan (up to eight, deduplicated by driven
+set). A disjunction such as `x1 * x2 == 0` is a plan per arm, and
+`classify::tightest` picks per point the plan whose driven coordinates are
+pinned hardest — the arm the point is on; at a crossing the walker spreads its
+chains across the tie. Three rules hold the whole thing up:
 
 - **Driving is a Gibbs draw, not an evaluation.** `y == f(x) +/- t` admits the
   whole band, so `retract` draws uniformly from `f(free) ± t`. Assigning
@@ -195,7 +201,7 @@ applies it. Three rules hold the whole thing up:
 - **A variable named on both sides makes the equality *implicit* in it**, and
   `ConstraintSystem::new` refuses it, naming the rearrangement (`a == b + a/2` is
   `a/2 - b == 0`). Not "cyclic" — a cycle is a mutual dependency *between*
-  equations, which `plan` meets and handles by driving neither. Two narrower
+  equations, which `plans` meets and handles by driving neither. Two narrower
   rules were tried and discarded; both are written up in todo.md.
 
 `classify::reaches` answers whether the operators between an equality's root and
@@ -222,10 +228,12 @@ would have to choose a branch and be silently wrong half the time — which is w
 intersects both branches with what the argument can already be. `^`, `%`, `max`,
 `min` and the periodic functions still decline.
 
-Two holes are red on purpose. Driving assumes the feasible set is a **graph**
-over the free coordinates, so `x1 * x2 == 0` is a cross with one arm unreachable.
-And where two equations would drive the *same* variable, `plan` refuses to choose
-and drives neither — that is the bipartite matching todo.md carries as unbuilt.
+Two holes were red on purpose and closed on 2026-09-16: driving assumes the
+feasible set is a **graph** over the free coordinates, so `x1 * x2 == 0` was a
+cross with one arm unreachable — now a plan per arm, chosen per point; and two
+equations wanting the *same* variable drove neither — now the matching. What
+stays open is seeding: a chain keeps the arm it started on, and the other arm's
+seed is the bisection's to find, which it can in low dimension only.
 
 `var[i]` is resolved at `ConstraintSystem::new` — the first moment a schema
 exists, since `parse` has none and `Kind::Global` indexes the expression's own
