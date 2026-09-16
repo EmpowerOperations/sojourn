@@ -92,13 +92,27 @@ fn active_set_rounds(rows: usize) -> usize {
 /// active there, and the direction *into* the region from it.
 pub(crate) struct Landing {
     pub(crate) point: Point,
-    /// The negated sum of the active constraints' unit normals, in the
+    /// The negated sum of the unit normals of every constraint the landing
+    /// stands on — the active set, and any row that is *tight* there without
+    /// having been violated, a box wall the proposal already sat on — in the
     /// caller's coordinates: the bisector of the wedge they make, which
-    /// enters every one of them — where the KKT direction `p → x*` need not,
-    /// on a sharp wedge like the spring's vertex, where one wall's normal is
-    /// far steeper than the other's and the weighted sum leans out of it.
+    /// enters every one of them. The KKT direction `p → x*` need not, on a
+    /// sharp wedge like the spring's vertex, where one wall's normal is far
+    /// steeper than the other's and the weighted sum leans out of it; and
+    /// the active set alone need not either, since a wall the proposal never
+    /// left is not in it, and a step that ignores it leaves the landing on
+    /// that wall with no clearance — measured by Artemis on a slab at ten
+    /// variables, where the box then did the stepping and moved a coordinate
+    /// no constraint names by a tenth of a unit.
     pub(crate) inward: Vec<f64>,
 }
+
+/// How far below zero a residual may be at the landing for its row to count
+/// as a wall the landing stands on. A bound the proposal sat on is exactly
+/// zero; a constraint Newton landed on is within its own rounding. Generous,
+/// because a row wrongly counted only adds an inward component, and the
+/// ladder that follows judges every rung by the oracle.
+const TIGHT: f64 = 1e-9;
 
 /// The nearest point of `system`'s feasible set to `target`, sought from
 /// `from`, on the boundary of the constraints active there; `None` where
@@ -279,10 +293,18 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
                 active = active.len(),
                 "converged"
             );
-            // The bisector: each active row's unit normal in the cube, summed
-            // and negated, then scaled back to the caller's coordinates.
+            // The bisector: each row the landing stands on — active, or
+            // tight without having been violated — by its unit normal in the
+            // cube, summed and negated, then scaled back to the caller's
+            // coordinates.
+            let standing: Vec<usize> = (0..rows)
+                .filter(|row| {
+                    active.contains(row)
+                        || residual(*row, &x, &u).is_some_and(|value| value >= -TIGHT)
+                })
+                .collect();
             let mut inward = vec![0.0; dimensions];
-            for row in &active {
+            for row in &standing {
                 let partials = gradient(*row, &x)?;
                 let norm = partials
                     .iter()

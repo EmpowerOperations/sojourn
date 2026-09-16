@@ -676,3 +676,133 @@ mod repair_strands_on_a_product_constraint {
         is_repaired(50, &POINT_50)
     }
 }
+
+/// Artemis 0.13.4, 2026-09-16, against `82671de`: `repair` moved a coordinate
+/// no constraint names — `x15`, sitting on the box wall — by 0.14, landing
+/// 1.3% farther than the nearest feasible point on the `c06-rosenbrock-50`
+/// slab corner. The proposal: one slab `x1 == x2 + 1 +/- 0.01`, `x1 = x2 = 10`
+/// off it and on the wall, one more coordinate on the wall in no constraint,
+/// the rest zero. Exact at `n <= 8`; wrong by a seeded amount from `n = 10`.
+///
+/// The trace: `x1` stands on the box wall and the slab's edge at once, so the
+/// clamp, once `x2` has stepped in by a clearance, finds `x1` a slice one
+/// clearance wide with no room for the clearance on both sides, aims for its
+/// middle, and the two ping-pong toward the fixed point by halves — eight
+/// sweeps never get there. Newton lands exactly, but stepped inside along
+/// the bisector of its *active* rows, and a wall the proposal never left is
+/// tight, not violated, so `x_n`'s wall was not among them and no rung of
+/// that ladder could clear it. Both landings came back feasible without the
+/// clearance, and the only clear landing was the sampling box's — a draw
+/// around the proposal in every coordinate — which at `n <= 8` COBYLA's
+/// cross-check happened to beat. Fixed in `newton::Landing::inward`: the
+/// bisector sums every row the landing *stands on*, tight rows included, so
+/// the first rung clears every wall at once.
+mod a_wall_coordinate_in_no_constraint_stays_put {
+    use super::*;
+    use sojourn::RepairError;
+
+    const CLEARANCE: f64 = 1e-12;
+    /// What a coordinate in no constraint may move by: the back-off ladder's
+    /// doublings, far below anything an optimizer could see.
+    const STAY_PUT: f64 = 1e-6;
+
+    fn slab(n: usize) -> anyhow::Result<ConstraintSystem> {
+        let variables = (1..=n)
+            .map(|i| InputVariable::new(format!("x{i}"), -10.0, 10.0))
+            .collect();
+        Ok(ConstraintSystem::new(variables, ["x1 == x2 + 1 +/- 0.01"])?)
+    }
+
+    /// `x1 = x2 = x_n = 10`, the rest 0: the corner shape from the c06 point.
+    fn corner(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                if i == 0 || i == 1 || i == n - 1 {
+                    10.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    fn l2(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    fn lands_nearest(n: usize, proposal: &[f64]) -> anyhow::Result<()> {
+        let system = slab(n)?;
+        let region = ConstraintSolver::new().with_seed(7).solve(&system)?;
+        let repaired = match region.repair(proposal, CLEARANCE) {
+            Ok(repaired) => repaired,
+            Err(RepairError::Cramped { nearest, .. }) => nearest,
+            Err(RepairError::Stranded) => anyhow::bail!("stranded on a slab with room"),
+        };
+        assert!(
+            system.is_feasible(&repaired, CLEARANCE),
+            "n = {n}: landed without the clearance"
+        );
+        // The nearest feasible point: `x2` down to the slab's near face,
+        // everything else where it was, wall coordinates a clearance in.
+        let mut nearest = proposal.to_vec();
+        nearest[1] = proposal[0] - 1.0 + 0.01;
+        let (landed, best) = (l2(proposal, &repaired), l2(proposal, &nearest));
+        let moved: Vec<String> = (0..n)
+            .filter(|&i| (repaired[i] - proposal[i]).abs() > STAY_PUT)
+            .map(|i| format!("x{}: {:+.6}", i + 1, repaired[i] - proposal[i]))
+            .collect();
+        assert!(
+            landed <= best * (1.0 + 1e-6),
+            "n = {n}: landed {landed:.6} from the proposal, the nearest feasible point is \
+             {best:.6} away; moved beyond the clearance: [{}]",
+            moved.join(", ")
+        );
+        for i in 2..n {
+            assert!(
+                (repaired[i] - proposal[i]).abs() <= STAY_PUT,
+                "n = {n}: x{} is in no constraint and moved {:+.3e}",
+                i + 1,
+                repaired[i] - proposal[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// The control: exact before the fix too.
+    #[test]
+    fn at_eight_variables_the_wall_coordinate_stays() -> anyhow::Result<()> {
+        lands_nearest(8, &corner(8))
+    }
+
+    #[test]
+    fn at_ten_variables_the_wall_coordinate_stays() -> anyhow::Result<()> {
+        lands_nearest(10, &corner(10))
+    }
+
+    /// The c06 shape as found: fifteen variables, `x15` moved by 0.14.
+    #[test]
+    fn at_fifteen_variables_the_wall_coordinate_stays() -> anyhow::Result<()> {
+        lands_nearest(15, &corner(15))
+    }
+
+    /// Every coordinate on the wall: the landing was 4.0 from the proposal.
+    #[test]
+    fn with_every_coordinate_on_the_wall_only_the_slab_moves() -> anyhow::Result<()> {
+        lands_nearest(10, &[10.0; 10])
+    }
+
+    /// The other control: a coordinate a unit inside the wall was never moved.
+    #[test]
+    fn an_interior_coordinate_stays_at_any_size() -> anyhow::Result<()> {
+        for n in [10usize, 15, 50] {
+            let mut proposal = corner(n);
+            proposal[n - 1] = 9.0;
+            lands_nearest(n, &proposal)?;
+        }
+        Ok(())
+    }
+}

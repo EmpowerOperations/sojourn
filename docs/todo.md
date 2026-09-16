@@ -2876,6 +2876,21 @@ count of contractions, and a contraction at 200 variables walks every constraint
 per coordinate); without `Strategy::Prune` it is 21 ms. Both are pre-existing, both are
 recorded here as the next two performance items rather than fixed.
 
+**2026-09-16: a wall the proposal never left.** Artemis 0.13.4 on the c06 slab corner:
+`repair` moved `x15` — in no constraint, on the box wall — by 0.14, and by a seeded amount at
+every `n ≥ 10` while `n ≤ 8` was exact. The trace (`tests/regression_fixture.rs`,
+*a_wall_coordinate_in_no_constraint_stays_put*): both the clamp and Newton landed feasible
+*without* the clearance, so the sampling box's random draw was the only clear landing, and at
+`n ≤ 8` COBYLA's cross-check happened to beat it. Newton's step-in walked the bisector of its
+*active* rows, and a wall the proposal stood on is tight, not violated — not active — so no
+rung could clear it. Fixed by summing every row the landing *stands on* into the bisector
+(`newton::TIGHT`); the first rung now clears every wall at once and Newton wins at every `n`.
+Left as it is: the clamp's own failure on that point — `x1` on the box wall and the slab's
+edge at once gets a slice one clearance wide, aims for its middle, and ping-pongs with `x2`
+by halves through all eight sweeps. A "step in from the wall you stand on" rule instead of
+the middle would converge in two; not needed while Newton lands, noted in case a
+non-differentiable constraint puts the clamp back in front.
+
 **2026-09-16: where a design's time goes, by count and by flame graph.** A `judged` tally on
 the walker (`burn_in` and `walk` spans at `debug`) and a `samply` run on
 `tests/profiling.rs::a_design_on_the_100_segment_beam` (200 variables, two dense
