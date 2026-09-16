@@ -1,14 +1,13 @@
 # A hang should report, not stall.
 #
-# Once the constraint pool fills on a background thread, the characteristic bug
-# is no longer a failed assertion: a broken "exhausted" signal makes
-# `generate` block for points that will never arrive, and CI simply never
-# finishes. Terminating turns that into a legible failure with a test name on it.
+# Every loop in the engine is bounded by a count, so a test that does not
+# return is a bug; terminating turns it into a legible failure with a test
+# name on it rather than a stalled CI job.
 #
 # The threshold has to clear the slowest *honest* test by a wide margin, and
-# that bar is higher than it looks: `top_corner_200d` takes about 25 seconds,
-# because burn-in for a 200-dimensional chain is genuinely expensive. A 30s
-# limit sat close enough to flag it as slow, which trains people to ignore the
+# that bar is higher than it looks: a design over the 200-variable beam pays
+# the walker's burn-in, which is genuinely expensive. A 30s limit sat close
+# enough to flag honest tests as slow, which trains people to ignore the
 # warning. 60s leaves real headroom while still bounding a hang.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
@@ -18,7 +17,7 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # tight enough that a pure-string test came back "leaky" under full-suite load
 # on Windows — 0.35s there against 0.019s in isolation, on a test that spawns
 # nothing at all. A false positive here is worse than useless, because the
-# warning that matters is a genuinely unjoined worker thread.
+# warning that matters is a genuinely unjoined thread.
 leak-timeout = "500ms"
 
 # The brute-squad fixtures measure wall clock against a budget and expect the
@@ -27,17 +26,3 @@ leak-timeout = "500ms"
 [[profile.default.overrides]]
 filter = 'binary(brute_squad)'
 threads-required = 'num-cpus'
-
-# Every benchmark now runs on ten seeds and requires all ten, because one seed
-# could not tell a real change from a lucky draw — `top_corner_200d` was failing
-# on half of all seeds and passing on the committed one. See `REPLICATES` in
-# `cvg_benchmarks.rs` for the measurement.
-#
-# That multiplies the honest runtime by ten, and the 200-dimensional problems
-# went from about 25 seconds to about four minutes — past the limit above, which
-# terminated them mid-run. The bound is still here to turn a hang into a legible
-# failure rather than a stalled CI job; it is simply an order of magnitude
-# further out, because the honest test now is.
-[[profile.default.overrides]]
-filter = 'binary(cvg_benchmarks)'
-slow-timeout = { period = "300s", terminate-after = 2 }

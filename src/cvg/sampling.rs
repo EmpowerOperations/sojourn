@@ -19,13 +19,12 @@
 //! the point that comes out does not depend on how many threads looked for it.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use super::Cancellation;
 use super::classify;
 use super::progress::Trial;
 #[cfg(feature = "gpu")]
@@ -214,21 +213,14 @@ impl RandomSampler {
     /// numbered batch with a hit, so the points that come out are a function
     /// of the seed and the budget alone. Threads change how fast, never what.
     /// Threads that had run ahead finish the batch they are on, which is the
-    /// only way `proposed` depends on the thread count.
-    ///
-    /// `cancel` is asked between batches on the calling thread, which is how
-    /// a caller that dropped the [`solve`](super::ConstraintSolver::solve)
-    /// future gets its cores back within a batch.
+    /// only way `proposed` depends on the thread count. Every thread is
+    /// joined before this returns: the fan-out is a detail of one call.
     ///
     /// Draws one value from the sampler's own stream for `base`. The pool
     /// reaches here only after an empty probe, after which it never asks this
     /// sampler for a batch again, so the probe and the delivery streams are
     /// exactly what they were before this existed.
-    pub(crate) fn brute_force(
-        &mut self,
-        problem: &ConstraintSystem,
-        cancel: &Cancellation<'_>,
-    ) -> Trial {
+    pub(crate) fn brute_force(&mut self, problem: &ConstraintSystem) -> Trial {
         let base = self.rng.next_u64();
 
         #[cfg(feature = "gpu")]
@@ -237,7 +229,7 @@ impl RandomSampler {
         {
             // The sieve — and with it the device, if nobody else holds it —
             // is dropped at the end of this block, whichever way it went.
-            if let Some(trial) = brute_force_on_gpu(&sieve, problem, base, budget, cancel) {
+            if let Some(trial) = brute_force_on_gpu(&sieve, problem, base, budget) {
                 return trial;
             }
             // The device failed or timed out mid-search. Finish on the CPU,
@@ -246,42 +238,27 @@ impl RandomSampler {
             self.gpu_budget = None;
         }
 
-        self.brute_force_on_cpu(problem, base, cancel)
+        self.brute_force_on_cpu(problem, base)
     }
 
     /// The CPU brute-force loop: every thread walks its own arithmetic
     /// progression of batch numbers, and the lowest-numbered batch with a
     /// hit wins.
-    fn brute_force_on_cpu(
-        &self,
-        problem: &ConstraintSystem,
-        base: u64,
-        cancel: &Cancellation<'_>,
-    ) -> Trial {
+    fn brute_force_on_cpu(&self, problem: &ConstraintSystem, base: u64) -> Trial {
         let columns = self.batch_columns();
         let batches = self.budget.div_ceil(columns as u64);
         let rows = self.bounds.len();
 
         let winner = AtomicU64::new(u64::MAX);
         let best: Mutex<Option<(u64, Vec<Point>)>> = Mutex::new(None);
-        let abandoned = AtomicBool::new(false);
         let proposed = AtomicU64::new(0);
 
         // One thread's share of the batches: `first, first + stride, ...`,
-        // stopping at the budget, at a batch past a known winner, or on
-        // abandonment. `poll` is `Some` only on the calling thread.
-        let work = |first: u64, stride: u64, poll: Option<&Cancellation<'_>>| {
+        // stopping at the budget or at a batch past a known winner.
+        let work = |first: u64, stride: u64| {
             let mut candidates = Mat::zeros(rows, columns);
             let mut k = first;
             while k < batches && k <= winner.load(Ordering::Acquire) {
-                if abandoned.load(Ordering::Relaxed) {
-                    return;
-                }
-                if poll.is_some_and(Cancellation::is_requested) {
-                    abandoned.store(true, Ordering::Relaxed);
-                    return;
-                }
-
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(base ^ k);
                 fill_box(&mut candidates, &self.bounds, &mut rng);
                 // Driven coordinates are computed rather than guessed, which is
@@ -330,9 +307,9 @@ impl RandomSampler {
         std::thread::scope(|scope| {
             for first in 1..stride {
                 let work = &work;
-                scope.spawn(move || work(first, stride, None));
+                scope.spawn(move || work(first, stride));
             }
-            work(0, stride, Some(cancel));
+            work(0, stride);
         });
 
         let points = best
@@ -360,14 +337,10 @@ fn brute_force_on_gpu(
     problem: &ConstraintSystem,
     base: u64,
     budget: u64,
-    cancel: &Cancellation<'_>,
 ) -> Option<Trial> {
     let mut proposed = 0u64;
     let batches = budget.div_ceil(u64::from(GPU_BATCH));
     for k in 0..batches {
-        if cancel.is_requested() {
-            break;
-        }
         let remaining = budget - k * u64::from(GPU_BATCH);
         let count = u32::try_from(remaining.min(u64::from(GPU_BATCH))).expect("at most GPU_BATCH");
         let survivors = sieve.sieve_generated(base, k, count)?;
@@ -475,29 +448,17 @@ mod brute_force_tests {
     //! The budgeted search: what it finds is a function of the seed and the
     //! budget, and of nothing about the machine.
 
-    use std::time::{Duration, Instant};
-
-    use futures_channel::oneshot;
-
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
-    use super::super::{Cancellation, Opening};
     use super::{RandomSampler, Trial};
     use crate::InputVariable;
     use crate::system::tests::system;
 
     const SEED: u64 = 0xB2_07_E5_90_AD;
 
-    /// Runs brute force on `x1 in 0..1` under `source`; `receiver` is the
-    /// caller's end of the opening channel, and dropping it is cancellation.
-    fn search(
-        source: &str,
-        budget: u64,
-        threads: usize,
-        receiver: oneshot::Receiver<Opening>,
-        sender: &oneshot::Sender<Opening>,
-    ) -> (Trial, usize) {
+    /// Runs brute force on `x1 in 0..1` under `source`.
+    fn search(source: &str, budget: u64, threads: usize) -> (Trial, usize) {
         let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
         let mut sampler = RandomSampler::new(
             &problem.variables,
@@ -506,15 +467,8 @@ mod brute_force_tests {
             threads,
         );
         let columns = sampler.batch_columns();
-        let trial = sampler.brute_force(&problem, &Cancellation::watching(sender));
-        drop(receiver);
+        let trial = sampler.brute_force(&problem);
         (trial, columns)
-    }
-
-    /// A search nobody cancels.
-    fn attended(source: &str, budget: u64, threads: usize) -> (Trial, usize) {
-        let (sender, receiver) = oneshot::channel();
-        search(source, budget, threads, receiver, &sender)
     }
 
     /// One in a million: the probe-sized first batch misses and the loop has
@@ -523,8 +477,8 @@ mod brute_force_tests {
     /// hit and a batch is a function of its number.
     #[test]
     fn the_same_seed_lands_the_same_points_on_one_thread_and_on_eight() {
-        let (alone, columns) = attended("x1 > 0.999999", 100_000_000, 1);
-        let (crowd, _) = attended("x1 > 0.999999", 100_000_000, 8);
+        let (alone, columns) = search("x1 > 0.999999", 100_000_000, 1);
+        let (crowd, _) = search("x1 > 0.999999", 100_000_000, 8);
 
         assert!(
             !alone.points.is_empty(),
@@ -547,7 +501,7 @@ mod brute_force_tests {
 
     #[test]
     fn the_budget_bounds_the_proposals() {
-        let (trial, columns) = attended("x1 > 2", 100_000, 4);
+        let (trial, columns) = search("x1 > 2", 100_000, 4);
         assert!(trial.points.is_empty());
         assert!(trial.proposed >= 100_000, "{}", trial.proposed);
         assert!(
@@ -559,46 +513,8 @@ mod brute_force_tests {
 
     #[test]
     fn a_zero_budget_proposes_nothing() {
-        let (trial, _) = attended("x1 > 0.5", 0, 4);
+        let (trial, _) = search("x1 > 0.5", 0, 4);
         assert!(trial.points.is_empty());
         assert_eq!(trial.proposed, 0);
-    }
-
-    /// The caller changes its mind mid-search — drops its end of the opening
-    /// channel — and the loop stops within a batch on every thread, not at
-    /// the budget.
-    #[test]
-    fn an_abandoned_search_stops_within_a_round() {
-        let (sender, receiver) = oneshot::channel::<Opening>();
-        let started = Instant::now();
-        let trial = std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                drop(receiver);
-            });
-            let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &["x1 > 2"]);
-            let mut sampler = RandomSampler::new(
-                &problem.variables,
-                Xoshiro256PlusPlus::seed_from_u64(SEED),
-                u64::MAX,
-                4,
-            );
-            sampler.brute_force(&problem, &Cancellation::watching(&sender))
-        });
-        let took = started.elapsed();
-        let columns = 2_730;
-
-        assert!(trial.points.is_empty());
-        assert!(
-            took < Duration::from_secs(1),
-            "abandoned search ran {took:?}"
-        );
-        // Far below anything the budget would allow: a few thousand batches
-        // at most in the time it had.
-        assert!(
-            trial.proposed < 100_000 * columns as u64,
-            "{} proposals after abandonment",
-            trial.proposed
-        );
     }
 }

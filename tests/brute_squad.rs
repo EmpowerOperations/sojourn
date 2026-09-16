@@ -78,16 +78,15 @@
 //! cannot land reads as a couple of hundred milliseconds even at 1e-6, where
 //! the search itself takes a few.
 //!
-//! # The budget, and what dropping the future does
+//! # The budget
 //!
-//! [`solve`] runs the search on a worker thread and its future waits on a
-//! oneshot for the opening verdict. The budget here is enforced by polling
-//! the future by hand with a no-op waker and **dropping it** when time is up.
-//! Dropping the receiver is the cancellation signal: the brute-force search
-//! polls for it between batches and stops, so the worker is gone within a
-//! batch rather than leaking until it has spent the budget, and the next
-//! attempt gets a quiet machine. Nothing else in the library had to learn
-//! about deadlines for this to work.
+//! [`solve`] runs on the calling thread to a verdict, bounded by its
+//! proposal budget and nothing else. The wall budget here is read after the
+//! fact: a point found inside it is a hit, one found after it is `timed
+//! out`, and a search that spent its proposals is `gave up`. An attempt that
+//! would miss therefore runs to the proposal budget rather than stopping at
+//! the deadline — seconds, on the rungs that are red — which is the price
+//! of a library with no clock in it.
 //!
 //! [`solve`]: ConstraintSolver::solve
 
@@ -96,8 +95,6 @@ mod common;
 use std::f64::consts::PI;
 use std::fmt;
 use std::hint::black_box;
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use faer::Mat;
@@ -222,7 +219,7 @@ enum Outcome {
     Found(Duration),
     /// The pool returned a verdict of "nothing" before the budget ran out.
     GaveUp(Duration, Infeasibility),
-    /// The budget ran out with the pool still searching.
+    /// A point was found, but after the budget.
     TimedOut(Duration),
 }
 
@@ -239,10 +236,7 @@ impl fmt::Display for Outcome {
 }
 
 /// One attempt at a first point, with the solver left out and the clock
-/// stopped the moment the pool reports it has one.
-///
-/// Polls the future by hand rather than blocking on it, so that it can be
-/// dropped at the deadline. See the module header for what that leaks.
+/// read the moment the region reports it has one.
 fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
     let sources = family.sources(p);
     let solver = ConstraintSolver::new()
@@ -250,46 +244,35 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
         .with_strategies(SAMPLING_ONLY.to_vec());
 
     let system = system(&sources);
-    let mut future = pin!(solver.solve(&system));
-    let mut context = Context::from_waker(Waker::noop());
     let start = Instant::now();
+    match solver.solve(&system) {
+        Ok(region) => {
+            let elapsed = start.elapsed();
 
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(Ok(mut samples)) => {
-                let elapsed = start.elapsed();
-
-                // `Satisfied` promises a point is already in hand; make it
-                // show one, and make the point pass every source in `f64`, the
-                // way `cvg_pools` does. A pool that says "found" and delivers
-                // nothing would otherwise pass this fixture.
-                let point = samples.take(1);
-                assert_eq!(
-                    point.ncols(),
-                    1,
-                    "{family:?}: Satisfied but no sample delivered"
+            // `Satisfied` promises a point is already in hand; make it show
+            // one, and make the point pass every source in `f64`, the way
+            // `cvg_pools` does. A region that says "found" and holds nothing
+            // would otherwise pass this fixture.
+            let point = region.witness();
+            let bindings: Vec<(&str, f64)> = VARIABLES
+                .iter()
+                .enumerate()
+                .map(|(row, name)| (*name, point[row]))
+                .collect();
+            for source in &sources {
+                let residual = common::eval_one(source, &bindings)
+                    .unwrap_or_else(|e| panic!("{source:?} failed to evaluate: {e}"));
+                assert!(
+                    residual <= 0.0,
+                    "{family:?}: delivered point {bindings:?} violates {source:?} by {residual}"
                 );
-                let bindings: Vec<(&str, f64)> = VARIABLES
-                    .iter()
-                    .enumerate()
-                    .map(|(row, name)| (*name, point[(row, 0)]))
-                    .collect();
-                for source in &sources {
-                    let residual = common::eval_one(source, &bindings)
-                        .unwrap_or_else(|e| panic!("{source:?} failed to evaluate: {e}"));
-                    assert!(
-                        residual <= 0.0,
-                        "{family:?}: delivered point {bindings:?} violates {source:?} by {residual}"
-                    );
-                }
-                return Outcome::Found(elapsed);
             }
-            Poll::Ready(Err(because)) => {
-                return Outcome::GaveUp(start.elapsed(), because);
+            if elapsed > budget {
+                return Outcome::TimedOut(budget);
             }
-            Poll::Pending if start.elapsed() >= budget => return Outcome::TimedOut(budget),
-            Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            Outcome::Found(elapsed)
         }
+        Err(because) => Outcome::GaveUp(start.elapsed(), because),
     }
 }
 
@@ -351,14 +334,12 @@ fn sampling_only_is_the_default_ladder_minus_the_seeders() {
 #[test]
 fn without_a_prover_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = ["x1 > 2.0".to_owned()];
-    let verdict = pollster::block_on(
-        ConstraintSolver::new()
-            .with_proposal_budget(common::PROPOSAL_BUDGET)
-            .with_gpu(false)
-            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-            .with_strategies(SAMPLING_ONLY.to_vec())
-            .solve(&system(&constraints)),
-    );
+    let verdict = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .with_strategies(SAMPLING_ONLY.to_vec())
+        .solve(&system(&constraints));
 
     match verdict {
         Err(Infeasibility::NotFound { unexpressed }) => {

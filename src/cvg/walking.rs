@@ -117,9 +117,6 @@
 //! the last place and the emitted points with it; nothing depends on the same
 //! seed reproducing across machines.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use faer::{Mat, Side};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -362,17 +359,7 @@ impl HitAndRunWalker {
     /// fitted once the last chain is in. That burn-in runs on the sphere; a
     /// second one runs under the estimate and refits it, for the reason given
     /// where it happens.
-    /// Returns early, with the chains as far as they got, when `stop` is
-    /// raised: burn-in at two hundred dimensions is a minute and a half, and a
-    /// caller that has dropped its handle should not wait for it. A walker
-    /// stopped here is never asked to emit — [`extend`](Self::extend) checks
-    /// the same flag — so the partial state is never read.
-    fn start_chains(
-        &mut self,
-        existing: &VecDeque<Point>,
-        problem: &ConstraintSystem,
-        stop: &AtomicBool,
-    ) {
+    fn start_chains(&mut self, existing: &[Point], problem: &ConstraintSystem) {
         if self.chains.len() >= CHAIN_COUNT {
             return;
         }
@@ -421,9 +408,6 @@ impl HitAndRunWalker {
                 steps: 0,
             };
             for step in 0..burn_in {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
                 chain.point = advance(
                     chain.point,
                     step,
@@ -454,9 +438,6 @@ impl HitAndRunWalker {
             let mut states: Vec<Vec<f64>> = Vec::new();
             for chain in &mut self.chains {
                 for _ in 0..burn_in {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
                     chain.point = advance(
                         std::mem::take(&mut chain.point),
                         chain.steps,
@@ -486,21 +467,17 @@ impl HitAndRunWalker {
     /// judges them again anyway, because "never an infeasible one" is its
     /// promise and not this function's. Nothing to walk from is not an error:
     /// on a tight region it is the normal state until a seed exists.
-    ///
-    /// `stop` is the search's cancellation: raised, the walk ends between
-    /// steps and whatever was emitted so far is returned — possibly nothing.
     pub(crate) fn extend(
         &mut self,
         problem: &ConstraintSystem,
-        from: &VecDeque<Point>,
+        from: &[Point],
         count: usize,
-        stop: &AtomicBool,
     ) -> Vec<Point> {
         if count == 0 || from.is_empty() {
             return Vec::new();
         }
-        self.start_chains(from, problem, stop);
-        if stop.load(Ordering::Relaxed) || self.chains.is_empty() {
+        self.start_chains(from, problem);
+        if self.chains.is_empty() {
             return Vec::new();
         }
         let thinning = thinning_for(from[0].len());
@@ -508,7 +485,6 @@ impl HitAndRunWalker {
         // Sequential by nature — a chain cannot take its next step until it has
         // judged this one — so the points are walked one at a time.
         (0..count)
-            .take_while(|_| !stop.load(Ordering::Relaxed))
             .map(|emitted| {
                 let index = emitted % self.chains.len();
                 let mut point = std::mem::take(&mut self.chains[index].point);

@@ -19,6 +19,7 @@
 mod common;
 
 use anyhow::Context;
+use faer::Mat;
 use sojourn::{
     ConstraintSolver, ConstraintSystem, FeasibleRegion, Infeasibility, InputVariable, Strategy,
 };
@@ -75,10 +76,9 @@ fn solver() -> ConstraintSolver {
 
 /// The region a solve returns, which is where `repair` lives. The fixture
 /// below hands it its own anchor, so the census is not what is being tested.
-async fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
+fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
     solver()
         .solve(system)
-        .await
         .context("the fixture should be satisfiable")
 }
 
@@ -87,20 +87,19 @@ async fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
 /// well inside brute force's reach and far outside the probe's luck. The
 /// solver can say nothing about it, so nothing here was proved; every point
 /// was sampled or walked from a sampled or locally solved seed.
-#[pollster::test]
-async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()> {
+#[test]
+fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()> {
     const WANTED: usize = 10;
 
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
     )?;
-    let mut samples = solver()
+    let samples = solver()
         .solve(&system)
-        .await
         .context("a curve that sampling can reach should be found")?;
 
-    let points = samples.take(WANTED);
+    let points = samples.sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?;
     assert_eq!(points.ncols(), WANTED, "the stream ended early");
     for column in 0..points.ncols() {
         let point: Vec<f64> = (0..points.nrows())
@@ -116,11 +115,11 @@ async fn a_thin_curve_is_found_without_the_solver_helping() -> anyhow::Result<()
 /// a real exponent has no inverse to narrow through, but the forward check
 /// needs none — the whole box evaluates to at most `10^1.234`, and that is a
 /// proof, before a single proposal is spent on it.
-#[pollster::test]
-async fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Result<()> {
+#[test]
+fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Result<()> {
     let source = "x1^1.234 > 1000000";
     let system = system(&[("x1", 0.0, 10.0)], &[source])?;
-    let verdict = solver().solve(&system).await;
+    let verdict = solver().solve(&system);
 
     let Err(because) = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
@@ -142,14 +141,14 @@ async fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Resu
 /// This spends brute force's whole budget — a billion proposals across
 /// every thread in release, about ten seconds — because giving up early
 /// would be the bug.
-#[pollster::test]
-async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
+#[test]
+fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
     let source = "var[n] > 20";
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0), ("n", 1.0, 2.0)],
         &[source],
     )?;
-    let verdict = solver().solve(&system).await;
+    let verdict = solver().solve(&system);
 
     let Err(because) = verdict else {
         panic!("a point beyond the box was reported {verdict:?}");
@@ -172,18 +171,17 @@ async fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()
 /// outside the probe's luck, but a point on it is an ordinary constrained
 /// optimisation from the box centre, and that is what the local solve is
 /// for.
-#[pollster::test]
-async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
+#[test]
+fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 == 5 +/- 0.01"],
     )?;
-    let mut region = solver()
+    let region = solver()
         .with_strategies(vec![Strategy::LocalSolve, Strategy::HitAndRun])
         .solve(&system)
-        .await
         .context("the band is not empty")?;
-    let points = region.take(4);
+    let points = region.sample(Mat::zeros(0, 0).as_ref(), 4, SEED)?;
     assert_eq!(
         points.ncols(),
         4,
@@ -204,14 +202,14 @@ async fn a_thin_curve_is_seeded_by_the_local_solve() -> anyhow::Result<()> {
 /// from the projection too, since no slice can say where the wall is to step
 /// off it: the rows carry the margin, and failing that the landing is backed
 /// off along the projection's own direction until the axis neighbours pass.
-#[pollster::test]
-async fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
+#[test]
+fn repair_lands_without_an_interval_to_clamp_to() -> anyhow::Result<()> {
     const CLEARANCE: f64 = 1e-3;
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
         &["x1^1.234 + x2^1.234 < 5"],
     )?;
-    let region = region(&system).await?;
+    let region = region(&system)?;
     let repaired = region
         .repair(&[9.0, 9.0], CLEARANCE)
         .context("the origin is feasible, so something is reachable")?;

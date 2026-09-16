@@ -13,7 +13,6 @@ askama = "0.16"
 # Rust, no C toolchain, which is the whole reason it and not `nlopt`.
 basin = "1.11"
 faer = { version = "0.24.4", default-features = false, features = ["std"] }
-futures-channel = "0.3.34"
 pollster = { version = "1.0.1", optional = true }
 # Explicit SIMD for the evaluator's tile kernels, with the instruction set
 # chosen at run time. The features mirror faer's exactly so that there is one
@@ -40,7 +39,6 @@ anyhow = "1.0"
 # stage-by-stage account of a repair or an opening comes out on stderr.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 naga = { version = "30.0.1", features = ["wgsl-in"] }
-pollster = { version = "1.0.1", features = ["macro"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [features]

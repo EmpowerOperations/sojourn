@@ -12,11 +12,12 @@
 //!
 //! Finding the *first* feasible point is the hard part, and for a tight region
 //! it needs a local solve or a bisection. Once there, cheap strategies cover
-//! the space quickly. That is why `ConstraintSolver::solve` is the expensive,
-//! awaitable call and `FeasibleRegion::take` is not.
+//! the space quickly. That is why `ConstraintSolver::solve` — the [`open`]
+//! — is the expensive call, bounded by its budgets, and a [`design`] from the
+//! region it found is not.
 //!
 //! This module is the engine. The types a caller holds — the system, the
-//! solver, the samples handle, the verdicts — are defined at the crate root
+//! solver, the region, the verdicts — are defined at the crate root
 //! (`system.rs`, `solve.rs`, `repair.rs`) and this is what they drive.
 //!
 //! The strategies divide along that line:
@@ -27,10 +28,11 @@
 //!   nothing else settled it, the same sampler keeps proposing on every
 //!   core, for a proposal budget, until one batch lands: a region a millionth
 //!   or a hundred-millionth of its box is a matter of milliseconds to seconds,
-//!   and the seed it finds is what the walker starts from.
+//!   and the seed it finds is what the walker starts from. The threads are
+//!   joined before it returns; nothing runs after any call here.
 //! * **Hit-and-run** *emits* everywhere the probe did not settle it. It
-//!   converges to the uniform distribution over the region, so what a caller
-//!   receives is governed by the strategy with a guarantee. It cannot start
+//!   converges to the uniform distribution over the region, so a design's
+//!   candidate pool is drawn from a source with a guarantee. It cannot start
 //!   without a feasible point, and a seed comes from the probe's own hits,
 //!   from the local solve, from a bisection's leaves, or from brute force.
 //! * **The local solve** ([`local`]) *seeds* where the probe found nothing:
@@ -70,10 +72,7 @@ mod sieve;
 mod walking;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
 
-use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 
@@ -93,56 +92,45 @@ use crate::{ConstraintSystem, Point};
 /// four. The JVM's `EASY_PATH_THRESHOLD_FACTOR` was a tenth of the points
 /// *asked for* at hundredfold oversampling, which is the same rate.
 ///
-/// This decides nothing about who runs — every batch is sampled first and
-/// walked for the rest, see [`next_batch`]. It decides only whether the
-/// opening spends its prune budget on *coverage*: chains cannot cross between
-/// a region's pieces, so a search the walker will carry needs a seed in every
+/// This decides nothing about who runs — a design's pool is sampled first and
+/// walked for the rest, see [`design`]. It decides only whether the opening
+/// spends its prune budget on *coverage*: chains cannot cross between a
+/// region's pieces, so a search the walker will carry needs a seed in every
 /// piece, where uniform proposals reach every piece in proportion to its
 /// measure and need no help. The probe is one batch and can misjudge the
 /// rate either way; the cost of a wrong guess here is coverage of a rare
-/// piece, never a stalled stream.
+/// piece.
 const EASY_PATH_THRESHOLD: f64 = 0.001;
 
-/// How many points the worker produces per round trip through the channel.
+/// The candidate pool a design is chosen from: this many per point asked
+/// for, plus [`POOL_FLOOR`].
 ///
-/// Trades channel overhead against shutdown latency and memory: the stop flag
-/// is only checked between batches, so this also bounds how long `drop` waits.
-///
-/// Small, because read-ahead is not free on the expensive problems. Total
-/// look-ahead is this times [`CHANNEL_CAPACITY`], and every point of it is
-/// produced whether or not anybody asks: at 200 dimensions a point costs some
-/// four hundred walker moves, so 64 points of buffer is about three seconds of
-/// work done on spec. Cheap problems never notice either number.
-const BATCH_SIZE: usize = 32;
+/// The pool is sampled and walked, and the walk is the cost: a point at two
+/// hundred variables is some four hundred moves. Two per point keeps a
+/// large design's walk at twice what the design itself would cost; the
+/// floor is what gives a small design — the usual one, a handful of points
+/// — enough candidates to be a choice at all, since the walker's output is
+/// a chain, correlated step to step, and the selection needs a run of
+/// neighbours to skip past. The selection is `O(count · pool · dimensions)`,
+/// which at these sizes is nothing next to the walk.
+const POOL_FACTOR: usize = 2;
 
-/// How many batches may sit unread before the worker blocks.
-///
-/// This *is* the high-water mark. A bounded channel parks the producer when it
-/// is full and wakes it when the consumer drains — which is the whole of
-/// "fill up in the background between requests", with no watermarks, condvars
-/// or polling to write.
-pub(crate) const CHANNEL_CAPACITY: usize = 2;
-
-/// Consecutive empty batches before the worker concludes there is nothing left.
-///
-/// More than one because an empty batch is not proof: rejection sampling can
-/// miss a whole round by luck on a region it usually reaches. More than a
-/// handful would just burn cycles on a region that really is exhausted.
-const BARREN_BATCHES: usize = 3;
+/// See [`POOL_FACTOR`].
+const POOL_FLOOR: usize = 128;
 
 /// The strategies, holding nothing but their streams and their knobs.
 ///
-/// Lives entirely on the worker thread and is never shared. That is the whole
-/// concurrency design — no locks, because there is nothing to lock. What the
-/// caller holds is [`FeasibleRegion`], which is a handle to the worker and
-/// owns none of this. What the search has *found* is not here either: that is
-/// a [`Progress`] value the worker threads through its loop.
+/// Lives for one [`open`] and is dropped with it. What the caller holds
+/// afterwards is [`FeasibleRegion`](crate::FeasibleRegion), which owns none of
+/// this: only the points the opening found. What the search has *found* along
+/// the way is not here either: that is a [`Progress`] value threaded through
+/// the opening.
 pub(crate) struct Ladder {
     /// Uniform rejection sampling over the declared box, if configured. The
-    /// probe, the first source every batch draws on, and the brute squad where
-    /// the opening finds nothing.
+    /// probe, and the brute squad where the opening finds nothing.
     sampler: Option<RandomSampler>,
-    /// Fills whatever sampling left short of a batch, from the points in hand.
+    /// Whether the walker is configured: the opening spends its prune budget
+    /// on coverage only when chains will be placed.
     walker: Option<HitAndRunWalker>,
     /// The stream a local solve draws its starts from, when
     /// [`Strategy::LocalSolve`] is configured. Runs on the opening, after the
@@ -222,17 +210,17 @@ impl Ladder {
     }
 }
 
-/// What the worker concluded while looking for its first point.
+/// What the opening concluded while looking for its first point.
 ///
-/// Sent exactly once, and the thing `ConstraintSolver::solve` awaits. Carries
-/// constraint *indices* rather than expressions so the worker never needs a copy
-/// of them.
+/// Carries constraint *indices* rather than expressions; `solve` names them.
 pub(crate) enum Opening {
     /// At least one sample is in hand. The invariant a returned `FeasibleRegion`
     /// rests on, and the reason a bisection that ran out of budget need not
     /// surface: a budget spent that still produced a point arrives here like
-    /// any other success.
-    Satisfied,
+    /// any other success. `seeded` is the local solve's point from the box
+    /// centre, when the opening ran one: the most interior point the search
+    /// knows, and the reference a repair walks in from.
+    Satisfied { seeded: Option<Point> },
     /// Interval reasoning proved the region empty.
     Impossible { blamed: Vec<usize> },
     /// Nothing found and nothing proven, carrying whatever interval reasoning
@@ -281,7 +269,6 @@ fn cover(
     leaves: Vec<prune::Leaf>,
     held: &VecDeque<Point>,
     local: Option<&mut Xoshiro256PlusPlus>,
-    cancel: &Cancellation<'_>,
 ) -> Vec<Point> {
     let mut seeds: Vec<Point> = Vec::new();
     let mut unsettled: Vec<prune::Node> = Vec::new();
@@ -302,21 +289,7 @@ fn cover(
         // so a leaf on the far side of the region is solved before one
         // next to a known piece — the ordering `start_chains` uses for the
         // same reason.
-        let widths: Vec<f64> = problem
-            .variables
-            .iter()
-            .map(|variable| variable.upper_bound - variable.lower_bound)
-            .collect();
-        let distance = |a: &[f64], b: &[f64]| -> f64 {
-            a.iter()
-                .zip(b)
-                .zip(&widths)
-                .map(|((x, y), width)| {
-                    let scaled = if *width > 0.0 { (x - y) / width } else { 0.0 };
-                    scaled * scaled
-                })
-                .sum()
-        };
+        let widths = widths(problem);
         let centre = |node: &prune::Node| -> Point {
             node.bounds
                 .iter()
@@ -324,14 +297,14 @@ fn cover(
                 .collect()
         };
         let mut remaining = GAP_SEEDS;
-        while remaining > 0 && !unsettled.is_empty() && !cancel.is_requested() {
+        while remaining > 0 && !unsettled.is_empty() {
             let known: Vec<&Point> = held.iter().chain(seeds.iter()).collect();
             let farthest = (0..unsettled.len())
                 .map(|index| {
                     let at = centre(&unsettled[index]);
                     let nearest = known
                         .iter()
-                        .map(|point| distance(&at, point))
+                        .map(|point| normalised_distance(&widths, &at, point))
                         .fold(f64::INFINITY, f64::min);
                     (index, nearest)
                 })
@@ -339,7 +312,7 @@ fn cover(
                 .map_or(0, |(index, _)| index);
             let node = unsettled.swap_remove(farthest);
             remaining -= 1;
-            if let Some(seed) = local::find_initial(problem, &node.bounds, 1, rng, cancel) {
+            if let Some(seed) = local::find_initial(problem, &node.bounds, 1, rng) {
                 seeds.push(seed);
             }
         }
@@ -347,79 +320,6 @@ fn cover(
 
     tracing::info!(seeds = seeds.len(), "coverage from a bisection's leaves");
     seeds
-}
-
-/// How many coordinate sweeps a repair gets before it gives up.
-/// The caller's way of saying "never mind".
-///
-/// Dropping the `ConstraintSolver::solve` future drops the receiving
-/// end of the opening channel, and the sending end can see that. Brute force
-/// asks between batches, a bisection between boxes, a local solve between
-/// evaluations.
-pub(crate) struct Cancellation<'a>(Option<&'a oneshot::Sender<Opening>>);
-
-impl Cancellation<'_> {
-    /// Requested once the receiving end of `opening` is gone.
-    pub(crate) const fn watching(opening: &oneshot::Sender<Opening>) -> Cancellation<'_> {
-        Cancellation(Some(opening))
-    }
-
-    /// Never requested: for a local solve with no future behind it to drop —
-    /// a repair's reference point, or a test driving a call directly.
-    pub(crate) const fn never() -> Cancellation<'static> {
-        Cancellation(None)
-    }
-
-    pub(crate) fn is_requested(&self) -> bool {
-        self.0.is_some_and(oneshot::Sender::is_canceled)
-    }
-}
-
-/// The worker's thread body: open, report the verdict, keep filling.
-pub(crate) fn serve(
-    problem: &ConstraintSystem,
-    mut ladder: Ladder,
-    known: Vec<Point>,
-    opening: oneshot::Sender<Opening>,
-    batches: &SyncSender<Vec<Point>>,
-    stop: &AtomicBool,
-) {
-    // Hints are judged, not trusted, and count as points rather than trials.
-    let known = known
-        .into_iter()
-        .filter(|point| problem.is_feasible(point, 0.0))
-        .collect();
-    let progress = Progress::empty().extend(known);
-    let cancel = Cancellation::watching(&opening);
-
-    let (verdict, progress) = open(problem, &mut ladder, progress, &cancel);
-    if cancel.is_requested() {
-        // The caller dropped the future mid-search. There is nobody to report
-        // to, and brute force stopped for exactly that reason.
-        return;
-    }
-    tracing::debug!(
-        points = progress.points().len(),
-        proposed = progress.proposed(),
-        landed = progress.landed(),
-        "opened"
-    );
-
-    let deliverable = matches!(verdict, Opening::Satisfied);
-    if opening.send(verdict).is_err() || !deliverable {
-        // Either the caller gave up before we answered, or there is nothing to
-        // deliver. Dropping `batches` on the way out is what tells the pool it
-        // is exhausted rather than merely slow.
-        return;
-    }
-
-    // The points in hand are the first batch: every one is feasible, and they
-    // are as good as any that would follow.
-    let first: Vec<Point> = progress.points().iter().take(BATCH_SIZE).cloned().collect();
-    if batches.send(first).is_err() {
-        return;
-    }
-    keep_filling(problem, &mut ladder, progress, batches, stop);
 }
 
 /// The opening: contract, probe, local solve, bisect, brute force, in that
@@ -437,12 +337,18 @@ pub(crate) fn serve(
 ///
 /// `Satisfied` means at least one feasible point is in hand, which is what
 /// a returned [`FeasibleRegion`](crate::FeasibleRegion) promises.
-fn open(
+pub(crate) fn open(
     problem: &ConstraintSystem,
     ladder: &mut Ladder,
-    progress: Progress,
-    cancel: &Cancellation<'_>,
+    known: Vec<Point>,
 ) -> (Opening, Progress) {
+    // Hints are judged, not trusted, and count as points rather than trials.
+    let known: Vec<Point> = known
+        .into_iter()
+        .filter(|point| problem.is_feasible(point, 0.0))
+        .collect();
+    let progress = Progress::empty().extend(known);
+
     // What each constraint managed to say, over the whole opening: the
     // answer to "which constraints could nothing be concluded from".
     let mut contributed = vec![false; problem.constraints.len()];
@@ -475,12 +381,13 @@ fn open(
     // A local solve before any bisection: finding one point is an
     // optimisation, and a local method does it where a bisection of two
     // hundred coordinates would spend its budget on the first few.
+    let mut seeded = None;
     if progress.is_empty()
         && let Some(rng) = &mut ladder.local
-        && let Some(point) =
-            local::find_initial(problem, &problem.declared(), local::STARTS, rng, cancel)
+        && let Some(point) = local::find_initial(problem, &problem.declared(), local::STARTS, rng)
     {
-        progress = progress.extend(vec![point]);
+        progress = progress.extend(vec![point.clone()]);
+        seeded = Some(point);
     }
 
     // Having points settles the *verdict*. It does not settle **coverage**:
@@ -497,7 +404,7 @@ fn open(
     if let Some((root, budget)) = root
         && (progress.is_empty() || walker_will_carry)
     {
-        match prune::bisect(problem, root, budget, &mut contributed, cancel) {
+        match prune::bisect(problem, root, budget, &mut contributed) {
             prune::Pruned::Empty { blamed } => {
                 assert!(
                     progress.is_empty(),
@@ -514,13 +421,7 @@ fn open(
                         "bisection cut short; pieces beyond the seeds in hand may be missed"
                     );
                 }
-                let seeds = cover(
-                    problem,
-                    leaves,
-                    progress.points(),
-                    ladder.local.as_mut(),
-                    cancel,
-                );
+                let seeds = cover(problem, leaves, progress.points(), ladder.local.as_mut());
                 progress = progress.extend(seeds);
             }
         }
@@ -529,7 +430,7 @@ fn open(
     if progress.is_empty()
         && let Some(sampler) = &mut ladder.sampler
     {
-        let trial = sampler.brute_force(problem, cancel);
+        let trial = sampler.brute_force(problem);
         tracing::info!(
             proposed = trial.proposed,
             landed = trial.points.len(),
@@ -539,7 +440,13 @@ fn open(
     }
 
     if !progress.is_empty() {
-        return (Opening::Satisfied, progress);
+        tracing::debug!(
+            points = progress.points().len(),
+            proposed = progress.proposed(),
+            landed = progress.landed(),
+            "opened"
+        );
+        return (Opening::Satisfied { seeded }, progress);
     }
     // Without a contractor every constraint is "unexpressed" in the sense
     // `NotFound` uses: none was put to anything that could reason about it.
@@ -551,89 +458,130 @@ fn open(
     (Opening::Unproven { unexpressed }, progress)
 }
 
-/// The steady state: one batch per trip through the channel until the caller
-/// stops asking or the region runs dry.
+/// A space-filling design of up to `count` feasible points, spread away from
+/// `existing` and from each other.
 ///
-/// "Runs dry" is [`BARREN_BATCHES`] empty batches in a row, and a batch is
-/// empty only when sampling landed nothing *and* the walker had nothing to
-/// fill from — see [`next_batch`]. With a walker configured and points in
-/// hand that cannot happen, so this is a conclusion only a sampling-only
-/// configuration ever reaches.
-fn keep_filling(
+/// The pool: `held` (what the opening found, the witness first), a round of
+/// uniform proposals over the box, and the walker from all of that for the
+/// rest — sampling first because it is unbiased and needs no burn-in, and on
+/// a region it reaches it is the whole pool; the walker is what reaches a
+/// region sampling cannot. Both from streams derived from `seed`, so the pool
+/// is a function of the region and the seed. Then farthest-first: each
+/// choice is the pool point whose nearest neighbour among `existing` and the
+/// choices so far is farthest, in box-normalised Euclidean distance, the
+/// metric `repair` lands by. With nothing to spread from, the first choice is
+/// the witness. A Latin hypercube was considered and is the wrong tool here:
+/// it stratifies each axis, which says nothing about a design of fewer
+/// points than dimensions, where "far from each other and from what the
+/// caller has" is the whole requirement.
+///
+/// Fewer than `count` only when the region ran out of distinct points: the
+/// next choice would coincide with one already in the design, which a
+/// point-sized region reaches at once (the walker stays put, and emits the
+/// same point). Every point returned is feasible and judged here.
+pub(crate) fn design(
     problem: &ConstraintSystem,
-    ladder: &mut Ladder,
-    mut progress: Progress,
-    batches: &SyncSender<Vec<Point>>,
-    stop: &AtomicBool,
-) {
-    let mut barren = 0;
-    while !stop.load(Ordering::Relaxed) {
-        let (batch, next) = next_batch(problem, ladder, progress, BATCH_SIZE, stop);
-        progress = next;
-        if batch.is_empty() {
-            barren += 1;
-            if barren >= BARREN_BATCHES {
-                return;
-            }
-            continue;
-        }
-        barren = 0;
-        if batches.send(batch).is_err() {
-            return;
-        }
+    held: &[Point],
+    existing: &[Point],
+    count: usize,
+    seed: u64,
+) -> Vec<Point> {
+    let _span = tracing::debug_span!("design", count, existing = existing.len()).entered();
+    if count == 0 || held.is_empty() {
+        return Vec::new();
     }
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let mut sampler = RandomSampler::new(
+        &problem.variables,
+        Xoshiro256PlusPlus::from_rng(&mut rng),
+        0,
+        1,
+    );
+    let mut walker = HitAndRunWalker::new(Xoshiro256PlusPlus::from_rng(&mut rng));
+
+    let wanted = count * POOL_FACTOR + POOL_FLOOR;
+    let mut pool: Vec<Point> = held.to_vec();
+    let trial = sampler.deliver(problem, wanted);
+    let sampled = trial.points.len();
+    pool.extend(trial.points);
+    let walked: Vec<Point> = walker
+        .extend(problem, &pool, wanted - sampled)
+        .into_iter()
+        .filter(|point| problem.is_feasible(point, 0.0))
+        .collect();
+    tracing::debug!(sampled, walked = walked.len(), "pooled");
+    pool.extend(walked);
+
+    let widths = widths(problem);
+    let mut nearest: Vec<f64> = pool
+        .iter()
+        .map(|candidate| {
+            existing
+                .iter()
+                .map(|point| normalised_distance(&widths, candidate, point))
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect();
+    let mut chosen: Vec<Point> = Vec::with_capacity(count);
+    while chosen.len() < count {
+        // `max_by` keeps the last of equal maxima; with nothing to spread
+        // from every candidate is infinitely far, and the one to take is the
+        // witness at the front.
+        let (index, farthest) = nearest
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map_or((0, 0.0), |(index, farthest)| {
+                if farthest.is_infinite() {
+                    (0, farthest)
+                } else {
+                    (index, farthest)
+                }
+            });
+        if farthest <= 0.0 {
+            break;
+        }
+        let choice = pool[index].clone();
+        for (candidate, nearest) in pool.iter().zip(&mut nearest) {
+            *nearest = nearest.min(normalised_distance(&widths, candidate, &choice));
+        }
+        chosen.push(choice);
+    }
+    tracing::debug!(chosen = chosen.len(), pool = pool.len(), "designed");
+    chosen
 }
 
-/// At most `count` feasible points, and the progress that now includes them.
-///
-/// Sampling goes first and the walker fills whatever it left short. Sampling
-/// first because it is unbiased by construction and needs no burn-in, and on
-/// a region it reaches it is the whole answer: the measured case is
-/// `parabolic_roots_narrowing`, where the walker alone returned 2000 points
-/// worth 87 independent ones, because a chain cannot cross the gap between
-/// the two bands and the split between them was decided by where each chain
-/// happened to start. Plain sampling reaches that region perfectly well and
-/// has no such problem. On a region sampling cannot reach, its batch is a few
-/// thousand proposals judged in one pass — cheap next to the walk that
-/// follows — and the walker does the delivering.
-///
-/// There is no mode to get wrong. A region the probe misjudged as easy is
-/// simply walked where sampling comes up short, and the mixture of two
-/// sources that are each uniform over the region is uniform over it.
-///
-/// Fewer than asked for is normal — the walker may have nothing to walk from
-/// yet. Never more, and never an infeasible one.
-fn next_batch(
-    problem: &ConstraintSystem,
-    ladder: &mut Ladder,
-    mut progress: Progress,
-    count: usize,
-    stop: &AtomicBool,
-) -> (Vec<Point>, Progress) {
-    let mut points = Vec::new();
-    if let Some(sampler) = &mut ladder.sampler {
-        let trial = sampler.deliver(problem, count);
-        points.clone_from(&trial.points);
-        progress = progress.absorb(trial);
-    }
-    if points.len() < count
-        && let Some(walker) = &mut ladder.walker
-    {
-        let walked = walker.extend(problem, progress.points(), count - points.len(), stop);
-        let walked: Vec<Point> = walked
-            .into_iter()
-            .filter(|point| problem.is_feasible(point, 0.0))
-            .collect();
-        progress = progress.extend(walked.clone());
-        points.extend(walked);
-    }
-    (points, progress)
+/// Each variable's box width, the scale [`normalised_distance`] divides by.
+pub(crate) fn widths(problem: &ConstraintSystem) -> Vec<f64> {
+    problem
+        .variables
+        .iter()
+        .map(|variable| variable.upper_bound - variable.lower_bound)
+        .collect()
+}
+
+/// Euclidean distance over box-normalised coordinates: the metric a landing
+/// is judged nearest by and a design is spread by. A coordinate with no width
+/// contributes nothing.
+pub(crate) fn normalised_distance(widths: &[f64], a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .zip(widths)
+        .map(|((x, y), width)| {
+            if *width > 0.0 {
+                let scaled = (x - y) / width;
+                scaled * scaled
+            } else {
+                0.0
+            }
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-
     use super::*;
     use crate::{ConstraintSolver, Infeasibility, InputVariable};
 
@@ -646,17 +594,18 @@ mod tests {
 
     const SEED: u64 = 0x50_50_1E_5E_ED;
 
-    #[pollster::test]
-    async fn brute_force_seeds_the_walker_when_the_probe_is_empty() {
+    #[test]
+    fn brute_force_seeds_the_walker_when_the_probe_is_empty() {
         let verdict = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_threads(2)
-            .solve(&one_in_a_million())
-            .await;
+            .solve(&one_in_a_million());
 
-        let mut samples = verdict.expect("brute force should have found the region");
-        let delivered = samples.take(10);
+        let region = verdict.expect("brute force should have found the region");
+        let delivered = region
+            .sample(faer::Mat::zeros(1, 0).as_ref(), 10, SEED)
+            .expect("a slab has ten distinct points");
         assert_eq!(delivered.ncols(), 10);
         for column in 0..10 {
             assert!(
@@ -673,13 +622,12 @@ mod tests {
     /// cannot settle within its budget — a computed subscript, which it
     /// concludes nothing from — is found anyway, because what it cannot
     /// decide is handed to brute force.
-    #[pollster::test]
-    async fn the_seeders_go_first_and_brute_force_takes_what_they_cannot_decide() {
+    #[test]
+    fn the_seeders_go_first_and_brute_force_takes_what_they_cannot_decide() {
         let by_seeders = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_proposal_budget(0)
-            .solve(&one_in_a_million())
-            .await;
+            .solve(&one_in_a_million());
         assert!(
             by_seeders.is_ok(),
             "the contraction or the local solve should have seeded the region with no brute \
@@ -706,11 +654,12 @@ mod tests {
             ])
             .with_proposal_budget(1_000_000)
             .with_threads(2)
-            .solve(&opaque)
-            .await;
-        let mut samples = by_brute_force
+            .solve(&opaque);
+        let region = by_brute_force
             .expect("brute force should have taken over from what nothing could conclude on");
-        let delivered = samples.take(5);
+        let delivered = region
+            .sample(faer::Mat::zeros(2, 0).as_ref(), 5, SEED)
+            .expect("a slab has five distinct points");
         assert_eq!(delivered.ncols(), 5);
         for column in 0..5 {
             assert!(
@@ -725,8 +674,8 @@ mod tests {
     /// instance it would grind on comes back `NotFound` promptly, with no
     /// brute force to mask it — a small budget, and no more contractions
     /// than it allows.
-    #[pollster::test]
-    async fn the_prune_budget_bounds_the_opening() {
+    #[test]
+    fn the_prune_budget_bounds_the_opening() {
         let hard = ConstraintSystem::new(
             vec![
                 InputVariable::new("x", 0.0, 100.0),
@@ -747,8 +696,7 @@ mod tests {
             .with_prune_budget(64)
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(&hard)
-            .await;
+            .solve(&hard);
         let took = started.elapsed();
         assert!(
             matches!(verdict, Err(Infeasibility::NotFound { .. })),
@@ -760,67 +708,18 @@ mod tests {
     /// Pins that the loop is what changed: with no proposal budget and no
     /// seeder the pool behaves as it did before step 4 and gives up after
     /// the probe.
-    #[pollster::test]
-    async fn a_zero_budget_is_the_old_behaviour() {
+    #[test]
+    fn a_zero_budget_is_the_old_behaviour() {
         let verdict = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_proposal_budget(0)
             .with_gpu(false)
-            .solve(&one_in_a_million())
-            .await;
+            .solve(&one_in_a_million());
 
         assert!(
             matches!(verdict, Err(Infeasibility::NotFound { .. })),
             "{verdict:?}"
-        );
-    }
-
-    /// The caller dropped the `solve` future — here, the receiving end of the
-    /// opening channel — while brute force was grinding on an empty region
-    /// with an effectively unlimited budget. The worker must notice and
-    /// return, not spend the budget.
-    #[test]
-    fn a_dropped_future_stops_the_search() {
-        let system = ConstraintSystem::new(vec![InputVariable::new("x1", 0.0, 1.0)], ["x1 > 2"])
-            .expect("the fixture binds");
-        let ladder = Ladder::new(
-            &system,
-            Xoshiro256PlusPlus::seed_from_u64(SEED),
-            &[Strategy::BruteSquad, Strategy::HitAndRun],
-            Budgets {
-                proposals: u64::MAX,
-                threads: 2,
-                ..Budgets::default()
-            },
-        );
-
-        let (send_opening, opening) = oneshot::channel();
-        let (send_batch, _batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let stop = AtomicBool::new(false);
-        drop(opening);
-
-        let started = std::time::Instant::now();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                serve(
-                    &system,
-                    ladder,
-                    Vec::new(),
-                    send_opening,
-                    &send_batch,
-                    &stop,
-                )
-            });
-        });
-        let took = started.elapsed();
-        // Generous, because under `--features gpu` this shares one device —
-        // and one lock per dispatch — with the sieve tests running beside it,
-        // and connecting to the adapter is a couple of hundred milliseconds
-        // by itself. The budget it must not spend is hours.
-        assert!(
-            took < std::time::Duration::from_secs(10),
-            "the worker ran {took:?} after its caller was gone"
         );
     }
 }

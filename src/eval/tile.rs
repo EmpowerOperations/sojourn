@@ -307,7 +307,104 @@ impl WithSimd for TileRun<'_> {
 
     #[inline(always)]
     fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-        run_tile_with(simd, self)
+        let TileRun {
+            tape,
+            samples,
+            first_column,
+            lanes,
+            file,
+            faults,
+        } = self;
+        let available = samples.nrows();
+
+        for (pc, insn) in tape.insns.iter().enumerate() {
+            match *insn {
+                Instruction::Load { dst, input } => {
+                    let d = file.reg_mut(dst, lanes);
+                    if simd::load_strided(d, samples, input as usize, first_column) {
+                        record_non_finite(faults, pc, d);
+                    }
+                }
+                Instruction::Copy { dst, src } => {
+                    let (d, s) = file.dst_a(dst, src, lanes);
+                    d.copy_from_slice(s);
+                }
+                Instruction::Unary { dst, op, a } => {
+                    let (d, a) = file.dst_a(dst, a, lanes);
+                    if dispatch_unary!(simd, op, d, a) {
+                        record_non_finite(faults, pc, d);
+                    }
+                }
+                Instruction::Binary { dst, op, a, b } => {
+                    let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
+                    if dispatch_binary!(simd, op, d, a, b) {
+                        record_non_finite(faults, pc, d);
+                    }
+                }
+                Instruction::Compare { dst, op, a, b } => {
+                    let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
+                    let bad = simd::binary(
+                        simd,
+                        d,
+                        a,
+                        b,
+                        |s, x, y| simd::compare(s, op, x, y),
+                        |x, y| super::lane::compare(op, x, y),
+                    );
+                    if bad {
+                        record_non_finite(faults, pc, d);
+                    }
+                }
+                Instruction::Combine {
+                    dst,
+                    how,
+                    a,
+                    b,
+                    last,
+                } => {
+                    let bad = if dst == a {
+                        let (d, b) = file.dst_a(dst, b, lanes);
+                        dispatch_combine!(simd, how, in_place: d, b)
+                    } else {
+                        let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
+                        dispatch_combine!(simd, how, three_address: d, a, b)
+                    };
+                    if last && bad {
+                        record_non_finite(faults, pc, file.reg(dst, lanes));
+                    }
+                }
+                Instruction::Check { reg } => {
+                    let values = file.reg(reg, lanes);
+                    if simd::any_non_finite(simd, values) {
+                        record_non_finite(faults, pc, values);
+                    }
+                }
+                Instruction::Gather { dst, index, .. } => {
+                    // Per lane by nature: each lane reads its own row. Scalar.
+                    let (d, index) = file.dst_a(dst, index, lanes);
+                    for (lane, (v, &i)) in d.iter_mut().zip(index).enumerate() {
+                        match lane::resolve_index(i, available) {
+                            Ok(position) => {
+                                let x = samples[(position, first_column + lane)];
+                                *v = x;
+                                if !x.is_finite() {
+                                    record(faults, lane, pc, FaultKind::NonFinite(x));
+                                }
+                            }
+                            Err(kind) => {
+                                *v = f64::NAN;
+                                record(faults, lane, pc, kind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        faults
+            .iter()
+            .enumerate()
+            .find_map(|(lane, fault)| fault.map(|f| (lane, f)))
     }
 }
 
@@ -353,109 +450,6 @@ pub(crate) fn run_tile_on(
         file,
         faults,
     })
-}
-
-/// The instruction walk, monomorphised per backend.
-#[inline(always)]
-fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault)> {
-    let TileRun {
-        tape,
-        samples,
-        first_column,
-        lanes,
-        file,
-        faults,
-    } = run;
-    let available = samples.nrows();
-
-    for (pc, insn) in tape.insns.iter().enumerate() {
-        match *insn {
-            Instruction::Load { dst, input } => {
-                let d = file.reg_mut(dst, lanes);
-                if simd::load_strided(d, samples, input as usize, first_column) {
-                    record_non_finite(faults, pc, d);
-                }
-            }
-            Instruction::Copy { dst, src } => {
-                let (d, s) = file.dst_a(dst, src, lanes);
-                d.copy_from_slice(s);
-            }
-            Instruction::Unary { dst, op, a } => {
-                let (d, a) = file.dst_a(dst, a, lanes);
-                if dispatch_unary!(simd, op, d, a) {
-                    record_non_finite(faults, pc, d);
-                }
-            }
-            Instruction::Binary { dst, op, a, b } => {
-                let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
-                if dispatch_binary!(simd, op, d, a, b) {
-                    record_non_finite(faults, pc, d);
-                }
-            }
-            Instruction::Compare { dst, op, a, b } => {
-                let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
-                let bad = simd::binary(
-                    simd,
-                    d,
-                    a,
-                    b,
-                    |s, x, y| simd::compare(s, op, x, y),
-                    |x, y| super::lane::compare(op, x, y),
-                );
-                if bad {
-                    record_non_finite(faults, pc, d);
-                }
-            }
-            Instruction::Combine {
-                dst,
-                how,
-                a,
-                b,
-                last,
-            } => {
-                let bad = if dst == a {
-                    let (d, b) = file.dst_a(dst, b, lanes);
-                    dispatch_combine!(simd, how, in_place: d, b)
-                } else {
-                    let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
-                    dispatch_combine!(simd, how, three_address: d, a, b)
-                };
-                if last && bad {
-                    record_non_finite(faults, pc, file.reg(dst, lanes));
-                }
-            }
-            Instruction::Check { reg } => {
-                let values = file.reg(reg, lanes);
-                if simd::any_non_finite(simd, values) {
-                    record_non_finite(faults, pc, values);
-                }
-            }
-            Instruction::Gather { dst, index, .. } => {
-                // Per lane by nature: each lane reads its own row. Scalar.
-                let (d, index) = file.dst_a(dst, index, lanes);
-                for (lane, (v, &i)) in d.iter_mut().zip(index).enumerate() {
-                    match lane::resolve_index(i, available) {
-                        Ok(position) => {
-                            let x = samples[(position, first_column + lane)];
-                            *v = x;
-                            if !x.is_finite() {
-                                record(faults, lane, pc, FaultKind::NonFinite(x));
-                            }
-                        }
-                        Err(kind) => {
-                            *v = f64::NAN;
-                            record(faults, lane, pc, kind);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    faults
-        .iter()
-        .enumerate()
-        .find_map(|(lane, fault)| fault.map(|f| (lane, f)))
 }
 
 #[cfg(test)]

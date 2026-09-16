@@ -1,39 +1,40 @@
-//! The solve: a builder for how hard to search, and the handle a search
+//! The solve: a builder for how hard to search, and the region a search
 //! hands back.
 //!
 //! [`ConstraintSolver`] is every knob — the seed, the budgets, the strategy
-//! list — with a default for each, and one awaitable call,
-//! [`solve`](ConstraintSolver::solve), that starts the engine on a worker
-//! thread. [`FeasibleRegion`] is what a satisfied search returns: the solved
-//! region — a handle to that worker, from which feasible points are taken as
-//! a matrix, the system it was solved over, and repair of any point against
-//! it. The verdicts say what a search concluded, and whether that was a proof
-//! or a shrug. The engine itself is `cvg`.
+//! list — with a default for each, and one call,
+//! [`solve`](ConstraintSolver::solve), that runs the engine's opening to a
+//! verdict. [`FeasibleRegion`] is what a satisfied search returns: the
+//! system it was solved over and the feasible points the opening found, from
+//! which a space-filling design is [`sample`](FeasibleRegion::sample)d and
+//! any point is [`repair`](FeasibleRegion::repair)ed. The verdicts say what a
+//! search concluded, and whether that was a proof or a shrug. The engine
+//! itself is `cvg`.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
-
-use futures_channel::oneshot;
+use faer::{Mat, MatRef};
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use faer::Mat;
-
 use crate::cvg;
-use crate::cvg::{CHANNEL_CAPACITY, Ladder, Opening};
+use crate::cvg::{Ladder, Opening, local};
 use crate::repair::RepairError;
 use crate::{ConstraintRef, ConstraintSystem, Point};
+
+/// The seed the reference point's local solve draws its extra starts from,
+/// when the opening did not run one.
+///
+/// A constant, so the reference is a function of the system alone: the same
+/// on every solve, on every machine, whatever the solver's own seed found.
+/// The first start is the box centre and needs no draw; this seeds the ones
+/// after it.
+const REFERENCE_SEED: u64 = 0x5E_ED_0F_1D;
 
 /// Why no sample was produced — and whether that is a proof or a shrug.
 ///
 /// The one way [`solve`](crate::solve) fails to return a region: there is
 /// none to return, or none could be found. Everything else that can go wrong
-/// in a search — a thread that cannot be spawned, a worker that dies — is a
-/// bug in this crate or a failure of the host, and is a panic, raised on the
-/// calling thread.
+/// in a search is a bug in this crate or a failure of the host, and is a
+/// panic.
 ///
 /// Kept as two variants rather than a `proved: bool` because they are different
 /// sentences to whoever reads the result. *"Your constraints conflict, here are
@@ -122,11 +123,14 @@ pub enum Strategy {
     /// not settle it either, it is the brute squad: the same proposals, wider,
     /// on every core, for [`ConstraintSolver::with_proposal_budget`]
     /// candidates, to land the seed the walker needs. What it lands is a
-    /// function of the seed and the budget, never of the thread count.
+    /// function of the seed and the budget, never of the thread count, and
+    /// every thread is joined before it returns.
     BruteSquad,
     /// Hit-and-run: walk the chord of the region through the current point.
     /// Converges to the uniform distribution, but needs a feasible point to
     /// start from and crosses between disconnected pieces only by luck.
+    /// In the opening it decides only whether the prune budget is spent on
+    /// coverage; a design's candidate pool is always walked.
     HitAndRun,
     /// A local solve for a first point when the probe found none: COBYLA,
     /// derivative-free, from the box centre and a few seeded starts, driving
@@ -162,8 +166,8 @@ pub enum Strategy {
 ///
 /// The strategies are partitioned by role in [`Ladder::new`] rather than by
 /// position, so the order here is cosmetic. The actual order of escalation is
-/// fixed by [`open`]: contract, probe, then local solve, then bisect, then
-/// brute force, then the walker from whatever seed those produced.
+/// fixed by [`cvg::open`]: contract, probe, then local solve, then bisect,
+/// then brute force.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
 /// copy of this list living in the test suite is a copy that goes stale, and did.
@@ -248,13 +252,14 @@ pub const GPU_VARIABLE: &str = "SOJOURN_GPU";
 ///
 /// ```no_run
 /// # use sojourn::{ConstraintSystem, InputVariable};
-/// # async fn example() -> anyhow::Result<()> {
+/// # fn example() -> anyhow::Result<()> {
 /// let system = ConstraintSystem::new(vec![InputVariable::new("x", -1.0, 1.0)], ["x > 0"])?;
 ///
-/// let mut region = sojourn::solve(&system).await?;
-/// // One column per sample, one row per variable — an input matrix as it
+/// let region = sojourn::solve(&system)?;
+/// // One column per point, one row per variable — an input matrix as it
 /// // stands, no transpose.
-/// let batch = region.take(1_000);
+/// let design = region.sample(faer::Mat::zeros(1, 0).as_ref(), 16, 42)?;
+/// # let _ = design;
 /// # Ok(())
 /// # }
 /// ```
@@ -328,8 +333,9 @@ impl ConstraintSolver {
     /// Points the caller already believes are feasible.
     ///
     /// A hint, not an assertion: infeasible ones are discarded rather than
-    /// trusted. Worth supplying — on a region too tight to sample, a seed is the
-    /// difference between the walker working and having nothing to start from.
+    /// trusted. Worth supplying — on a region too tight to sample, a seed is
+    /// the difference between an opening that returns at once and one that
+    /// spends its budgets.
     #[must_use]
     pub fn with_known_feasible(mut self, points: Vec<Point>) -> Self {
         self.known_feasible = points;
@@ -338,11 +344,11 @@ impl ConstraintSolver {
 
     /// Pins the randomness, so a run is reproducible.
     ///
-    /// What a caller reproducing a run supplies. Every point the search
-    /// delivers is a function of this seed and the budgets, so two solves of
-    /// the same system under the same seed hand out the same points in the
-    /// same order. ([`repair`](FeasibleRegion::repair) needs no seed: it is a
-    /// function of the system, the point and the clearance.)
+    /// What a caller reproducing a run supplies. Every point the opening
+    /// finds is a function of this seed and the budgets, so two solves of
+    /// the same system under the same seed hold the same points. (A design
+    /// takes its own seed, [`sample`](FeasibleRegion::sample);
+    /// [`repair`](FeasibleRegion::repair) needs none.)
     #[must_use]
     pub fn with_seed(self, seed: u64) -> Self {
         self.with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
@@ -358,10 +364,9 @@ impl ConstraintSolver {
 
     /// Pins the strategy list.
     ///
-    /// Hidden along with [`Strategy`] itself: which strategy delivers is the
-    /// engine's decision, made per batch, not the caller's. Tests use this to
-    /// measure one strategy at a time, because a pool that mixes them cannot
-    /// say which produced a bad distribution.
+    /// Hidden along with [`Strategy`] itself: which strategy finds the
+    /// region is the engine's decision, not the caller's. Tests use this to
+    /// measure one strategy at a time.
     #[doc(hidden)]
     #[must_use]
     pub fn with_strategies(mut self, strategies: Vec<Strategy>) -> Self {
@@ -373,9 +378,9 @@ impl ConstraintSolver {
     ///
     /// A *proposal* is one random point in the declared box, judged against
     /// every constraint. When the opening probe lands nothing and the solver,
-    /// if configured, comes back without a proof or a usable witness, the pool
-    /// keeps proposing on every core until a batch lands or this many have
-    /// been judged. The default
+    /// if configured, comes back without a proof or a usable witness, brute
+    /// force keeps proposing on every core until a batch lands or this many
+    /// have been judged. The default
     /// is [`DEFAULT_PROPOSAL_BUDGET`]; the cost is some seventy million
     /// proposals a second per core on a simple constraint set. Zero skips
     /// brute force on the CPU. A count rather than a duration, so that the
@@ -448,92 +453,62 @@ impl ConstraintSolver {
         self
     }
 
-    /// Finds a feasible region and hands back something that can sample it.
+    /// Finds a feasible region and hands back the points it found there.
     ///
-    /// # Why this is `async`
-    ///
-    /// There is no bound on how long it takes. A solver can hit exponential
-    /// blowup and effectively not finish, so a plain `fn` returning in 45ms or
-    /// 45 minutes would be lying about its cost. A future says so in the type.
-    ///
-    /// No runtime is imposed. [`Future`](std::future::Future) is in `core`; drive
-    /// this with tokio, smol, or a bare `block_on` — this crate's own tests use
-    /// the last of those, which is the proof that nothing heavier is required.
-    ///
-    /// The search runs on its own thread and this future waits on the opening
-    /// verdict, so a `timeout` around it does fire. **Dropping the future is
-    /// how to cancel:** a brute-force search notices between batches and
-    /// stops, freeing every core it took, and a bisection notices between
-    /// boxes. [`FeasibleRegion::take`] is synchronous by design. Recorded in
-    /// `docs/todo.md`.
+    /// Bounded by its budgets and by nothing else: a count of contractions
+    /// for branch-and-prune, of evaluations for the local solve, of
+    /// proposals for brute force — never a clock, so the same seed reaches
+    /// the same verdict on every machine. That is also the shape of "this
+    /// may take a while": the budgets say how much may be spent, and a
+    /// search that spends them without a point is [`Infeasibility::NotFound`]
+    /// rather than a call that never returns. Milliseconds on most systems;
+    /// brute force on a region it cannot reach is the default budget's
+    /// seconds. Runs on the calling thread; brute force fans out over the
+    /// cores and joins them before returning, and nothing runs after.
     ///
     /// # Errors
     /// There is no region: the constraints were proved to conflict, or nothing
     /// could be found and nothing could be proved — [`Infeasibility`]
     /// says which and names the constraints involved. Nothing else is an
     /// error; see [`Infeasibility`] for what is a panic instead.
-    ///
-    /// # Panics
-    /// If the search thread panics, with its panic: the worker's payload is
-    /// resumed here rather than caught, so a bug in the engine is a panic on
-    /// the calling thread like any other.
-    pub async fn solve(self, system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
-        // The worker owns a clone and the handle another: the thread needs
-        // `'static`, and the handle answers for the region after the search,
-        // which is where repair lives. A system is tapes and two small graphs,
-        // so two clones are nothing against the search.
-        let ladder = Ladder::new(system, self.rng, &self.strategies, self.budgets);
-        let system = system.clone();
-
-        let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (send_opening, opening) = oneshot::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let worker_stop = Arc::clone(&stop);
-        let known_feasible = self.known_feasible;
-        let worker_system = system.clone();
-        let worker = std::thread::spawn(move || {
-            cvg::serve(
-                &worker_system,
-                ladder,
-                known_feasible,
-                send_opening,
-                &send_batch,
-                &worker_stop,
-            );
-        });
-
-        let Ok(verdict) = opening.await else {
-            // The worker dropped its end without reporting, which only a
-            // panic does: join it and raise that panic here, payload intact.
-            match worker.join() {
-                Err(payload) => std::panic::resume_unwind(payload),
-                Ok(()) => unreachable!("the search thread returned without reporting a verdict"),
-            }
-        };
-
-        // Built even for an unsatisfiable problem, which does not keep it: its
-        // `Drop` is what joins the worker.
-        let region = FeasibleRegion {
-            system,
-            batches,
-            buffer: VecDeque::new(),
-            worker: Some(worker),
-            stop,
-            exhausted: false,
-        };
+    pub fn solve(self, system: &ConstraintSystem) -> Result<FeasibleRegion, Infeasibility> {
+        let mut ladder = Ladder::new(system, self.rng, &self.strategies, self.budgets);
+        let (verdict, progress) = cvg::open(system, &mut ladder, self.known_feasible);
 
         let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
-            indices
-                .into_iter()
-                .map(|i| region.system.named(i))
-                .collect()
+            indices.into_iter().map(|i| system.named(i)).collect()
         };
-
         match verdict {
-            // The region is dropped on both unsatisfiable paths, and its `Drop`
-            // is what joins the worker.
-            Opening::Satisfied => Ok(region),
+            // The region answers for the system after the search, which is
+            // where repair lives; a system is tapes and two small graphs, so
+            // the clone is nothing against the search.
+            Opening::Satisfied { seeded } => {
+                let points = progress.into_points();
+                // The reference a flat-constraint repair walks in from: the
+                // local solve's point from the box centre — the opening's own
+                // where it ran one, else one run here under a fixed seed. A
+                // probe hit would do for feasibility but not for this: a
+                // random point of Keane's region can stand where the product
+                // is already nearly flat, and a chord from there lands the
+                // projection on ground it cannot read (1.3 s against 4 ms
+                // from the centre, measured). The witness is the fallback
+                // where no local solve lands.
+                let reference = seeded
+                    .or_else(|| {
+                        local::find_initial(
+                            system,
+                            &system.declared(),
+                            local::STARTS,
+                            &mut Xoshiro256PlusPlus::seed_from_u64(REFERENCE_SEED),
+                        )
+                    })
+                    .unwrap_or_else(|| points[0].clone());
+                Ok(FeasibleRegion {
+                    system: system.clone(),
+                    points,
+                    reference,
+                })
+            }
             Opening::Impossible { blamed } => Err(Infeasibility::Proved {
                 blamed: name_all(blamed),
             }),
@@ -544,48 +519,52 @@ impl ConstraintSolver {
     }
 }
 
-/// What a pool is doing, when it is not simply handing over points.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Status {
-    /// Still producing, or at least still trying.
-    Filling,
-    /// The worker finished. There will be no more points, ever.
-    ///
-    /// Only ever a legitimate end: a worker that *panicked* is not exhausted,
-    /// its panic is resumed on the caller's thread by the `take` that finds
-    /// it, so "no more points exist" and "we broke" can never be confused.
-    Exhausted,
+/// Why [`FeasibleRegion::sample`] could not answer.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SampleError {
+    /// The region ran out of distinct points before the design was full: the
+    /// next choice would have coincided with one already in the design or
+    /// among the caller's own. A region a few ulps wide, or a single point —
+    /// a fully determined system — does this at once. `found` is the design
+    /// as far as it got, every column feasible, in case it is better than
+    /// nothing.
+    #[error(
+        "the region yielded {} distinct points of the {wanted} asked for; it is a point, or near enough to one",
+        found.ncols()
+    )]
+    Degenerate { found: Mat<f64>, wanted: usize },
 }
 
-/// A solved region: the system a search found feasible points in, being
-/// sampled on a background thread.
+/// A solved region: the system a search found feasible points in, and those
+/// points.
 ///
-/// Holds no search state — the engine's ladder and its progress value live
-/// on the worker thread and nowhere else. This is the system, a receiving
-/// end, a buffer, and the means to stop the worker. It is also where a point
-/// that is not a sample is brought to the region, [`repair`](Self::repair):
-/// a region that could not be solved has nothing to repair toward, which is
-/// why that lives here and not on the system.
+/// A value, immutable, holding no search state: the engine's ladder and its
+/// progress lived for the opening and are gone. What is here is the system
+/// and every feasible point the opening ended with, the witness first. From
+/// it a space-filling design is [`sample`](Self::sample)d, and a point that
+/// is not one is brought to the region by [`repair`](Self::repair): a region
+/// that could not be solved has nothing to repair toward, which is why that
+/// lives here and not on the system.
 ///
 /// Slight misnomer: this region is "solved", and may be disjoint
 /// (meaning its "feasible regions"),
 /// at time of writing it has no mechanism to discover this.
+#[derive(Clone)]
 pub struct FeasibleRegion {
     system: ConstraintSystem,
-    batches: Receiver<Vec<Point>>,
-    buffer: VecDeque<Point>,
-    worker: Option<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
-    /// Set once the channel disconnects. The worker is gone and no amount of
-    /// waiting will produce more.
-    exhausted: bool,
+    /// Every feasible point the opening ended with, the witness at the front.
+    /// Never empty: `Satisfied` means at least one.
+    points: Vec<Point>,
+    /// A feasible point as far inside the region as a local solve from the
+    /// box centre reaches: the reference a repair on a flat constraint walks
+    /// in from. A function of the system alone.
+    reference: Point,
 }
 
 impl std::fmt::Debug for FeasibleRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FeasibleRegion")
-            .field("buffered", &self.buffer.len())
-            .field("status", &self.status())
+            .field("points", &self.points.len())
             .finish()
     }
 }
@@ -597,11 +576,27 @@ impl FeasibleRegion {
         &self.system
     }
 
+    /// The first feasible point the search found: the one every design
+    /// starts its walk from.
+    #[must_use]
+    pub fn witness(&self) -> &[f64] {
+        &self.points[0]
+    }
+
+    /// Every feasible point the opening ended with, the witness first: the
+    /// probe's hits, the local solve's or brute force's seed, the coverage
+    /// seeds a bisection found, and any hint the caller supplied that judged
+    /// feasible. At most a window of the most recent thousand or so.
+    #[must_use]
+    pub fn points(&self) -> &[Point] {
+        &self.points
+    }
+
     /// A point that satisfies the system with room to spare, near `point`,
     /// the same every time.
     ///
-    /// The answer is a function of the system, the point and the clearance
-    /// and of nothing else — not of the samples this region has handed out,
+    /// The answer is a function of this region, the point and the clearance
+    /// and of nothing else — not of the designs this region has handed out,
     /// not of anything the caller has seen elsewhere. That is what an
     /// optimizer being repaired needs: a landing that depends on other points
     /// steers the optimizer toward them, and this used to take *anchors* for
@@ -613,10 +608,11 @@ impl FeasibleRegion {
     /// solve where a constraint that bites has no derivative (`floor`,
     /// `ceil`, `sgn`, `%`, a computed subscript) — so a step over a wall is
     /// put back where it stepped from rather than slid along the wall to
-    /// wherever one coordinate could reach. A constraint flat where the
-    /// point stands, or with a jump in it, is walked in from a reference
-    /// point found under a fixed seed and sampled around under another, so a
-    /// region that can be sampled is landed near. Microseconds at fifty
+    /// wherever one coordinate could reach. A constraint with a jump in it
+    /// is sampled around under a fixed seed, and one flat where the point
+    /// stands is walked in from a reference point a local solve found from
+    /// the box centre — a function of the system alone — so a region that
+    /// can be sampled is landed near. Microseconds at fifty
     /// variables in a release build where the gradients apply; the
     /// derivative-free fallbacks are milliseconds to tenths of a second.
     ///
@@ -645,127 +641,82 @@ impl FeasibleRegion {
     /// If `point` does not have one entry per variable, or `clearance` is
     /// negative or not finite. That is a caller mixing up systems, not a
     /// verdict about the point.
-    pub fn repair(&self, point: &[f64], clearance: f64) -> std::result::Result<Point, RepairError> {
-        crate::repair::repair(&self.system, point, clearance)
+    pub fn repair(&self, point: &[f64], clearance: f64) -> Result<Point, RepairError> {
+        crate::repair::repair(&self.system, &self.reference, point, clearance)
     }
 
-    /// Up to `count` samples, waiting for them.
+    /// A space-filling design of `count` feasible points, spread away from
+    /// `existing` and from each other.
     ///
-    /// **One column per sample, one row per schema variable** — the shape
-    /// [`CompiledExpression::eval`](crate::CompiledExpression::eval) takes, so a
-    /// batch goes straight back in with no transpose.
+    /// **One column per point, one row per variable**, in `existing` and in
+    /// the result — the shape
+    /// [`CompiledExpression::eval`](crate::CompiledExpression::eval) takes, so
+    /// a design goes straight back in with no transpose. `existing` is what
+    /// the caller already has in its design: not judged, not returned, only
+    /// spread away from. An optimizer opening on the box centre repairs it,
+    /// hands it in here, and concatenates:
     ///
-    /// Fewer than `count` means the search is exhausted and no amount of waiting
-    /// will produce more. That is a real outcome, not an error: a region can
-    /// yield forty points and then nothing, ever, and blocking forever on the
-    /// forty-first is the hang this returns short to avoid.
+    /// ```no_run
+    /// # use sojourn::{ConstraintSystem, InputVariable};
+    /// # fn example() -> anyhow::Result<()> {
+    /// # let system = ConstraintSystem::new(vec![InputVariable::new("x", -1.0, 1.0)], ["x > 0"])?;
+    /// let region = sojourn::solve(&system)?;
+    /// let centre = region.repair(&[0.0], 1e-12)?;
+    /// let existing = faer::Mat::from_fn(1, 1, |row, _| centre[row]);
+    /// let design = region.sample(existing.as_ref(), 9, 42)?;
+    /// // `centre` and the nine columns of `design` are the opening ten.
+    /// # let _ = design;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
-    /// Blocking rather than `async`, for now. The producer is a thread and the
-    /// channel is `std::sync::mpsc`, so waiting here is a real park rather than
-    /// a spin; making this `async` honestly means an async-aware channel, which
-    /// is a change to the worker and not to this signature. Use
-    /// [`try_take`](Self::try_take) from a context that must not block.
+    /// Farthest-first over a pool of candidates: each point chosen is the
+    /// candidate whose nearest neighbour among `existing` and the points
+    /// chosen so far is farthest, in Euclidean distance over box-normalised
+    /// coordinates — the metric [`repair`](Self::repair) lands by. The pool
+    /// is the region's own points, a round of uniform proposals, and
+    /// hit-and-run from all of that, under streams derived from `seed`; so
+    /// the design is a function of this region, `existing`, `count` and
+    /// `seed`, and the same call gives the same matrix. Not a Latin
+    /// hypercube: a design of fewer points than variables — the usual case
+    /// — has no useful stratification, and "far from what I have" is the
+    /// whole requirement. Cost is `O(count² · dimensions)` in the selection
+    /// plus the walk, which is a burn-in per call: milliseconds at twenty
+    /// variables, seconds at two hundred.
+    ///
+    /// # Errors
+    /// [`SampleError::Degenerate`] when the region has fewer than `count`
+    /// distinct points to give: it is a single point, or near enough to one
+    /// that the walk cannot leave it. The error carries what was found.
     ///
     /// # Panics
-    /// With the worker's panic, if it panicked: a bug in the engine is raised
-    /// here, on the caller's thread, rather than reported as an end.
-    pub fn take(&mut self, count: usize) -> Mat<f64> {
-        while self.buffer.len() < count && !self.exhausted {
-            match self.batches.recv() {
-                Ok(batch) => self.buffer.extend(batch),
-                Err(_) => self.exhausted = self.worker_finished(),
-            }
-        }
-        self.drain(count)
-    }
-
-    /// Up to `count` samples from what is already buffered. Never waits.
-    ///
-    /// Named `try_take` and not `poll`: `poll` is the async primitive, and a
-    /// method by that name on a type callers `await` around would read as one.
-    ///
-    /// # Panics
-    /// As [`take`](Self::take).
-    pub fn try_take(&mut self, count: usize) -> Mat<f64> {
-        while self.buffer.len() < count {
-            match self.batches.try_recv() {
-                Ok(batch) => self.buffer.extend(batch),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.exhausted = self.worker_finished();
-                    break;
-                }
-            }
-        }
-        self.drain(count)
-    }
-
-    /// Joins the worker once its channel has closed: `true` when it ended, a
-    /// resumed panic when it panicked. Idempotent, since the handle is taken.
-    fn worker_finished(&mut self) -> bool {
-        if let Some(handle) = self.worker.take()
-            && let Err(payload) = handle.join()
-        {
-            std::panic::resume_unwind(payload);
-        }
-        true
-    }
-
-    /// How many samples can be had right now without waiting.
-    #[must_use]
-    pub fn available(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Whether the search has finished. No further sample will ever arrive.
-    #[must_use]
-    pub const fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-
-    /// Stop producing.
-    ///
-    /// [`Drop`] does this too; calling it early is for a caller who has enough
-    /// and wants the worker's CPU back before the handle goes out of scope.
-    pub fn close(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-
-    /// Takes `count` from the buffer as a column-per-sample matrix.
-    fn drain(&mut self, count: usize) -> Mat<f64> {
-        let taken = count.min(self.buffer.len());
+    /// If `existing` has columns but not one row per variable. That is a
+    /// caller mixing up systems, not a verdict about the points. A matrix
+    /// with no columns — `Mat::zeros(0, 0)` will do — is nothing to spread
+    /// from.
+    pub fn sample(
+        &self,
+        existing: MatRef<'_, f64>,
+        count: usize,
+        seed: u64,
+    ) -> Result<Mat<f64>, SampleError> {
         let rows = self.system.variables.len();
-        // `from_fn` visits in the matrix's own order, so the points come out of
-        // the buffer by index rather than by draining as it goes.
-        let samples = Mat::from_fn(rows, taken, |row, column| self.buffer[column][row]);
-        self.buffer.drain(..taken);
-        samples
-    }
-
-    #[must_use]
-    pub const fn status(&self) -> Status {
-        if self.exhausted {
-            Status::Exhausted
-        } else {
-            Status::Filling
+        assert!(
+            existing.ncols() == 0 || existing.nrows() == rows,
+            "a design has one row per variable of the system it is sampled from, not {}",
+            existing.nrows()
+        );
+        let anchors: Vec<Point> = (0..existing.ncols())
+            .map(|column| (0..rows).map(|row| existing[(row, column)]).collect())
+            .collect();
+        let chosen = cvg::design(&self.system, &self.points, &anchors, count, seed);
+        let found = Mat::from_fn(rows, chosen.len(), |row, column| chosen[column][row]);
+        if chosen.len() < count {
+            return Err(SampleError::Degenerate {
+                found,
+                wanted: count,
+            });
         }
-    }
-}
-
-impl Drop for FeasibleRegion {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-
-        // Draining is not tidiness, it is the difference between joining and
-        // deadlocking. `drop` runs before the fields do, so the receiver is
-        // still alive here — and a worker parked on a full channel stays parked
-        // until somebody reads. Emptying it lets that last `send` return, at
-        // which point the worker sees the stop flag and exits, the sender drops,
-        // and `recv` finally errors out of this loop.
-        while self.batches.recv().is_ok() {}
-
-        if let Some(handle) = self.worker.take() {
-            drop(handle.join());
-        }
+        Ok(found)
     }
 }

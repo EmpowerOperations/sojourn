@@ -1,9 +1,10 @@
 //! What the search has in hand, and what it cost to get.
 //!
-//! The pool's state is a *value*, not a field. Every step of the worker takes
-//! a [`Progress`], adds what it found, and hands it back; nothing changes
-//! behind a caller's back and there is nothing to lock. What the pool does
-//! next — which route delivers, whether to escalate — is read off the value.
+//! The opening's state is a *value*, not a field. Every step of the opening
+//! takes a [`Progress`], adds what it found, and hands it back; nothing
+//! changes behind a caller's back and there is nothing to lock. What the
+//! opening does next — whether to escalate — is read off the value, and what
+//! it ends with is what the region holds.
 
 use std::collections::VecDeque;
 
@@ -11,18 +12,18 @@ use crate::Point;
 
 /// How many of the points in hand are kept.
 ///
-/// What reads them: the first batch delivered, which takes the front, and the
-/// walker, which starts its chains from a random pick across them, once. So
-/// the history has one job, to be a fair sample of where the region has been
-/// seen, and a thousand recent points do that as well as a million. Unbounded,
-/// a caller drawing a million samples at two hundred variables would be
-/// holding 1.6 GB nobody reads.
+/// What reads them: the region, which holds them, and a design's walker,
+/// which starts its chains from a pick across them. So the history has one
+/// job, to be a fair sample of where the region has been seen, and a thousand
+/// recent points do that as well as a million. Unbounded, a brute-force
+/// batch at two hundred variables could leave a region holding far more than
+/// anything reads.
 pub(crate) const RECENT_POINTS: usize = 1_024;
 
 /// One round of uniform proposals: what landed and what it cost.
 ///
-/// Returned by every rung that proposes candidates at random — the probe, the
-/// delivery batches, brute force — and absorbed into a [`Progress`]. The
+/// Returned by every rung that proposes candidates at random — the probe, a
+/// design's round, brute force — and absorbed into a [`Progress`]. The
 /// walker does not produce one: its output is not a trial of the region.
 #[derive(Debug, Default)]
 pub(crate) struct Trial {
@@ -34,15 +35,15 @@ pub(crate) struct Trial {
 
 /// Everything the search has in hand.
 ///
-/// A value: every method takes `self` and gives it back, so the worker's loop
+/// A value: every method takes `self` and gives it back, so the opening
 /// reads `progress = progress.absorb(trial)` and there is no other way to
 /// change it.
 #[derive(Debug, Default)]
 pub(crate) struct Progress {
     /// The most recent [`RECENT_POINTS`] feasible points in hand, from any
-    /// source, oldest at the front. What the walker starts from, and what the
-    /// first batch is drawn from. A window: once full, a point leaves the
-    /// front for every one that arrives at the back.
+    /// source, oldest at the front. What the region holds and a design's
+    /// walker starts from. A window: once full, a point leaves the front for
+    /// every one that arrives at the back.
     points: VecDeque<Point>,
     /// Uniform candidates judged so far, and how many points were kept from
     /// them. The walker's output and the solver's witness count as points,
@@ -99,6 +100,11 @@ impl Progress {
 
     pub(crate) const fn landed(&self) -> usize {
         self.landed
+    }
+
+    /// The window of recent points, oldest first, as what the region holds.
+    pub(crate) fn into_points(self) -> Vec<Point> {
+        self.points.into()
     }
 }
 

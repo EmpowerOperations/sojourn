@@ -54,8 +54,7 @@
 //! The starts are the box centre and then draws from the search's seeded rng;
 //! each runs for a number of cost evaluations fixed by the dimension. COBYLA
 //! is deterministic from a start, so the same seed finds the same point on any
-//! machine. Cancellation is honoured per evaluation, through the same flag
-//! that stops a run on landing.
+//! machine.
 //!
 //! # The same solver projects
 //!
@@ -92,7 +91,6 @@ use basin::{Cobyla, CobylaState, CostFunction, Executor, NonlinearInequalityCons
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use super::Cancellation;
 use super::classify;
 use super::interval::Interval;
 use crate::{ConstraintSystem, Point};
@@ -171,13 +169,12 @@ const LEAST_MARGIN: f64 = 1e-9;
 /// it: over the declared box that is the search's first point, from
 /// [`STARTS`] starts; over a leaf of a bisection it is a piece of the region
 /// the solve cannot wander out of, from one. The first start is the centre
-/// of `bounds`; `rng` draws the rest; `cancel` is checked between starts.
+/// of `bounds`; `rng` draws the rest.
 pub(crate) fn find_initial(
     problem: &ConstraintSystem,
     bounds: &[Interval],
     starts: usize,
     rng: &mut Xoshiro256PlusPlus,
-    cancel: &Cancellation<'_>,
 ) -> Option<Point> {
     let dimensions = problem.variables.len();
     if dimensions == 0 {
@@ -186,9 +183,6 @@ pub(crate) fn find_initial(
 
     let budget = EVALS_PER_DIMENSION * (dimensions as u64 + 1);
     for start in 0..starts {
-        if cancel.is_requested() {
-            return None;
-        }
         let from: Vec<f64> = if start == 0 {
             vec![0.5; dimensions]
         } else {
@@ -199,7 +193,6 @@ pub(crate) fn find_initial(
 
         let landing = Landing {
             problem,
-            cancel,
             cube: Cube::over(bounds),
             best: RefCell::new(None),
             stop: Rc::new(Cell::new(false)),
@@ -207,9 +200,9 @@ pub(crate) fn find_initial(
         let solver = Cobyla::new()
             .with_initial_radius(INITIAL_RADIUS)
             .with_final_radius(FINAL_RADIUS);
-        // The run stops the moment a point is judged feasible, or the search
-        // is cancelled: `stop_when` wants a `'static` closure, so the flag it
-        // reads is shared with the landing rather than borrowed from it.
+        // The run stops the moment a point is judged feasible: `stop_when`
+        // wants a `'static` closure, so the flag it reads is shared with the
+        // landing rather than borrowed from it.
         let stop = Rc::clone(&landing.stop);
         // `Infallible` is the error type, so `run` cannot fail; the `Ok` is a
         // type-level formality.
@@ -311,7 +304,6 @@ fn residuals(problem: &ConstraintSystem, point: &Point) -> Vec<f64> {
 /// The seed search as COBYLA sees it: over the unit cube, judged as it goes.
 struct Landing<'a> {
     problem: &'a ConstraintSystem,
-    cancel: &'a Cancellation<'a>,
     cube: Cube,
     /// The judged point with the lowest worst residual so far, with that
     /// residual — normally the first, since the run stops on it, but the stop
@@ -319,8 +311,8 @@ struct Landing<'a> {
     /// Interior mutability because the solver holds the problem by shared
     /// reference and the cost function is, to it, pure.
     best: RefCell<Option<(f64, Point)>>,
-    /// Raised when a point has been judged feasible or the search cancelled;
-    /// the executor's stop check reads it between iterations.
+    /// Raised when a point has been judged feasible; the executor's stop
+    /// check reads it between iterations.
     stop: Rc<Cell<bool>>,
 }
 
@@ -355,9 +347,6 @@ impl CostFunction for &Landing<'_> {
             if best.as_ref().is_none_or(|(deepest, _)| worst < *deepest) {
                 *best = Some((worst, candidate));
             }
-            self.stop.set(true);
-        }
-        if self.cancel.is_requested() {
             self.stop.set(true);
         }
         Ok(total)
@@ -566,14 +555,8 @@ mod tests {
             ],
             &["2*x1 + x2 < -3"],
         );
-        let point = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("a half-space seeds");
+        let point = find_initial(&system, &system.declared(), STARTS, &mut rng())
+            .expect("a half-space seeds");
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
     }
 
@@ -586,14 +569,8 @@ mod tests {
             ],
             &["sqr(x - 2) + sqr(y - 2) < 0.25"],
         );
-        let point = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("a disc seeds");
+        let point =
+            find_initial(&system, &system.declared(), STARTS, &mut rng()).expect("a disc seeds");
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
     }
 
@@ -610,7 +587,7 @@ mod tests {
             &["min(sqr(x - 2) + sqr(y - 2), sqr(x) + sqr(y)) < 0.25"],
         );
         let bounds = [Interval::new(1.0, 3.0), Interval::new(1.0, 3.0)];
-        let point = find_initial(&system, &bounds, 1, &mut rng(), &Cancellation::never())
+        let point = find_initial(&system, &bounds, 1, &mut rng())
             .expect("the far disc seeds from its own box");
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
         assert!(
@@ -715,14 +692,8 @@ mod tests {
             "the centre is on every wall"
         );
 
-        let point = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("the corner seeds");
+        let point = find_initial(&system, &system.declared(), STARTS, &mut rng())
+            .expect("the corner seeds");
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
     }
 
@@ -732,16 +703,7 @@ mod tests {
             vec![InputVariable::new("x", 0.0, 10.0)],
             &["x > 8", "x < 2"],
         );
-        assert!(
-            find_initial(
-                &system,
-                &system.declared(),
-                STARTS,
-                &mut rng(),
-                &Cancellation::never()
-            )
-            .is_none()
-        );
+        assert!(find_initial(&system, &system.declared(), STARTS, &mut rng()).is_none());
     }
 
     #[test]
@@ -749,14 +711,8 @@ mod tests {
         // `ln` of a negative faults; the fault is a residual the solver steps
         // away from, not an abort.
         let system = system(vec![InputVariable::new("x", -1.0, 3.0)], &["ln(x) > 0"]);
-        let point = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("the log's domain seeds");
+        let point = find_initial(&system, &system.declared(), STARTS, &mut rng())
+            .expect("the log's domain seeds");
         assert!(system.is_feasible(&point, 0.0), "{point:?}");
     }
 
@@ -769,39 +725,8 @@ mod tests {
             ],
             &["sqr(x - 2) + sqr(y - 2) < 0.25", "x + y > 3.9"],
         );
-        let first = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("seeds");
-        let second = find_initial(
-            &system,
-            &system.declared(),
-            STARTS,
-            &mut rng(),
-            &Cancellation::never(),
-        )
-        .expect("seeds");
+        let first = find_initial(&system, &system.declared(), STARTS, &mut rng()).expect("seeds");
+        let second = find_initial(&system, &system.declared(), STARTS, &mut rng()).expect("seeds");
         assert_eq!(first, second);
-    }
-
-    #[test]
-    fn a_cancelled_search_does_not_start() {
-        let system = system(vec![InputVariable::new("x", 0.0, 10.0)], &["x > 8"]);
-        let (sender, receiver) = futures_channel::oneshot::channel::<super::super::Opening>();
-        drop(receiver);
-        assert!(
-            find_initial(
-                &system,
-                &system.declared(),
-                STARTS,
-                &mut rng(),
-                &Cancellation::watching(&sender)
-            )
-            .is_none()
-        );
     }
 }

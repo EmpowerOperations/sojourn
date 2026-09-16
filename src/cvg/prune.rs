@@ -56,7 +56,6 @@
 
 use std::collections::VecDeque;
 
-use super::Cancellation;
 use super::classify;
 use super::incidence::{ConstraintId, Row};
 use super::interval::{Interval, narrow};
@@ -283,7 +282,6 @@ pub(crate) fn bisect(
     root: Node,
     budget: u32,
     contributed: &mut [bool],
-    cancel: &Cancellation<'_>,
 ) -> Pruned {
     let declared: Vec<f64> = problem
         .variables
@@ -320,11 +318,6 @@ pub(crate) fn bisect(
     let mut exhausted = false;
 
     while let Some(node) = queue.pop_front() {
-        if cancel.is_requested() {
-            exhausted = true;
-            leaves.push(settle(node));
-            continue;
-        }
         let leaf = settle(node);
         if leaf.settled.is_some() {
             leaves.push(leaf);
@@ -408,13 +401,7 @@ mod tests {
         let mut contributed = vec![false; system.constraints.len()];
         let result = match contract(system, Node::declared(system), &mut contributed) {
             Contracted::Empty { blamed } => Pruned::Empty { blamed },
-            Contracted::Live(root) => bisect(
-                system,
-                root,
-                budget,
-                &mut contributed,
-                &Cancellation::never(),
-            ),
+            Contracted::Live(root) => bisect(system, root, budget, &mut contributed),
         };
         let silent = contributed
             .iter()

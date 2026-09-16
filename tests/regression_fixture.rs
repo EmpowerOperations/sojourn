@@ -7,26 +7,35 @@
 
 mod common;
 
-use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Status, Strategy};
+use faer::Mat;
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Strategy};
+
+/// The design seed, where a fixture asks for one; the solve seed is the
+/// report's own.
+const SEED: u64 = 0x5E_ED_0F_1D;
 
 /// Artemis, 2026-09-11. `x1 == x2 + 1 +/- 0.01` over `[-32.768, 32.768]^20`:
 /// a 0.02-wide slab in a 65.5-wide box, one driven variable, the rest free.
 /// Seeds 0, 1 and 3..=9 streamed 1500 points. Seed 2 reported `Satisfied`,
-/// delivered exactly 25 points, and ended in `Status::Exhausted`.
+/// delivered exactly 25 points, and ended exhausted.
 ///
 /// The pool used to pick a route on the probe, one batch, and on seed 2 it
 /// landed enough hits to choose plain sampling for a region whose true rate
 /// is a third of the threshold. The delivery batches then came back empty
 /// three times in a row, which the fill loop read as the region running dry.
-/// A connected region with 25 known feasible points cannot run dry. There is
-/// no route now: every batch is sampled first and walked for the rest.
+/// A connected region with 25 known feasible points cannot run dry. The
+/// stream is gone; what remains of the report is that a design over the
+/// slab is sampled first and walked for the rest, under every seed.
 mod a_lucky_probe_must_not_strand_the_sampling_route {
     use super::*;
 
     const DIM: usize = 20;
     const HALF_WIDTH: f64 = 32.768;
     const SLAB: &str = "x1 == x2 + 1 +/- 0.01";
-    const WANTED: usize = 1500;
+    /// Artemis asked its stream for 1500; a design of 256 is past the 25
+    /// the report stopped at by the same margin that matters, at a sixth
+    /// of the walk.
+    const WANTED: usize = 256;
 
     fn system() -> anyhow::Result<ConstraintSystem> {
         let inputs: Vec<InputVariable> = (1..=DIM)
@@ -35,39 +44,29 @@ mod a_lucky_probe_must_not_strand_the_sampling_route {
         Ok(ConstraintSystem::new(inputs, [SLAB])?)
     }
 
-    #[pollster::test]
-    async fn seed_2_streams_the_whole_request() -> anyhow::Result<()> {
-        let mut region = ConstraintSolver::new()
-            .with_seed(2)
-            .solve(&system()?)
-            .await?;
-        let got = region.take(WANTED).ncols();
+    #[test]
+    fn seed_2_streams_the_whole_request() -> anyhow::Result<()> {
+        let region = ConstraintSolver::new().with_seed(2).solve(&system()?)?;
+        let got = region
+            .sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?
+            .ncols();
 
         assert_eq!(
-            got,
-            WANTED,
-            "seed 2 delivered {got} of {WANTED} and ended in {:?}; a connected slab \
-             with points in hand should never exhaust",
-            region.status()
+            got, WANTED,
+            "seed 2 delivered {got} of {WANTED}; a connected slab with points in hand \
+             should never run out"
         );
-        assert_eq!(region.status(), Status::Filling);
         Ok(())
     }
 
-    #[pollster::test]
-    async fn every_other_seed_streams_the_same_slab() -> anyhow::Result<()> {
+    #[test]
+    fn every_other_seed_streams_the_same_slab() -> anyhow::Result<()> {
         for seed in (0..10u64).filter(|s| *s != 2) {
-            let mut region = ConstraintSolver::new()
-                .with_seed(seed)
-                .solve(&system()?)
-                .await?;
-            let got = region.take(WANTED).ncols();
-            assert_eq!(
-                got,
-                WANTED,
-                "seed {seed} ended early in {:?}",
-                region.status()
-            );
+            let region = ConstraintSolver::new().with_seed(seed).solve(&system()?)?;
+            let got = region
+                .sample(Mat::zeros(0, 0).as_ref(), WANTED, SEED)?
+                .ncols();
+            assert_eq!(got, WANTED, "seed {seed} ended early");
         }
         Ok(())
     }
@@ -146,11 +145,10 @@ mod repair_lands_too_close_at_a_vertex {
     }
 
     /// The solved region, which is where `repair` lives.
-    async fn region() -> anyhow::Result<FeasibleRegion> {
+    fn region() -> anyhow::Result<FeasibleRegion> {
         ConstraintSolver::new()
             .with_seed(0x50_50_1E_5E_ED)
             .solve(&system()?)
-            .await
             .context("the spring should be satisfiable")
     }
 
@@ -159,9 +157,9 @@ mod repair_lands_too_close_at_a_vertex {
     /// `-1e-15`, and it did not survive the frame round trip. With a clearance
     /// it is not a fixed point any more: it comes back stepped inside, and
     /// the round trip leaves it feasible.
-    #[pollster::test]
-    async fn the_spring_vertex_is_landed_one_rounding_error_inside() -> anyhow::Result<()> {
-        let region = region().await?;
+    #[test]
+    fn the_spring_vertex_is_landed_one_rounding_error_inside() -> anyhow::Result<()> {
+        let region = region()?;
         let landed = [
             0.052_986_411_203_565_92_f64,
             0.388_738_764_466_29,
@@ -190,9 +188,9 @@ mod repair_lands_too_close_at_a_vertex {
     /// somewhere that any one-ulp move of any coordinate leaves feasible. It
     /// passed before the clearance existed, one step away from the vertex; it
     /// is here so a fix for the vertex does not lose it.
-    #[pollster::test]
-    async fn a_repaired_point_should_survive_a_one_ulp_perturbation() -> anyhow::Result<()> {
-        let region = region().await?;
+    #[test]
+    fn a_repaired_point_should_survive_a_one_ulp_perturbation() -> anyhow::Result<()> {
+        let region = region()?;
         // Just outside the vertex: a thicker wire violates the deflection
         // constraint (the first, which grows with `d^4` in the denominator)
         // while the others stay satisfied.
@@ -246,13 +244,15 @@ mod census_does_not_return_on_the_20_segment_beam {
     use super::*;
     use crate::common::stepped_beam;
 
-    #[pollster::test]
-    async fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
-        let mut region = ConstraintSolver::new()
+    #[test]
+    fn the_5_segment_beam_census_is_quick() -> anyhow::Result<()> {
+        let region = ConstraintSolver::new()
             .with_seed(0)
-            .solve(&stepped_beam(5)?)
-            .await?;
-        assert_eq!(region.take(256).ncols(), 256);
+            .solve(&stepped_beam(5)?)?;
+        assert_eq!(
+            region.sample(Mat::zeros(0, 0).as_ref(), 256, SEED)?.ncols(),
+            256
+        );
         Ok(())
     }
 
@@ -267,13 +267,15 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// the budget affords spends its 3,000,000 units in about 110 s and the
     /// walker's 256 points take another 30, for 137 s measured on 2026-09-12.
     /// A test that needs its own timeout is a test at the wrong size.
-    #[pollster::test]
-    async fn the_10_segment_beam_census_returns() -> anyhow::Result<()> {
-        let mut region = ConstraintSolver::new()
+    #[test]
+    fn the_10_segment_beam_census_returns() -> anyhow::Result<()> {
+        let region = ConstraintSolver::new()
             .with_seed(0)
-            .solve(&stepped_beam(10)?)
-            .await?;
-        assert_eq!(region.take(256).ncols(), 256);
+            .solve(&stepped_beam(10)?)?;
+        assert_eq!(
+            region.sample(Mat::zeros(0, 0).as_ref(), 256, SEED)?.ncols(),
+            256
+        );
         Ok(())
     }
 
@@ -297,9 +299,9 @@ mod census_does_not_return_on_the_20_segment_beam {
     /// first feasible point is its 24th evaluation. The points that follow are
     /// the walker's, and its burn-in at 200 dimensions on this system is about
     /// 95 s before the first one, so this test asks for the opening alone.
-    #[pollster::test]
-    async fn the_100_segment_beam_opens_by_local_solve() -> anyhow::Result<()> {
-        let verdict = without_the_solver().solve(&stepped_beam(100)?).await;
+    #[test]
+    fn the_100_segment_beam_opens_by_local_solve() -> anyhow::Result<()> {
+        let verdict = without_the_solver().solve(&stepped_beam(100)?);
         assert!(
             verdict.is_ok(),
             "the beam is not empty (b = 5, h = 100 is feasible), yet: {verdict:?}"
@@ -308,11 +310,15 @@ mod census_does_not_return_on_the_20_segment_beam {
     }
 
     /// Past where the probe reaches, the whole census: seed by local solve,
-    /// then 256 walked points — about 35 s at thirty segments.
-    #[pollster::test]
-    async fn the_30_segment_beam_census_returns_from_a_local_seed() -> anyhow::Result<()> {
-        let mut region = without_the_solver().solve(&stepped_beam(30)?).await?;
-        assert_eq!(region.take(256).ncols(), 256);
+    /// then a design of 64 walked points — about 35 s at thirty segments in
+    /// a debug build, most of it the walker's burn-in.
+    #[test]
+    fn the_30_segment_beam_census_returns_from_a_local_seed() -> anyhow::Result<()> {
+        let region = without_the_solver().solve(&stepped_beam(30)?)?;
+        assert_eq!(
+            region.sample(Mat::zeros(0, 0).as_ref(), 64, SEED)?.ncols(),
+            64
+        );
         Ok(())
     }
 }
@@ -362,11 +368,10 @@ mod repair_lands_axis_aligned_not_nearest {
         Ok(ConstraintSystem::new(variables, sources.iter().cloned())?)
     }
 
-    async fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
+    fn region(system: &ConstraintSystem) -> anyhow::Result<FeasibleRegion> {
         ConstraintSolver::new()
             .with_seed(7)
             .solve(system)
-            .await
             .context("the fixture should be satisfiable")
     }
 
@@ -409,15 +414,15 @@ mod repair_lands_axis_aligned_not_nearest {
     /// point is radial onto the circle of radius 1.5 about `(3, 3)`; the
     /// proposals sit a hundredth, three tenths, three and eight units outside
     /// it at random angles, the other 48 coordinates anywhere.
-    #[pollster::test]
-    async fn a_ball_near_miss_lands_on_the_radial_projection() -> anyhow::Result<()> {
+    #[test]
+    fn a_ball_near_miss_lands_on_the_radial_projection() -> anyhow::Result<()> {
         let system = system(
             50,
             -10.0,
             10.0,
             &["(x1 - 3)^2 + (x2 - 3)^2 < 2.25".to_owned()],
         )?;
-        let region = region(&system).await?;
+        let region = region(&system)?;
         let mut rng = SmallRng::seed_from_u64(1);
         let mut proposals = Vec::new();
         for scale in [0.01, 0.3, 3.0, 8.0] {
@@ -450,10 +455,10 @@ mod repair_lands_axis_aligned_not_nearest {
     /// `c06`: `x1 == x2 + 1 +/- 0.01` over `[-10, 10]^50`. The nearest point
     /// shifts `x1` and `x2` symmetrically onto the nearer face; the clamp
     /// alone moved `x1` by the whole gap, `√2×` farther, on every row.
-    #[pollster::test]
-    async fn a_slab_landing_moves_both_coordinates() -> anyhow::Result<()> {
+    #[test]
+    fn a_slab_landing_moves_both_coordinates() -> anyhow::Result<()> {
         let system = system(50, -10.0, 10.0, &["x1 == x2 + 1 +/- 0.01".to_owned()])?;
-        let region = region(&system).await?;
+        let region = region(&system)?;
         let mut rng = SmallRng::seed_from_u64(2);
         let mut proposals = Vec::new();
         for gap in [0.02, 0.1, 1.0, 5.0, -0.02, -1.0, -5.0] {
@@ -491,15 +496,15 @@ mod repair_lands_axis_aligned_not_nearest {
     /// `587199c` already — clamping cannot land on a twenty-variable
     /// equality, so the projection always ran — and is here so the contract
     /// is pinned on a shape where the clamp never had a say.
-    #[pollster::test]
-    async fn a_sphere_shell_landing_is_the_radial_projection() -> anyhow::Result<()> {
+    #[test]
+    fn a_sphere_shell_landing_is_the_radial_projection() -> anyhow::Result<()> {
         let system = system(
             20,
             0.0,
             1.0,
             &["sum(1, 20, i -> (var[i])^2) == 1 +/- 0.0001".to_owned()],
         )?;
-        let region = region(&system).await?;
+        let region = region(&system)?;
         let mut rng = SmallRng::seed_from_u64(3);
         let mut proposals: Vec<Vec<f64>> = (0..5)
             .map(|_| (0..20).map(|_| rng.random_range(0.0..1.0)).collect())
@@ -634,12 +639,11 @@ mod repair_strands_on_a_product_constraint {
         point.iter().map(|&x| x.clamp(1.0, 10.0 - 1e-9)).collect()
     }
 
-    async fn is_repaired(n: usize, point: &[f64]) -> anyhow::Result<()> {
+    fn is_repaired(n: usize, point: &[f64]) -> anyhow::Result<()> {
         let system = keane(n)?;
         let region = ConstraintSolver::new()
             .with_seed(0x50_50_1E_5E_ED)
             .solve(&system)
-            .await
             .context("Keane's region is nearly the whole box")?;
         let lifted = lifted(point);
         assert!(
@@ -667,8 +671,8 @@ mod repair_strands_on_a_product_constraint {
         Ok(())
     }
 
-    #[pollster::test]
-    async fn the_50_variable_proposal_is_repaired() -> anyhow::Result<()> {
-        is_repaired(50, &POINT_50).await
+    #[test]
+    fn the_50_variable_proposal_is_repaired() -> anyhow::Result<()> {
+        is_repaired(50, &POINT_50)
     }
 }

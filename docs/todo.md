@@ -363,12 +363,10 @@ thing to read, and is the first work item rather than an admission.
       Watch the distribution: repairing a *seed* is free, repairing an *emitted*
       point skews the marginals, and `cvg_benchmarks` is what would catch it.
 
-- [ ] **`take` should be `async`.** It blocks today, because the producer is a
-      thread and the channel is `std::sync::mpsc` — a real park, not a spin, but
-      not awaitable. Doing it honestly means an async-aware channel, which is a
-      change to the worker rather than to this signature.
-- [ ] **`impl Stream for FeasibleSamples`**, if and only if a call site shows it
-      reading better than the inherent methods.
+- [x] ~~**`take` should be `async`.**~~ Moot: `take`, the stream and the
+      worker are gone (2026-09-16, below). `solve` is synchronous and
+      `sample` is a design, not a stream.
+- [x] ~~**`impl Stream for FeasibleSamples`**~~, likewise.
 - [ ] **A typed `SolveError`.** `solve` still returns `anyhow::Result`, which is
       right for a binary and loose for a library.
 - [ ] **A pipeline to hang these on.** Causalization splits one problem in two
@@ -2786,6 +2784,53 @@ wedge like the spring's. Repair latency on Artemis's shapes is now tens of micro
 few milliseconds. The async question is next: `repair` is bounded by counts and belongs
 synchronous; `solve`'s opening can still be 375 ms at 200 variables and brute force is
 unbounded, so its shape is the open one.
+
+**2026-09-16: `solve` is synchronous, the stream is gone, `sample` is a design.** The async
+`solve`, the worker thread, the channel, `take`/`try_take`/`available`/`close`/`Status` and
+the `Drop` that joined the worker all existed for Z3's hangs and for a batch consumer.
+Z3 is gone, and the one consumer (Artemis) called `take` once, for an initial design of a
+handful of points at a dimension usually larger than the count. So:
+
+- `ConstraintSolver::solve` is a plain fn that runs the opening on the calling thread and
+  returns `FeasibleRegion { system, points, reference }` — an immutable value. Its budgets
+  are all counts, and that is the shape of "this may take a while": a search that spends
+  them without a point is `NotFound`, never a call that does not return. Brute force keeps
+  its `std::thread::scope` fan-out as a private detail — fan out, work, join — and nothing
+  runs after any call returns. `Cancellation` and every `cancel`/`stop` parameter went
+  with the future they watched. `futures-channel` is gone; `pollster` remains only under
+  the `gpu` feature for wgpu's adapter requests.
+- `FeasibleRegion::sample(existing: MatRef, count, seed) -> Result<Mat, SampleError>` is a
+  space-filling design: a pool of candidates (the region's own points, a round of uniform
+  proposals, hit-and-run for the rest, under streams derived from `seed`), then
+  farthest-first selection in box-normalised Euclidean distance, seeded by `existing` —
+  the caller's own points, spread away from and never returned. Artemis repairs the box
+  centre, hands it in, and concatenates. A function of (region, existing, count, seed).
+  `Degenerate { found, wanted }` when the region runs out of distinct points: a
+  point-sized region, or a fully driven one (`abs(x1) == 1` is two points, and a design
+  of two hundred over it is two). Not a Latin hypercube: at `count < dims` an LHS
+  guarantees nothing, and "far from each other and from what I have" is the whole
+  requirement. The pool is `2·count + 128`: the walk is the cost, and a small design
+  needs a floor of candidates to be a choice at all.
+- `repair`'s reference stage reads the region's `reference` instead of running
+  `find_initial` per call: the opening's local solve from the box centre where it ran one,
+  else one run in `solve` under a fixed seed, else the witness. The centre matters: a
+  random probe hit of Keane's region can stand where the product is already nearly flat,
+  and a chord from there strands the projection (1.3 s against 0.8 s from the centre;
+  the rest of that 0.8 s is COBYLA from the point spending its budget before the
+  reference stage runs at all — the next latency to look at).
+- `tests/cvg_benchmarks.rs` — the stream's uniformity, autocorrelation and radial oracles —
+  is retired: a design is deliberately not a uniform sample. Its two lessons (lag
+  `CHAIN_COUNT`, pooled effective sample size) are kept in `AGENTS.md`.
+
+Measured in release: disc `sample(10)` 1.5 ms; slab-20 `sample(10)` 28 ms, `sample(256)`
+48 ms; Keane-50 `sample(10)` 8 ms; beam-100 (200 variables) `sample(10)` 21 s — the
+walker's burn-in, `max(2000, 16·d)` steps on eight chains, twice. That burn-in is the one
+cost on the design path that is not milliseconds, and it is paid per call, which is the
+price of a design that is a pure function of its seed. The default `solve` on beam-100 is
+35 s, all of it the coverage bisection at 200 variables (`DEFAULT_PRUNE_BUDGET` is a
+count of contractions, and a contraction at 200 variables walks every constraint's tree
+per coordinate); without `Strategy::Prune` it is 21 ms. Both are pre-existing, both are
+recorded here as the next two performance items rather than fixed.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

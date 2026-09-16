@@ -27,7 +27,7 @@ Read these before changing anything, in this order:
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
 | `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the validated system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
-| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the local solve (`local.rs`, COBYLA from `basin`), branch-and-prune (`prune.rs`), the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
+| `src/cvg/` | the search engine — private. Strategies, the ladder, the opening and the design, the local solve (`local.rs`, COBYLA from `basin`), branch-and-prune (`prune.rs`), the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
 | `docs/sojourn/` | notes and statement of intent from the original CVG project, whose code became `crate::cvg` | reference |
@@ -55,8 +55,8 @@ just brute          time-to-first-hit rungs + checks/s, release, machine otherwi
 
 - Use **nextest**, not `cargo test`: the AST is recursive and a stack overflow in one
   test must not take the binary with it. `.config/nextest.toml` sets a 60 s
-  slow-timeout, overridden to 300 s for `cvg_benchmarks` — every problem there runs
-  ten seeds, so `top_corner_200d` legitimately takes ~150 s and the equality twin ~350 s.
+  slow-timeout; the walker's burn-in on a 60-variable beam legitimately nears it in
+  a debug build.
 - There is no C or C++ toolchain in the build: the crate is pure Rust, and the one
   C++ dependency it had (Z3, built from source) was removed in favour of interval
   branch-and-prune. Do not reintroduce one without a new fact.
@@ -80,18 +80,20 @@ count for COBYLA, a contraction count for branch-and-prune, a proposal count
 for brute force), and otherwise a wall-clock ceiling set so conservatively that
 reaching it means a bug, not a slow case — the five-sigma use. Reaching it must
 fail loudly (an error, a `tracing::error!` and abandonment, a `panic!`) and never
-wait. The sampling worker is the model: a search that dies takes its panic to
-the caller's thread by `resume_unwind`, in `solve` and in `take`, rather than
-leaving a channel nobody will ever send on. A budget is a count and decides the
-answer deterministically; a ceiling is a watchdog and only decides that
-something is broken. Keep them distinct, and never let a ceiling become the
-thing that decides a result. (The last foreign call with a ceiling was Z3's
-leash; it went with Z3, and every loop that remains is a count.)
+wait. A budget is a count and decides the answer deterministically; a ceiling
+is a watchdog and only decides that something is broken. Keep them distinct,
+and never let a ceiling become the thing that decides a result. (The last
+foreign call with a ceiling was Z3's leash; it went with Z3, and every loop
+that remains is a count.) Nothing runs after a call returns: `solve` runs on
+the calling thread, brute force fans out over the cores and joins them before
+it returns, and there is no worker, no channel and no future — the async
+`solve` and the batch stream that justified them went on 2026-09-16, when the
+last consumer of a stream turned out to want one design.
 The full inventory of the engine's loops and the hedges considered is in
 `docs/todo.md` under "Hanging is the worst failure mode".
 
 **Call functions by their module.** Import modules and types; call functions
-qualified — `eval::bind(..)`, `cvg::serve(..)`, `ast::to_index(..)` — rather
+qualified — `eval::bind(..)`, `cvg::open(..)`, `ast::to_index(..)` — rather
 than importing the bare name. A four-letter verb says nothing about which part
 of the system is speaking, and the qualifier is what makes a call site readable
 to someone who has not memorised the tree. Re-exports in `lib.rs` are the one
@@ -157,15 +159,19 @@ budget (`with_proposal_budget`, default a billion), and an empty search is
 too algebraic for an enclosure ends there, and `docs/todo.md` records the
 classes. What brute force finds is a function of the seed and the budget, never
 of the thread count — keep it that way (the batch is the unit of randomness).
-`Strategy` is a test-only configuration, not a user-facing one; the fairness
-oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool
-tests run with `common::PROPOSAL_BUDGET`, a million under debug, because the
-default takes minutes on an unoptimised tape. The pool's state is a value:
-`cvg::progress::Progress`, threaded through `serve` → `open` → `keep_filling`
-and folded with `absorb`/`extend`, never a field. `ConstraintSystem` is
-immutable and compiled once; `Ladder` holds only the strategies' streams and
-knobs. Keep it that way — the only `&mut` in the search is an RNG or a
-walker's chain.
+`Strategy` is a test-only configuration, not a user-facing one. Pool tests
+run with `common::PROPOSAL_BUDGET`, a million under debug, because the
+default takes minutes on an unoptimised tape. The opening's state is a value:
+`cvg::progress::Progress`, threaded through `open` and folded with
+`absorb`/`extend`, never a field; what it ends with is the region's `points`.
+`ConstraintSystem` is immutable and compiled once; `Ladder` holds only the
+strategies' streams and knobs and lives for one opening. Keep it that way —
+the only `&mut` in the search is an RNG or a walker's chain. A design
+(`cvg::design`, `FeasibleRegion::sample`) is a pure function of the region,
+the caller's existing points, the count and a seed: a fresh sampler and
+walker per call, a pool of candidates, farthest-first selection in
+box-normalised Euclidean distance. Not a Latin hypercube — a design of fewer
+points than variables has no useful stratification.
 
 **An equality is read before it is searched.** `cvg::classify` reads
 `a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
@@ -279,12 +285,13 @@ the plan, `interval::slice` for the narrowing question, `prune::contract` and
 `prune::bisect` for the box. There is no wrapper type around the system.
 
 **`FeasibleRegion` is the solved system.** `ConstraintSolver::solve` takes the
-system by reference and clones it twice, once for the worker thread and once
-for the region, so the region can answer for the system after the search:
-`system()`, `take` for samples, and `repair` — which lives here rather than
-on the system because a region that could not be solved has nothing to repair
-toward. `repair` is a function of the system, the point and the clearance
-and of nothing else — it consults no census, because a landing that depends
+system by reference and clones it once for the region, so the region can
+answer for the system after the search: `system()`, `witness()` and
+`points()` for what the opening found, `sample` for a design, and `repair` —
+which lives here rather than on the system because a region that could not
+be solved has nothing to repair toward. `repair` is a function of the region,
+the point and the clearance and of nothing else — it consults no census,
+because a landing that depends
 on other points steers the optimizer being repaired toward them (the
 *anchors* it used to take did exactly that, measured as a 28° bias on a
 disc). "Near" is Euclidean over box-normalised coordinates, not taxicab: it
@@ -294,8 +301,8 @@ tape's reverse sweep (`eval/differentiate.rs`); COBYLA (`local::nearest`) only
 where a biting constraint has no derivative or Newton did not converge —
 unless the clamp's landing is separable (bounds), where the axis projection
 already is the Euclidean one. A constraint flat where the point stands is
-walked in from a reference found by `local::find_initial` under a fixed seed,
-then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
+walked in from the region's reference — a local solve from the box centre,
+run once by `solve`, a function of the system alone — then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
 sampled around, a box doubling and shrinking under another fixed seed — the
 backstop for "if it can be sampled it is landed near", last because it cannot
 localise a thin or high-dimensional region. **Gradients are reverse-mode over the virtual tape**, one
@@ -322,27 +329,16 @@ every constraint carrying an **unresolved `var[i]`**, because it reads a column
 chosen by the point and no symbol list names it. Skipping either accepts a point
 the full check would reject.
 
-**Every benchmark runs on ten seeds and requires all ten.** One seed cannot tell
-a real change from a lucky draw: `top_corner_200d` was failing on about half of
-all seeds and passing on the committed one, so a green tick was reporting the
-seed rather than the sampler. `cvg_benchmarks::run` drives `REPLICATES`
-independent trials through `catch_unwind` and names every seed that failed. It
-costs a tenfold runtime, which is why that binary has its own timeout in
-`.config/nextest.toml`.
-
-**A KS test needs the effective sample size, and that is pooled across
-coordinates.** The walker emits round-robin across its chains, so successive
-points come from *different* chains and the autocorrelation sits at lag
-`CHAIN_COUNT` rather than lag one. Two things follow, and both were learned the
-hard way. Sokal's window closes at `WINDOW_FACTOR * tau`, which with `tau` near
-one is lag five — **before** lag eight, so `autocorrelation_time` forces the
-window past the interleave before that rule may close it. And per coordinate the
-signal sits at its own noise floor, so estimating from one column is a coin
-flip; the interleave belongs to the *emission*, shared by every column, so
-`rho_k` is averaged over all of them. Getting this wrong reported `tau = 1.33`
-where the truth is 1.85, made the threshold 36% too tight, and read as the
-sampler being broken. Any new statistic compared here needs the same treatment —
-never `values.len()`.
+**A statistical oracle runs on ten seeds and requires all ten.** One seed
+cannot tell a real change from a lucky draw: the uniformity benchmarks the
+stream used to have (`tests/cvg_benchmarks.rs`, retired with the stream on
+2026-09-16 — a space-filling design is deliberately not uniform) were failing
+on about half of all seeds and passing on the committed one, so a green tick
+was reporting the seed rather than the sampler. Two lessons from them still
+apply to any statistic compared over walker output: the walker emits
+round-robin across its chains, so autocorrelation sits at lag `CHAIN_COUNT`,
+not lag one, and a KS test needs the effective sample size pooled across
+coordinates — never `values.len()`. `docs/todo.md` has the numbers.
 
 **Another language is never built with a string builder.** WGSL goes through
 askama templates under `templates/`, compiled at build time against views in

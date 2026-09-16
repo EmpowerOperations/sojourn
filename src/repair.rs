@@ -74,12 +74,12 @@
 //! **Reference** — nothing feasible seen at all: a constraint flat where the
 //! point stands (Keane's `0.75 − ∏xᵢ` with a coordinate at `1e-11` is `0.75`
 //! to fifty digits every way), which no slice, model or box around the point
-//! reads. A feasible point to walk *in* from, from [`local::find_initial`]
-//! under a fixed seed — a function of the system, not of what the region
-//! sampled — a chord bisected from it to the point, and the projection from
-//! that landing, where the constraint is well-scaled again; so the reference
-//! decides only which basin, never where in it. `Stranded` means this found
-//! nothing either.
+//! reads. A feasible point to walk *in* from — the region's reference, a
+//! local solve from the box centre that `solve` ran once, a function of the
+//! system and not of anything sampled since — a chord bisected from it to
+//! the point, and the projection from that landing, where the constraint is
+//! well-scaled again; so the reference decides only which basin, never where
+//! in it. `Stranded` means this found nothing either.
 //!
 //! A boundary landing — a chord's, or a Newton one — is stepped inside by
 //! [`stepped_inside`] / [`off_the_boundary`]: along the inward direction in
@@ -150,7 +150,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 
 use crate::cvg::incidence::{ConstraintId, Row};
-use crate::cvg::{Cancellation, classify, interval, local, newton};
+use crate::cvg::{classify, interval, local, newton, normalised_distance as distance};
 use crate::{ConstraintSystem, Point};
 
 /// How many rounds of clamping a point gets before the projection starts
@@ -189,19 +189,12 @@ const COBYLA_CHEAP: usize = 8;
 /// parameter in `[0, 1]` can still be halved.
 const CHORD_BITS: usize = 60;
 
-/// The seed the reference point's local solve draws its extra starts from.
+/// The seed the sampling box draws from.
 ///
-/// A constant, and deliberately so: `repair` is a function of the system,
-/// the point and the clearance, and the reference it walks from on a flat
-/// constraint has to be a function of the system alone — the same reference
-/// on every call, on every machine — or a landing would depend on what the
-/// region happened to have sampled, which is the bias the anchors had and the
-/// reason they are gone. The first start is the box centre and needs no
-/// draw; this seeds the ones after it.
-const REFERENCE_SEED: u64 = 0x5E_ED_0F_1D;
-
-/// The seed the sampling box draws from: a constant, for the same reason as
-/// [`REFERENCE_SEED`].
+/// A constant, and deliberately so: `repair` is a function of the region,
+/// the point and the clearance — the same landing on every call, on every
+/// machine — and a landing that depended on what had been sampled since
+/// would carry the bias the anchors had and the reason they are gone.
 const SAMPLING_SEED: u64 = 0xB0_0B_0F_5A;
 
 /// Rounds the sampling box gets: each doubles the box when it held nothing
@@ -247,11 +240,14 @@ pub enum RepairError {
 }
 
 /// A point that satisfies `system` with `clearance` to spare, near `point`,
-/// the same every time. The contract — clearance, the guarantees, the errors
-/// and the panics — is documented on
-/// [`FeasibleRegion::repair`](crate::FeasibleRegion::repair), the only caller.
+/// the same every time; `reference` is a feasible point of the system, as
+/// far inside as the region has, that the flat case walks in from. The
+/// contract — clearance, the guarantees, the errors and the panics — is
+/// documented on [`FeasibleRegion::repair`](crate::FeasibleRegion::repair),
+/// the only caller.
 pub(crate) fn repair(
     system: &ConstraintSystem,
+    reference: &[f64],
     point: &[f64],
     clearance: f64,
 ) -> Result<Point, RepairError> {
@@ -273,11 +269,7 @@ pub(crate) fn repair(
         return Ok(current);
     }
 
-    let widths: Vec<f64> = system
-        .variables()
-        .iter()
-        .map(|variable| variable.upper_bound - variable.lower_bound)
-        .collect();
+    let widths = crate::cvg::widths(system);
 
     // Every landing any stage produced, labelled by the stage; the nearest
     // with the clearance is the answer, the nearest feasible one without it
@@ -392,41 +384,31 @@ pub(crate) fn repair(
 
     // Nothing feasible seen at all: a constraint flat where the point
     // stands, which no slice, no linear model and no box around the point
-    // can read. Walk in from a reference point instead — see the module doc.
+    // can read. Walk in from the reference instead — see the module doc.
     if landings.is_empty() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(REFERENCE_SEED);
-        let reference = local::find_initial(
-            system,
-            &system.declared(),
-            local::STARTS,
-            &mut rng,
-            &Cancellation::never(),
+        tracing::debug!(stage = "reference");
+        let chord = along_chord(system, reference, point);
+        landings.extend(
+            stepped_off(
+                system,
+                &widths,
+                local::nearest(system, &chord, point, clearance),
+                point,
+                clearance,
+            )
+            .into_iter()
+            .map(|landing| ("reference", landing)),
         );
-        tracing::debug!(stage = "reference", found = reference.is_some());
-        if let Some(reference) = reference {
-            let chord = along_chord(system, &reference, point);
-            landings.extend(
-                stepped_off(
-                    system,
-                    &widths,
-                    local::nearest(system, &chord, point, clearance),
-                    point,
-                    clearance,
-                )
-                .into_iter()
-                .map(|landing| ("reference", landing)),
-            );
-            // The projection could not leave the chord's landing either — flat
-            // again — so the landing itself, stepped off its walls, stands.
-            if !landings.iter().any(|(_, landing)| landing.is_clear()) {
-                landings.push((
-                    "reference",
-                    match clamped(system, &widths, chord.clone(), clearance) {
-                        Ok(clear) => Landing::Clear(clear),
-                        Err(_) => Landing::Feasible(chord),
-                    },
-                ));
-            }
+        // The projection could not leave the chord's landing either — flat
+        // again — so the landing itself, stepped off its walls, stands.
+        if !landings.iter().any(|(_, landing)| landing.is_clear()) {
+            landings.push((
+                "reference",
+                match clamped(system, &widths, chord.clone(), clearance) {
+                    Ok(clear) => Landing::Clear(clear),
+                    Err(_) => Landing::Feasible(chord),
+                },
+            ));
         }
     }
 
@@ -500,25 +482,6 @@ fn nearer(slot: &mut Option<(f64, Point)>, at: f64, candidate: Point) {
     if slot.as_ref().is_none_or(|(nearest, _)| at < *nearest) {
         *slot = Some((at, candidate));
     }
-}
-
-/// Euclidean distance over box-normalised coordinates: the metric the
-/// consumer measures in, see the module doc. A zero-width coordinate
-/// contributes nothing.
-fn distance(widths: &[f64], a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b)
-        .zip(widths)
-        .map(|((x, y), width)| {
-            if *width > 0.0 {
-                let scaled = (x - y) / width;
-                scaled * scaled
-            } else {
-                0.0
-            }
-        })
-        .sum::<f64>()
-        .sqrt()
 }
 
 /// The landings a derivative-free projection yields, once its points have

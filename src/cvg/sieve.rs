@@ -139,8 +139,8 @@ fn connect() -> Option<Gpu> {
     }))
     .map_err(|error| tracing::info!(%error, adapter = %info.name, "GPU device request failed"))
     .ok()?;
-    // wgpu's default handler for an error nobody caught is a panic on the
-    // worker thread. A lost device should read as "the sieve stopped", which
+    // wgpu's default handler for an error nobody caught is a panic. A lost
+    // device should read as "the sieve stopped", which
     // the timeout on every wait already turns it into.
     device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
         tracing::error!(%error, "uncaptured GPU error");
@@ -351,7 +351,7 @@ impl Sieve {
         let source = shader(problem);
 
         // A shader that does not compile must come back as `None`, not as a
-        // panic on the worker thread. The error scope catches validation
+        // panic. The error scope catches validation
         // failures from both the module and the pipelines built on it.
         let _turn = gpu
             .turn

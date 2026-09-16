@@ -46,7 +46,7 @@ mod common;
 use faer::Mat;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, SystemError};
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, SampleError, SystemError};
 
 /// Pinned so a failure is reproducible, and the same value the other cvg suites
 /// use so a point seen in one is the point seen in another.
@@ -115,7 +115,7 @@ struct Occupancy<'a> {
 /// deliberate: these cases are expected to fail, and "delivered 1 of 500" and
 /// "covered 0% of x2" are different diagnoses that a fail-fast assertion would
 /// hide behind each other.
-async fn assert_explores(case: Case<'_>) {
+fn assert_explores(case: Case<'_>) {
     let inputs: Vec<InputVariable> = case
         .variables
         .iter()
@@ -124,24 +124,27 @@ async fn assert_explores(case: Case<'_>) {
     let system = ConstraintSystem::new(inputs.clone(), case.sources.iter().copied())
         .expect("a fixture's constraints should bind to its own box");
 
-    let mut pool = ConstraintSolver::new()
+    let pool = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system)
-        .await
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", case.what));
 
-    let points = columns(&pool.take(case.wanted));
+    let design = match pool.sample(Mat::zeros(0, 0).as_ref(), case.wanted, SEED) {
+        Ok(design) => design,
+        Err(SampleError::Degenerate { found, .. }) => found,
+    };
+    let points = columns(&design);
     let mut complaints: Vec<String> = Vec::new();
 
-    // 1. The count. `take` returning short means the search is exhausted, which
-    //    is a real outcome — and for a fully determined system it is the *only*
-    //    outcome, which is one of the things these cases are here to show.
+    // 1. The count. A design short of what was asked means the region ran
+    //    out of distinct points, which is a real outcome — and for a fully
+    //    determined system it is the *only* outcome, which is one of the
+    //    things these cases are here to show.
     if points.len() != case.wanted {
         complaints.push(format!(
-            "delivered {} of {} requested (exhausted: {})",
+            "delivered {} of {} requested (degenerate)",
             points.len(),
             case.wanted,
-            pool.is_exhausted()
         ));
     }
 
@@ -281,8 +284,8 @@ async fn assert_explores(case: Case<'_>) {
 /// somewhere other than sampling — and `x2`, which no constraint mentions, has
 /// to keep being explored anyway. A pipeline that solves the whole point at once
 /// gets `x1` right and `x2` frozen.
-#[pollster::test]
-async fn a_pinned_variable_does_not_freeze_the_free_one() {
+#[test]
+fn a_pinned_variable_does_not_freeze_the_free_one() {
     assert_explores(Case {
         what: "A (pinned): x1 == pi at 1e-9, x2 unconstrained",
         variables: &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
@@ -290,8 +293,7 @@ async fn a_pinned_variable_does_not_freeze_the_free_one() {
         wanted: 200,
         occupancy: None,
         coverage: &[("x2", 0.8)],
-    })
-    .await;
+    });
 }
 
 /// Every dimension pinned, which is as close to *fully determined* as babel can
@@ -309,8 +311,8 @@ async fn a_pinned_variable_does_not_freeze_the_free_one() {
 /// So this stands as the guard on the near-miss repair instead: at `1e-9` the
 /// band is thin enough that a solver witness rounding a hair outside is a real
 /// possibility, and this is what would catch a regression in `cvg::repaired`.
-#[pollster::test]
-async fn a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optional() {
+#[test]
+fn a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optional() {
     assert_explores(Case {
         what: "A (pinned, both dimensions): the closest thing to fully determined",
         variables: &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
@@ -318,8 +320,7 @@ async fn a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optio
         wanted: 200,
         occupancy: None,
         coverage: &[],
-    })
-    .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +339,8 @@ async fn a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optio
 /// This moves the box to `2..3`, where the origin is not available and the luck
 /// runs out, and tightens the tolerance by three orders. Driving `y` from `x`
 /// makes it trivial; not driving it makes it impossible.
-#[pollster::test]
-async fn a_driven_variable_is_evaluated_not_searched() {
+#[test]
+fn a_driven_variable_is_evaluated_not_searched() {
     assert_explores(Case {
         what: "B (driven): y == sin(x) at 1e-9, box away from the origin",
         variables: &[("x", 2.0, 3.0), ("y", -1.0, 1.0)],
@@ -347,8 +348,7 @@ async fn a_driven_variable_is_evaluated_not_searched() {
         wanted: 200,
         occupancy: None,
         coverage: &[("x", 0.8)],
-    })
-    .await;
+    });
 }
 
 /// Driven through a function with an inverse, so the seed is not the thing
@@ -358,8 +358,8 @@ async fn a_driven_variable_is_evaluated_not_searched() {
 /// its surface when a box's centre is judged, so the seed is immediate; the
 /// question is whether anything then explores the curve rather than sitting
 /// on the one point.
-#[pollster::test]
-async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
+#[test]
+fn a_driven_variable_a_solver_can_reach_is_still_explored() {
     assert_explores(Case {
         what: "B (driven, translatable): x1 == sqrt(x2), x3 == cbrt(x4) at 1e-9",
         variables: &[
@@ -375,8 +375,7 @@ async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
         wanted: 200,
         occupancy: None,
         coverage: &[("x2", 0.5), ("x4", 0.5)],
-    })
-    .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -404,8 +403,8 @@ async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
 /// It is also not a claim of emptiness. `sin(x) == x/2` has three solutions and
 /// `x == x*x + 2` is an ordinary quadratic, so `SolveError::Unsatisfiable`
 /// would be false. `SystemError` is the shape for "we will not try".
-#[pollster::test]
-async fn an_implicit_equality_is_refused_by_name() {
+#[test]
+fn an_implicit_equality_is_refused_by_name() {
     for (source, variable) in [
         ("x == sin(x) +/- 0.001", "x"),
         ("x == x*x + 2 +/- 0.001", "x"),
@@ -445,8 +444,8 @@ async fn an_implicit_equality_is_refused_by_name() {
 ///
 /// Without this the refusal above could be hiding a real loss of capability
 /// rather than asking for a different spelling of the same set.
-#[pollster::test]
-async fn the_rearranged_form_is_accepted_and_explored() {
+#[test]
+fn the_rearranged_form_is_accepted_and_explored() {
     assert_explores(Case {
         what: "C, rearranged: 1/2*x2 - x1 + x3/x4 == 0 at 1e-9",
         variables: &[
@@ -459,8 +458,7 @@ async fn the_rearranged_form_is_accepted_and_explored() {
         wanted: 200,
         coverage: &[("x1", 0.3), ("x3", 0.3)],
         occupancy: None,
-    })
-    .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -480,8 +478,8 @@ async fn the_rearranged_form_is_accepted_and_explored() {
 /// line, so essentially every chord misses it and the chains sit where they
 /// started. Forty of eighty bins is far above the pool's seed budget, so it can
 /// only be met by moving along the line.
-#[pollster::test]
-async fn a_compound_equality_is_traversed() {
+#[test]
+fn a_compound_equality_is_traversed() {
     assert_explores(Case {
         what: "compound side: x1 + x2 == 3 at 1e-9",
         variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0)],
@@ -493,8 +491,7 @@ async fn a_compound_equality_is_traversed() {
             divisions: 80,
             least: 40,
         }),
-    })
-    .await;
+    });
 }
 
 /// Two equalities sharing a variable, which is where the drive has to be
@@ -512,8 +509,8 @@ async fn a_compound_equality_is_traversed() {
 ///
 /// Read `b3 / b4 / b4` of 60 before isolation — the worst of everything
 /// measured.
-#[pollster::test]
-async fn two_coupled_equalities_are_traversed() {
+#[test]
+fn two_coupled_equalities_are_traversed() {
     assert_explores(Case {
         what: "coupled: x1 + x2 == 3 and x2 + x3 == 2 at 1e-9",
         variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0), ("x3", 0.0, 3.0)],
@@ -528,8 +525,7 @@ async fn two_coupled_equalities_are_traversed() {
             divisions: 80,
             least: 25,
         }),
-    })
-    .await;
+    });
 }
 
 /// Driving assumes the feasible set is a **graph** over the free coordinates,
@@ -562,8 +558,8 @@ async fn two_coupled_equalities_are_traversed() {
 /// between refusing to drive where a divisor can vanish — which would give up
 /// cases that are perfectly fine — and treating it as branch selection, and
 /// that is not a decision to make from one example.
-#[pollster::test]
-async fn both_arms_of_a_product_receive_points() {
+#[test]
+fn both_arms_of_a_product_receive_points() {
     /// The share of the sample each arm must hold. They are of equal measure,
     /// so a fair sample is even; a fifth is a long way below that and still
     /// nowhere near what a single parametrised branch delivers.
@@ -582,11 +578,14 @@ async fn both_arms_of_a_product_receive_points() {
     let solution = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(&system)
-        .await
         .expect("a cross through the origin is satisfiable");
-    let mut samples = solution;
+    let samples = solution;
 
-    let points = columns(&samples.take(400));
+    let points = columns(
+        &samples
+            .sample(Mat::zeros(0, 0).as_ref(), 400, SEED)
+            .expect("a cross has four hundred distinct points"),
+    );
     let on_arm = |axis: usize| {
         points
             .iter()
@@ -620,28 +619,30 @@ async fn both_arms_of_a_product_receive_points() {
 ///
 /// Coverage is the wrong instrument for a two-point set, so this states it
 /// directly: `x1` must span at least the distance between the branches.
-#[pollster::test]
-async fn both_branches_of_an_absolute_value_receive_points() {
+#[test]
+fn both_branches_of_an_absolute_value_receive_points() {
     assert_explores(Case {
         what: "D (multi-valued): abs(x1) == 1 at 1e-9, branches at -1 and +1",
         variables: &[("x1", -2.0, 2.0)],
         sources: &["abs(x1) == 1 +/- 0.000000001"],
-        wanted: 200,
+        // The region is two points: `x1` is driven onto its band, so nothing
+        // is free to move and a design holds exactly one point per branch.
+        // Asking for more is `Degenerate` with these two, by design.
+        wanted: 2,
         // The branches sit at -1 and +1 in a range of 4. Reaching both spans
         // 0.5 of it and reaching one spans ~0, so anything above ~0.1 is the
         // answer — the threshold is not 0.5 because that would additionally
         // require the extreme point of each band, which is not the claim.
         occupancy: None,
         coverage: &[("x1", 0.4)],
-    })
-    .await;
+    });
 }
 
 /// The same claim on the shape the benchmarks already measure distribution for,
 /// so a fix can be checked against `cvg_benchmarks::parabolic_roots_*` for
 /// uniformity rather than merely for reach.
-#[pollster::test]
-async fn both_bands_of_a_parabola_receive_points() {
+#[test]
+fn both_bands_of_a_parabola_receive_points() {
     assert_explores(Case {
         what: "D (multi-valued): (x + 2) * (x - 1) == 0 at 1e-9, bands at -2 and 1",
         variables: &[("x", -5.0, 5.0)],
@@ -651,8 +652,7 @@ async fn both_bands_of_a_parabola_receive_points() {
         // reaching one spans ~0. Below that, for the reason above.
         occupancy: None,
         coverage: &[("x", 0.25)],
-    })
-    .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -666,8 +666,8 @@ async fn both_bands_of_a_parabola_receive_points() {
 /// feasible set is a line segment in a three-dimensional box, so points exist in
 /// quantity but only along one direction, and finding that direction is the
 /// whole problem.
-#[pollster::test]
-async fn an_under_determined_system_explores_its_remaining_freedom() {
+#[test]
+fn an_under_determined_system_explores_its_remaining_freedom() {
     assert_explores(Case {
         what: "E (under-determined): two equations, three variables, at 1e-9",
         variables: &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)],
@@ -680,8 +680,7 @@ async fn an_under_determined_system_explores_its_remaining_freedom() {
         // coordinate moves along it. `x1` is the narrowest and bounds the rest.
         occupancy: None,
         coverage: &[("x1", 0.5)],
-    })
-    .await;
+    });
 }
 
 /// The same system, asked to fill its one degree of freedom rather than reach
@@ -710,8 +709,8 @@ async fn an_under_determined_system_explores_its_remaining_freedom() {
 ///
 /// `x2` rather than `x1` because `x2` appears in both equations and is the
 /// coordinate a wrong matching is most likely to freeze.
-#[pollster::test]
-async fn an_under_determined_system_fills_its_remaining_freedom() {
+#[test]
+fn an_under_determined_system_fills_its_remaining_freedom() {
     assert_explores(Case {
         what: "E (under-determined, strict): two equations, three variables, at 1e-9",
         variables: &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)],
@@ -726,8 +725,7 @@ async fn an_under_determined_system_fills_its_remaining_freedom() {
             divisions: 80,
             least: 24,
         }),
-    })
-    .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -747,8 +745,8 @@ async fn an_under_determined_system_fills_its_remaining_freedom() {
 /// two variables, one degree of freedom, no branches and nothing to invert. If
 /// anything holds at a tight tolerance it is this, so it is the fairest place to
 /// put the floor.
-#[pollster::test]
-async fn the_tolerance_floor_is_where_it_was_left() {
+#[test]
+fn the_tolerance_floor_is_where_it_was_left() {
     /// The tightest tolerance `x1 == x2 +/- t` is currently expected to survive.
     ///
     /// Was `1e-4` before the classifier: rejection sampling and a chord drawn
@@ -774,14 +772,17 @@ async fn the_tolerance_floor_is_where_it_was_left() {
         // An `Err` here is the region being empty or unfound at this
         // tolerance, which is the case being searched for; anything else a
         // solve can fail with is a bug and would be, at any tolerance.
-        let Ok(mut pool) = ConstraintSolver::new()
+        let Ok(pool) = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .solve(&system)
-            .await
         else {
             break;
         };
-        let points = columns(&pool.take(100));
+        let design = match pool.sample(Mat::zeros(0, 0).as_ref(), 100, SEED) {
+            Ok(design) => design,
+            Err(SampleError::Degenerate { found, .. }) => found,
+        };
+        let points = columns(&design);
 
         let feasible = points.iter().all(|point| {
             let bindings = [("x1", point[0]), ("x2", point[1])];
@@ -824,8 +825,8 @@ async fn the_tolerance_floor_is_where_it_was_left() {
 /// `interval::invert_unary` does the narrowing — intersecting both branches
 /// with the argument's own range rather than picking one. So the two tables were
 /// brought into step and this became drivable, with nothing to choose.
-#[pollster::test]
-async fn an_equality_under_a_function_is_driven_through_its_inverse() {
+#[test]
+fn an_equality_under_a_function_is_driven_through_its_inverse() {
     assert_explores(Case {
         what: "driven through an inverse: sqrt(x1) + sqrt(x2) == 3 at 1e-9",
         variables: &[("x1", 0.0, 9.0), ("x2", 0.0, 9.0)],
@@ -837,8 +838,7 @@ async fn an_equality_under_a_function_is_driven_through_its_inverse() {
             divisions: 40,
             least: 24,
         }),
-    })
-    .await;
+    });
 }
 
 /// **Red on purpose: the case bipartite matching exists for.**
@@ -858,8 +858,8 @@ async fn an_equality_under_a_function_is_driven_through_its_inverse() {
 /// Interval propagation does not rescue it, for the reason a Gibbs sweep cannot
 /// traverse a chain of tight equalities: the conditional slice of one
 /// coordinate on a measure-zero set is a point.
-#[pollster::test]
-async fn two_equations_wanting_the_same_variable_strand_each_other() {
+#[test]
+fn two_equations_wanting_the_same_variable_strand_each_other() {
     assert_explores(Case {
         what: "matching: x1 + x2 == 3 and x1 + x3 == 2, both wanting x1",
         variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0), ("x3", 0.0, 3.0)],
@@ -874,6 +874,5 @@ async fn two_equations_wanting_the_same_variable_strand_each_other() {
             divisions: 40,
             least: 24,
         }),
-    })
-    .await;
+    });
 }
