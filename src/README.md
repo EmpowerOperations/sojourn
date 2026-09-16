@@ -34,15 +34,17 @@ neither backend's lowering is visible to the other**.
 
 ## The front end
 
-Four passes. `parse` in [`frontend/mod.rs`](frontend/mod.rs) is the whole pipeline
-and reads top to bottom. It is crate-private: a caller hands source text to
-`compile` or to `ConstraintSystem::new`, and the tree between is nobody's
-business but the two backends'.
+`translate`, then `rewrite::canonicalize`: four passes in a fixed order, which
+`parse` in [`frontend/mod.rs`](frontend/mod.rs) runs and reads top to bottom.
+It is crate-private: a caller hands source text to `compile` or to
+`ConstraintSystem::new`, and the tree between is nobody's business but the
+two backends'.
 
 ```
-              fold_constants   invert_monotone   unroll_aggregates
- source ─►  ──────────────►  ──────────────►  ──────────────►  Ast
+              fold_constants   invert_monotone   unroll_aggregates   collect_powers
+ source ─►  ──────────────►  ──────────────►  ──────────────►  ─────────────►  Ast
       translate (fallible)                        (fallible)
+            └──────────────────── rewrite::canonicalize ─────────────────────┘
 ```
 
 The output is an `Ast`, not an evaluable thing: turning one into something that
@@ -55,6 +57,7 @@ is `cvg`, which never lowers it at all.
 | fold constants | `rewrite::fold_constants` | every subtree made only of literals becomes one `Kind::Literal` |
 | invert monotone | `rewrite::invert_monotone` | `f(u) op c` becomes `u op' c'` for the strictly monotone `f` |
 | unroll aggregates | `rewrite::unroll_aggregates` | every `Kind::Aggregate` becomes `Kind::Fold`; a bound that is not a constant, or a span past the cap, is a compile error |
+| collect powers | `rewrite::collect_powers` | a term multiplied by itself becomes `Pow(term, n)` — `f * f`, `f * (f * f)`, `f^2 * f^3`, `prod(1, n, i -> f)` — so a power has one form whatever was written; the one pass that may move a value by an ulp, since the unroll multiplies left to right whatever the spelling's grouping |
 
 The order is not arbitrary. Folding runs first because it makes *"is this
 constant?"* stop being a question anywhere else — afterwards a statically known
@@ -62,12 +65,19 @@ value **is** a `Kind::Literal`, which is why inversion and unrolling can both
 pattern-match instead of carrying evaluators of their own. Inversion has to see
 `Kind::Compare`, which it does, because nothing eliminates one any more.
 
-One rewrite that used to be here is deliberately not: `x ^ n` for a whole `n`
-reaches every backend as written. The tape and the shader rendered from it
-each lower it to repeated multiplication themselves, keyed on one rule
-(`Expr::whole_exponent`), and interval narrowing inverts the node through its
-root. Expanding it in the tree cost a compound base `n` evaluations and left
-a product fold nothing could invert.
+Powers are decided in three places, deliberately. The canonical tree holds
+`Pow(base, n)` for a whole `n`, whichever way it was spelled. The evaluator
+alone wants multiplications — `powf` has no vector form and the shader's `pow`
+is NaN for a negative base — so `eval::bind` runs `rewrite::unroll_powers` on
+its own copy of the tree before lowering: `(t·t)·t`, with a compound base bound
+to a fresh `let` so it is evaluated once. Interval narrowing wants the power
+kept — `x·x·x` over intervals is wider than `x³`, and a chain of
+multiplications inverts by dividing where a power inverts through its root — so
+`cvg::hc4` emits the canonical tree as it stands. The emitter itself knows
+nothing about powers; a `Pow` that reaches it is a real or variable exponent.
+(An earlier tree-level unroll in `parse` was removed for duplicating a compound
+base and for leaving nothing to invert; the `let` answers the first and applying
+it only on the eval path the second.)
 
 Two passes are fallible, and both refuse rather than defer:
 
@@ -93,7 +103,7 @@ produce a non-finite value, so the error names the innermost subexpression that
 went wrong rather than the whole constraint — instruction order is post-order,
 so the first faulting instruction is the innermost node. It also catches a
 non-finite *input* at its `Load`, and an unwritten local: the registers are
-primed with NaN as a sentinel and a local the lowerer cannot prove assigned gets
+primed with NaN as a sentinel and a local the emitter cannot prove assigned gets
 an explicit `Check`, so reading one is a slot-allocation bug rather than a value.
 
 Infinities are included deliberately, and `rewrite::monotone` is why: while
@@ -183,9 +193,9 @@ gone such a file is only the tape agreeing with itself.
 |---|---|
 | [`ast.rs`](ast.rs) | `Program`, `Block`, `Expr`, `Kind`, and the operator semantics in `UnaryOp::apply` / `BinaryOp::apply` |
 | [`frontend/`](frontend) | text to `Ast`: `parse` and the `Ast` type in `mod.rs`, `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
-| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`), `differentiate.rs` (the reverse sweep: a tape's gradient as a tape), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which turns a tape into the view that `templates/wgsl/` renders as a WGSL function for the GPU sieve |
+| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `irgen.rs` — IR generation, the tree walked once and instructions emitted, Clang's name for the step — `regalloc.rs`), `differentiate.rs` (the reverse sweep: a tape's gradient as a tape), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which turns a tape into the view that `templates/wgsl/` renders as a WGSL function for the GPU sieve |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
 | [`../templates/wgsl/`](../templates/wgsl) | the WGSL, as askama templates: `operators.wgsl.jinja` (one macro arm per babel operator and its domain guard), `function.wgsl.jinja` (a tape as a function), `prelude.wgsl.jinja`, `harness.wgsl.jinja` (the sieve's entry points and bindings) |
 | [`system.rs`](system.rs), [`solve.rs`](solve.rs), [`repair.rs`](repair.rs) | the generator's API: a validated set of constraints over a box, which answers whether a point is feasible and nothing harder; the solver builder and the solved region it returns, which hands out samples and repairs a point against its system; the repair algorithm |
-| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `prune.rs` (interval branch-and-prune: the proof, the blame, the pieces), `newton.rs` (the projection by Newton on the KKT system, for `repair`), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder, the opening (`open`) and the design (`design`) |
+| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `local.rs` (a local solve for the first point, COBYLA), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `hc4.rs` (HC4-revise over the constraint's tape — `IntervalTape`, the evaluator's IR run over intervals — and `slice`, which asks it of every constraint naming a coordinate), `prune.rs` (interval branch-and-prune: the proof, the blame, the pieces), `newton.rs` (the projection by Newton on the KKT system, for `repair`), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder, the opening (`open`) and the design (`design`) |

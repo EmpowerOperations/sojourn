@@ -15,11 +15,33 @@
 use std::f64::consts::FRAC_PI_2;
 
 use crate::ast::{
-    Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot, Program, UnaryOp,
-    to_index,
+    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot,
+    Program, UnaryOp, to_index,
 };
 use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
 use crate::{Ast, Schema};
+/// The canonical form of a parsed tree: what every consumer reads.
+///
+/// The passes in the order they must run — [`fold_constants`], so that a
+/// statically known value *is* a literal for everything after;
+/// [`invert_monotone`], while comparisons exist to be matched on;
+/// [`unroll_aggregates`], once every bound is a literal; then
+/// [`collect_powers`], once every repeated factor an aggregate hid is spelled
+/// out. Each is meaning-preserving; together they are the one place the tree
+/// is normalised, so that two spellings of a thing reach the evaluator and the
+/// narrower as one tree. What a single consumer wants of the tree beyond this
+/// — the evaluator's [`unroll_powers`] — is that consumer's to apply.
+///
+/// # Errors
+/// [`fold_constants`]'s and [`unroll_aggregates`]'s.
+pub(crate) fn canonicalize(program: Program) -> Result<Program, Vec<Fault>> {
+    let program = fold_constants(program)?;
+    let program = invert_monotone(program);
+    let program = unroll_aggregates(program)?;
+    let program = collect_powers(program);
+    Ok(program)
+}
+
 /// Replaces every subexpression made only of literals with the value it works
 /// out to.
 ///
@@ -760,18 +782,24 @@ fn unroll_block(block: Block) -> Result<Block, Vec<Fault>> {
         assignments,
         result,
     } = block;
-    Ok(Block {
-        assignments: assignments
-            .into_iter()
-            .map(|Assignment { slot, value, span }| {
-                Ok(Assignment {
-                    slot,
-                    value: unroll_expr(value)?,
-                    span,
-                })
+
+    let assignments = assignments
+        .into_iter()
+        .map(|Assignment { slot, value, span }| {
+            let value_expr = unroll_expr(value)?;
+            Ok(Assignment {
+                slot,
+                value: value_expr,
+                span,
             })
-            .collect::<Result<_, Vec<Fault>>>()?,
-        result: unroll_expr(result)?,
+        })
+        .collect::<Result<_, Vec<Fault>>>()?;
+
+    let result_expr = unroll_expr(result)?;
+
+    Ok(Block {
+        assignments,
+        result: result_expr,
     })
 }
 
@@ -789,8 +817,8 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
             // Descend first: an inner aggregate only becomes unrollable once the
             // enclosing parameter has been substituted away, and substitution
             // happens below. Recursing here handles nesting without a fixpoint.
-            let lower = unroll_descend(*lower)?;
-            let upper = unroll_descend(*upper)?;
+            let lower = Box::new(unroll_expr(*lower)?);
+            let upper = Box::new(unroll_expr(*upper)?);
             let body = Box::new(unroll_block(*body)?);
 
             Kind::Fold {
@@ -806,14 +834,14 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
 
         Kind::Unary { op, arg } => Kind::Unary {
             op,
-            arg: unroll_descend(*arg)?,
+            arg: Box::new(unroll_expr(*arg)?),
         },
         Kind::Binary { op, lhs, rhs } => Kind::Binary {
             op,
-            lhs: unroll_descend(*lhs)?,
-            rhs: unroll_descend(*rhs)?,
+            lhs: Box::new(unroll_expr(*lhs)?),
+            rhs: Box::new(unroll_expr(*rhs)?),
         },
-        Kind::DynamicIndex(index) => Kind::DynamicIndex(unroll_descend(*index)?),
+        Kind::DynamicIndex(index) => Kind::DynamicIndex(Box::new(unroll_expr(*index)?)),
         Kind::Block(block) => Kind::Block(Box::new(unroll_block(*block)?)),
         Kind::Fold { kind, terms } => Kind::Fold {
             kind,
@@ -830,16 +858,16 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
         // does not have to know that.
         Kind::Compare { op, lhs, rhs } => Kind::Compare {
             op,
-            lhs: unroll_descend(*lhs)?,
-            rhs: unroll_descend(*rhs)?,
+            lhs: Box::new(unroll_expr(*lhs)?),
+            rhs: Box::new(unroll_expr(*rhs)?),
         },
         Kind::NearEq {
             lhs,
             rhs,
             tolerance,
         } => Kind::NearEq {
-            lhs: unroll_descend(*lhs)?,
-            rhs: unroll_descend(*rhs)?,
+            lhs: Box::new(unroll_expr(*lhs)?),
+            rhs: Box::new(unroll_expr(*rhs)?),
             tolerance,
         },
         Kind::And { terms } => Kind::And {
@@ -851,12 +879,6 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
     };
 
     Ok(Expr { kind, span })
-}
-
-/// Mirrors `descend` above: takes the child by value so the caller's box is
-/// released rather than passed through.
-fn unroll_descend(expr: Expr) -> Result<Box<Expr>, Vec<Fault>> {
-    Ok(Box::new(unroll_expr(expr)?))
 }
 
 /// The range an aggregate covers, when both bounds are statically known.
@@ -1018,10 +1040,593 @@ fn substitute_block(block: Block, param: LocalSlot, index: i64) -> Block {
     }
 }
 
+// --------------------------------------------------------------------- powers
+
+/// Rewrites a term multiplied by itself into the power it is: `f * f` to
+/// `f^2`, `f * f * f` to `f^3`, `prod(1, n, i -> f)` to `f^n`.
+///
+/// So that a power has one form whatever the author wrote. It matters
+/// because the consumers treat the two spellings differently and would
+/// otherwise let the difference show: narrowing inverts `Mul` by dividing by
+/// the other factor's whole range, which for `h * h` concludes nothing, and
+/// inverts a power through its root, which for `h^2 < 9` concludes `h <= 3`;
+/// and the evaluator lowers a repeated factor as many times as it is written
+/// where it lowers a power's base once.
+///
+/// Any association is collected: `f * (f * f)` and `f^2 * f^3` are powers as
+/// much as `(f * f) * f` is. The evaluator then unrolls `f^n` as `(t·t)·t…`,
+/// left to right, which can differ from the spelling's own order in the last
+/// bit — the one pass here that is not bit-exact, on purpose: one power, one
+/// tape, one bound, and nobody choosing a spelling for its rounding.
+/// Exponents stay within [`crate::ast::POWER_LIMIT`].
+pub(crate) fn collect_powers(program: Program) -> Program {
+    let Program { body, frame_size } = program;
+    Program {
+        body: collect_block(body),
+        frame_size,
+    }
+}
+
+fn collect_block(block: Block) -> Block {
+    let Block {
+        assignments,
+        result,
+    } = block;
+    Block {
+        assignments: assignments
+            .into_iter()
+            .map(|Assignment { slot, value, span }| Assignment {
+                slot,
+                value: collect_expr(value),
+                span,
+            })
+            .collect(),
+        result: collect_expr(result),
+    }
+}
+
+fn collect_expr(expr: Expr) -> Expr {
+    let Expr { kind, span } = expr;
+    let descend = |expr: Box<Expr>| Box::new(collect_expr(*expr));
+
+    let kind = match kind {
+        // Children first, so `(f * f) * f` sees `f^2 * f`.
+        Kind::Binary {
+            op: BinaryOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            let (lhs, rhs) = (descend(lhs), descend(rhs));
+            match collected(*lhs, *rhs, span) {
+                Ok(power) => return power,
+                Err((lhs, rhs)) => Kind::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            }
+        }
+        Kind::Fold {
+            kind: AggregateKind::Prod,
+            terms,
+        } => {
+            let terms: Vec<Expr> = terms.into_iter().map(collect_expr).collect();
+            let repeated = terms.len() >= 2
+                && i64::try_from(terms.len()).is_ok_and(|n| n <= crate::ast::POWER_LIMIT)
+                && terms[1..].iter().all(|term| same_shape(term, &terms[0]));
+            if repeated {
+                let n = i64::try_from(terms.len()).expect("checked above");
+                let mut terms = terms;
+                return power(terms.swap_remove(0), n, span);
+            }
+            Kind::Fold {
+                kind: AggregateKind::Prod,
+                terms,
+            }
+        }
+
+        Kind::Unary { op, arg } => Kind::Unary {
+            op,
+            arg: descend(arg),
+        },
+        Kind::Binary { op, lhs, rhs } => Kind::Binary {
+            op,
+            lhs: descend(lhs),
+            rhs: descend(rhs),
+        },
+        Kind::DynamicIndex(index) => Kind::DynamicIndex(descend(index)),
+        Kind::Block(block) => Kind::Block(Box::new(collect_block(*block))),
+        Kind::Fold { kind, terms } => Kind::Fold {
+            kind,
+            terms: terms.into_iter().map(collect_expr).collect(),
+        },
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: descend(lhs),
+            rhs: descend(rhs),
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: descend(lhs),
+            rhs: descend(rhs),
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms.into_iter().map(collect_expr).collect(),
+        },
+        Kind::Aggregate {
+            kind,
+            lower,
+            upper,
+            param,
+            body,
+        } => Kind::Aggregate {
+            kind,
+            lower: descend(lower),
+            upper: descend(upper),
+            param,
+            body: Box::new(collect_block(*body)),
+        },
+
+        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
+    };
+
+    Expr { kind, span }
+}
+
+/// `lhs * rhs` as a power, where it is one: `f * f` is `f^2`, `f^n * f` and
+/// `f * f^n` are `f^(n+1)`, `f^n * f^m` is `f^(n+m)`. Otherwise the operands,
+/// handed back. A factor that is not a power counts as the first.
+fn collected(lhs: Expr, rhs: Expr, span: Span) -> Result<Expr, (Expr, Expr)> {
+    let (left_base, n) = base_and_exponent(&lhs);
+    let (right_base, m) = base_and_exponent(&rhs);
+    if !same_shape(left_base, right_base) || n + m > crate::ast::POWER_LIMIT {
+        return Err((lhs, rhs));
+    }
+    let base = match lhs.kind {
+        Kind::Binary {
+            op: BinaryOp::Pow,
+            lhs: base,
+            ..
+        } if n > 1 => *base,
+        _ => lhs,
+    };
+    Ok(power(base, n + m, span))
+}
+
+/// `(f, n)` for `f^n` with a whole positive `n` within the cap; `(expr, 1)`
+/// for anything else.
+fn base_and_exponent(expr: &Expr) -> (&Expr, i64) {
+    if let Kind::Binary {
+        op: BinaryOp::Pow,
+        lhs: base,
+        rhs: exponent,
+    } = &expr.kind
+        && let Some(n) = exponent.whole_exponent()
+        && (2..=crate::ast::POWER_LIMIT).contains(&n)
+    {
+        return (base, n);
+    }
+    (expr, 1)
+}
+
+fn power(base: Expr, n: i64, span: Span) -> Expr {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an exponent is within POWER_LIMIT"
+    )]
+    let exponent = n as f64;
+    // An unrolled aggregate's term is its body, a block binding nothing; the
+    // power's base is what the block computes.
+    let base = match base.kind {
+        Kind::Block(block) if block.assignments.is_empty() => block.result,
+        _ => base,
+    };
+    Expr::new(
+        Kind::Binary {
+            op: BinaryOp::Pow,
+            lhs: Box::new(base),
+            rhs: Box::new(Expr::new(Kind::Literal(exponent), span)),
+        },
+        span,
+    )
+}
+
+/// Structural equality, spans aside: two subtrees that compute the same thing
+/// from the same variables. `Expr`'s own equality compares spans, which two
+/// spellings of one factor never share.
+fn same_shape(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (Kind::Literal(x), Kind::Literal(y)) => x.to_bits() == y.to_bits(),
+        (Kind::Global(x), Kind::Global(y)) => x == y,
+        (Kind::Local(x), Kind::Local(y)) => x == y,
+        (Kind::Unary { op: p, arg: x }, Kind::Unary { op: q, arg: y }) => {
+            p == q && same_shape(x, y)
+        }
+        (
+            Kind::Binary {
+                op: p,
+                lhs: a1,
+                rhs: a2,
+            },
+            Kind::Binary {
+                op: q,
+                lhs: b1,
+                rhs: b2,
+            },
+        ) => p == q && same_shape(a1, b1) && same_shape(a2, b2),
+        (Kind::DynamicIndex(x), Kind::DynamicIndex(y)) => same_shape(x, y),
+        (Kind::Fold { kind: p, terms: x }, Kind::Fold { kind: q, terms: y }) => {
+            p == q && x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_shape(x, y))
+        }
+        // A block binding nothing is its result: what an unrolled aggregate's
+        // terms are. One that binds slots, and a comparison, are not factors
+        // worth collecting, and saying "different" is always safe.
+        (Kind::Block(x), Kind::Block(y))
+            if x.assignments.is_empty() && y.assignments.is_empty() =>
+        {
+            same_shape(&x.result, &y.result)
+        }
+        (Kind::Block(x), _) if x.assignments.is_empty() => same_shape(&x.result, b),
+        (_, Kind::Block(y)) if y.assignments.is_empty() => same_shape(a, &y.result),
+        _ => false,
+    }
+}
+
+/// Rewrites `x ^ n`, for a whole literal `n`, into the multiplications it is:
+/// what the evaluator lowers, and no other consumer.
+///
+/// `powf` is a per-lane libm call with no vector form and the shader's `pow`
+/// is NaN for a negative base; a multiply is one instruction on both and
+/// sign-safe. Interval narrowing wants the opposite — `x·x·x` over intervals
+/// is wider than `x³`, and a chain of multiplications inverts by dividing
+/// where a power inverts through its root — so this is not part of
+/// [`canonicalize`]: `eval::bind` applies it to its own copy of the tree, and
+/// the narrower lowers the tree as parsed. The lowering itself decides nothing
+/// about powers either way.
+///
+/// A compound base is bound to a fresh `let` and the multiplications read the
+/// local, so the base is evaluated once — the reason a tree-level unroll was
+/// once removed from `parse`, where it could only duplicate the subtree. A
+/// leaf base is repeated as it stands. `x^0` is the constant one for every
+/// base, including one that would fault, which is what `powf` answers; a
+/// negative exponent is one over the positive power; a real or oversized
+/// exponent stays `Pow` and goes through `powf`.
+pub(crate) fn unroll_powers(program: Program) -> Program {
+    let Program {
+        body,
+        mut frame_size,
+    } = program;
+    let body = powers_block(body, &mut frame_size);
+    Program { body, frame_size }
+}
+
+fn powers_block(block: Block, frame_size: &mut u32) -> Block {
+    let Block {
+        assignments,
+        result,
+    } = block;
+    Block {
+        assignments: assignments
+            .into_iter()
+            .map(|Assignment { slot, value, span }| Assignment {
+                slot,
+                value: powers_expr(value, frame_size),
+                span,
+            })
+            .collect(),
+        result: powers_expr(result, frame_size),
+    }
+}
+
+fn powers_expr(expr: Expr, frame_size: &mut u32) -> Expr {
+    let Expr { kind, span } = expr;
+    let descend = |expr: Box<Expr>, frame_size: &mut u32| Box::new(powers_expr(*expr, frame_size));
+
+    let kind = match kind {
+        Kind::Binary {
+            op: BinaryOp::Pow,
+            lhs,
+            rhs,
+        } if rhs.whole_exponent().is_some() => {
+            let n = rhs.whole_exponent().expect("matched above");
+            let base = powers_expr(*lhs, frame_size);
+            return unrolled(base, n, span, frame_size);
+        }
+
+        Kind::Unary { op, arg } => Kind::Unary {
+            op,
+            arg: descend(arg, frame_size),
+        },
+        Kind::Binary { op, lhs, rhs } => Kind::Binary {
+            op,
+            lhs: descend(lhs, frame_size),
+            rhs: descend(rhs, frame_size),
+        },
+        Kind::DynamicIndex(index) => Kind::DynamicIndex(descend(index, frame_size)),
+        Kind::Block(block) => Kind::Block(Box::new(powers_block(*block, frame_size))),
+        Kind::Fold { kind, terms } => Kind::Fold {
+            kind,
+            terms: terms
+                .into_iter()
+                .map(|term| powers_expr(term, frame_size))
+                .collect(),
+        },
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: descend(lhs, frame_size),
+            rhs: descend(rhs, frame_size),
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: descend(lhs, frame_size),
+            rhs: descend(rhs, frame_size),
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms
+                .into_iter()
+                .map(|term| powers_expr(term, frame_size))
+                .collect(),
+        },
+        Kind::Aggregate {
+            kind,
+            lower,
+            upper,
+            param,
+            body,
+        } => Kind::Aggregate {
+            kind,
+            lower: descend(lower, frame_size),
+            upper: descend(upper, frame_size),
+            param,
+            body: Box::new(powers_block(*body, frame_size)),
+        },
+
+        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
+    };
+
+    Expr { kind, span }
+}
+
+/// `base ^ n` as multiplications: `|n| - 1` of them, left-associated, over
+/// reads of the base — bound to a fresh local first unless it is a leaf. The
+/// same `(t·t)·t` a product fold from the identity computes, less the
+/// multiplication by one.
+fn unrolled(base: Expr, n: i64, span: Span, frame_size: &mut u32) -> Expr {
+    if n == 0 {
+        return Expr::new(Kind::Literal(1.0), span);
+    }
+    let count = usize::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
+    let product = |factor: Expr| {
+        (1..count).fold(factor.clone(), |acc, _| {
+            Expr::new(
+                Kind::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(factor.clone()),
+                },
+                span,
+            )
+        })
+    };
+    let positive = match base.kind {
+        Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => product(base),
+        _ => {
+            let slot = LocalSlot::from_index(*frame_size);
+            *frame_size += 1;
+            Expr::new(
+                Kind::Block(Box::new(Block {
+                    assignments: vec![Assignment {
+                        slot,
+                        value: base,
+                        span,
+                    }],
+                    result: product(Expr::new(Kind::Local(slot), span)),
+                })),
+                span,
+            )
+        }
+    };
+    if n > 0 {
+        positive
+    } else {
+        Expr::new(
+            Kind::Binary {
+                op: BinaryOp::Div,
+                lhs: Box::new(Expr::new(Kind::Literal(1.0), span)),
+                rhs: Box::new(positive),
+            },
+            span,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::eval;
+
+    /// `Pow(_, n)` at the root of a parsed expression, or `None`.
+    fn power_at_root(source: &str) -> Option<(Kind, i64)> {
+        let ast = crate::parse(source).expect("should compile");
+        match ast.program.body.result.kind {
+            Kind::Binary {
+                op: BinaryOp::Pow,
+                lhs,
+                rhs,
+            } => Some((lhs.kind, rhs.whole_exponent().expect("a whole exponent"))),
+            _ => None,
+        }
+    }
+
+    /// A term multiplied by itself is a power, however it is spelled, so that
+    /// every consumer sees one form: the evaluator unrolls it, the narrower
+    /// inverts it through its root, and neither depends on the author's
+    /// choice between `f * f` and `f^2`.
+    #[test]
+    fn a_term_multiplied_by_itself_is_a_power() {
+        let (base, n) = power_at_root("(sin(x) + 1) * (sin(x) + 1)").expect("a square");
+        assert_eq!(n, 2);
+        assert!(
+            matches!(
+                base,
+                Kind::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            ),
+            "{base:?}"
+        );
+
+        let (base, n) = power_at_root("y * y * y").expect("a cube");
+        assert_eq!((base, n), (Kind::Global(GlobalId::from_index(0)), 3));
+
+        let (base, n) = power_at_root("prod(1, 4, i -> x)").expect("a fourth power");
+        assert_eq!((base, n), (Kind::Global(GlobalId::from_index(0)), 4));
+    }
+
+    /// However the factors are grouped, and whichever of them are already
+    /// powers, the product is one power.
+    #[test]
+    fn any_association_of_a_repeated_factor_is_a_power() {
+        for (source, n) in [
+            ("y * (y * y)", 3),
+            ("(y * y) * (y * y)", 4),
+            ("y^2 * y^3", 5),
+            ("y * y^4", 5),
+            ("(y * y) * (y * (y * y))", 5),
+        ] {
+            let (base, exponent) = power_at_root(source).unwrap_or_else(|| panic!("{source}"));
+            assert_eq!(
+                (base, exponent),
+                (Kind::Global(GlobalId::from_index(0)), n),
+                "{source}"
+            );
+        }
+        // Past the cap the product stays a product.
+        assert!(power_at_root("y^40 * y^40").is_none());
+    }
+
+    /// Collecting powers, and the evaluator's unrolling after it, keep every
+    /// value: to the bit where the multiplications land in the order they
+    /// were written, and within a few ulps where collecting reassociated
+    /// them. What lets the canonical form grow.
+    #[test]
+    fn collecting_powers_keeps_the_value() {
+        use rand::rngs::Xoshiro256PlusPlus;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x5A_5A_C0_DE);
+        for (source, ulps) in [
+            ("x * x", 0),
+            ("x * x * x", 0),
+            ("(a / b) * (a / b) * (a / b)", 0),
+            ("x^3", 0),
+            ("x^-2", 0),
+            ("x^0", 0),
+            ("(a + b)^4", 0),
+            ("(a + b) * (a + b)", 0),
+            ("sin(x) * sin(x)", 0),
+            ("prod(1, 3, i -> x)", 0),
+            ("a * b * a", 0),
+            // Reassociated: the spelling's order is not the unroll's.
+            ("x * (x * x)", 4),
+            ("(x * x) * (x * (x * x))", 4),
+            ("(a + b)^2 * (a + b)^3", 4),
+        ] {
+            let raw = crate::frontend::translate(source).expect("should translate");
+            let program = fold_constants(raw.program).expect("folds");
+            let program = unroll_aggregates(invert_monotone(program)).expect("unrolls");
+            let raw = Ast {
+                source: source.to_owned(),
+                program,
+                symbols: raw.symbols,
+                contains_dynamic_lookup: raw.contains_dynamic_lookup,
+                is_constraint: raw.is_constraint,
+            };
+            let rewritten = crate::parse(source).expect("should compile");
+            for _ in 0..64 {
+                let inputs: Vec<(&str, f64)> = ["x", "a", "b"]
+                    .into_iter()
+                    .map(|name| (name, rng.random_range(-3.0..3.0)))
+                    .collect();
+                let before = eval::eval_parsed(&raw, &inputs);
+                let after = eval::eval_parsed(&rewritten, &inputs);
+                match (before, after) {
+                    (Ok(before), Ok(after)) => {
+                        let apart = before.to_bits().abs_diff(after.to_bits());
+                        assert!(
+                            apart <= ulps,
+                            "{source} at {inputs:?}: {before} became {after}, {apart} ulps"
+                        );
+                    }
+                    (Err(_), Err(_)) => {}
+                    (before, after) => {
+                        panic!("{source} at {inputs:?}: {before:?} became {after:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// The evaluator's unrolling binds a compound base once and multiplies
+    /// the local; a leaf base is multiplied as it stands, and the frame grows
+    /// only for the former.
+    #[test]
+    fn unrolling_binds_a_compound_base_once() {
+        let compound = crate::parse("(a + b)^3").expect("should compile");
+        let before = compound.program.frame_size;
+        let unrolled = unroll_powers(compound.program);
+        assert_eq!(unrolled.frame_size, before + 1);
+        let Kind::Block(block) = &unrolled.body.result.kind else {
+            panic!("a compound base is bound: {:?}", unrolled.body.result);
+        };
+        assert_eq!(block.assignments.len(), 1);
+        assert!(
+            matches!(
+                block.assignments[0].value.kind,
+                Kind::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            ),
+            "{:?}",
+            block.assignments[0].value
+        );
+        // `(t * t) * t`, reading the local.
+        let Kind::Binary {
+            op: BinaryOp::Mul,
+            rhs,
+            ..
+        } = &block.result.kind
+        else {
+            panic!("{:?}", block.result);
+        };
+        assert_eq!(rhs.kind, Kind::Local(block.assignments[0].slot));
+
+        let leaf = crate::parse("x^3").expect("should compile");
+        let before = leaf.program.frame_size;
+        let unrolled = unroll_powers(leaf.program);
+        assert_eq!(unrolled.frame_size, before);
+        assert!(
+            matches!(
+                unrolled.body.result.kind,
+                Kind::Binary {
+                    op: BinaryOp::Mul,
+                    ..
+                }
+            ),
+            "{:?}",
+            unrolled.body.result
+        );
+    }
 
     /// Substitution puts a literal where the loop parameter was, and the
     /// subscript has to end up a *literal* rather than an expression that

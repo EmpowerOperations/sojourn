@@ -27,7 +27,7 @@
 //! must not be fed. The stages, cheapest and most exact first:
 //!
 //! **Clamp** — where cheap. Each coordinate has a conditional slice, the
-//! interval it may occupy with the others held ([`interval::slice`]);
+//! interval it may occupy with the others held ([`hc4::slice`]);
 //! clamping into it is the axis projection onto that coordinate's
 //! constraints. A slice narrows against every constraint naming the
 //! coordinate, so the clamp costs a walk of each such constraint's tree per
@@ -150,7 +150,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 
 use crate::cvg::incidence::{ConstraintId, Row};
-use crate::cvg::{classify, interval, local, newton, normalised_distance as distance};
+use crate::cvg::{classify, hc4, local, newton, normalised_distance as distance};
 use crate::{ConstraintSystem, Point};
 
 /// How many rounds of clamping a point gets before the projection starts
@@ -722,7 +722,7 @@ fn clamped(
         // point rather than about the order the coordinates happen to be in.
         let mut clamps: Vec<(f64, usize, f64)> = (0..current.len())
             .filter_map(|coordinate| {
-                let slice = interval::slice(system, &current, coordinate);
+                let slice = hc4::slice(system, &current, coordinate);
                 if slice.is_empty() {
                     return None;
                 }

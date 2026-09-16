@@ -198,10 +198,8 @@ pub enum UnaryOp {
     Sinh,
     Tanh,
     Cot,
-    /// Natural logarithm — Babel's `ln`.
-    Ln,
-    /// Base-10 logarithm — Babel's unary `log`, overriding Java's naming.
-    Log10,
+    Ln,    // Natural logarithm (log base e) -- Babel's `ln`
+    Log10, // Base-10 logarithm -- Babel's unary `log`
     Abs,
     Sqrt,
     Cbrt,

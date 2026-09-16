@@ -4,7 +4,7 @@
 //!
 //! # One mechanism, two jobs
 //!
-//! [`interval::narrow`] is HC4-revise: given every other symbol's interval,
+//! [`IntervalTape::narrow`] is HC4-revise: given every other symbol's interval,
 //! the interval one symbol may take if a constraint is to hold, sound as a
 //! superset. The walker asks it from a *point*, one coordinate at a time. Ask
 //! it over the declared *box* instead — every constraint, every symbol it
@@ -52,13 +52,14 @@
 //! constraint, whichever first; a bisection ends at its budget of
 //! contractions. Nothing here waits on anything, so nothing here can hang.
 //!
-//! [`interval::narrow`]: super::interval::narrow
+//! [`IntervalTape::narrow`]: super::hc4::IntervalTape::narrow
 
 use std::collections::VecDeque;
 
 use super::classify;
+use super::hc4::Frames;
 use super::incidence::{ConstraintId, Row};
-use super::interval::{Interval, narrow};
+use super::interval::Interval;
 use crate::ast::GlobalId;
 use crate::{ConstraintSystem, Point};
 
@@ -197,6 +198,7 @@ pub(crate) fn contract(
     let mut queued = vec![true; constraints];
     let mut visits = 0;
     let cap = VISITS_PER_CONSTRAINT * constraints;
+    let mut frames = Frames::default();
 
     while let Some(id) = queue.pop_front() {
         queued[id.index()] = false;
@@ -211,10 +213,10 @@ pub(crate) fn contract(
         for (symbol, row) in rows.iter().enumerate() {
             let wanted = u32::try_from(symbol).expect("fewer than four billion symbols");
             let before = globals[symbol];
-            let after = before.intersect(narrow(
-                &problem.constraints[id.index()].written,
+            let after = before.intersect(problem.constraints[id.index()].intervals.narrow(
                 &globals,
                 GlobalId::from_index(wanted),
+                &mut frames,
             ));
             if after.is_empty() {
                 contributed[id.index()] = true;

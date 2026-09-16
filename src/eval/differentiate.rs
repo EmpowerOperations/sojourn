@@ -70,49 +70,30 @@ pub(crate) fn differentiate(primal: &VirtualTape, positions: &[u32]) -> Option<V
         return None;
     }
 
-    // The derivative tape starts as an empty tape sharing the primal's
-    // constant pool and continuing its temporary numbering.
+    // Forward: the primal in single assignment, copied as it stands. The
+    // derivative tape shares its constant pool and continues its temporary
+    // numbering.
+    let renamed = primal.single_assignment();
     let mut sweep = Sweep {
         tape: VirtualTape::new(
-            primal.consts.clone(),
-            primal.locals,
-            primal.temps(),
+            renamed.consts.clone(),
+            renamed.locals,
+            renamed.temps(),
             Vec::new(),
             Vec::new(),
-            primal.result,
+            renamed.result,
         ),
         span: Span::new(0, 0),
     };
-
-    // Forward: the primal, renamed so that every write is a fresh temporary
-    // and every read names the write it sees. Straight-line code needs no
-    // more than that — "SSA construction" (Cytron et al. 1991) is the
-    // general form, for code with branches.
-    let mut version: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
     let mut loads: Vec<(u32, VirtualRegister)> = Vec::new();
-    let mut renamed: Vec<Instruction<VirtualRegister>> = Vec::new();
-    for (insn, span) in primal.insns.iter().zip(&primal.spans) {
-        let read = insn.map(|reg| version.get(&reg).copied().unwrap_or(reg));
-        let written = match read {
-            Instruction::Check { .. } => read,
-            _ => {
-                let fresh = sweep.tape.fresh_temp();
-                let dst = insn.dst().expect("every instruction but a check writes");
-                version.insert(dst, fresh);
-                read.with_dst(fresh)
-            }
-        };
-        if let Instruction::Load { dst, input } = written {
+    for (insn, span) in renamed.insns.iter().zip(&renamed.spans) {
+        if let Instruction::Load { dst, input } = *insn {
             loads.push((input, dst));
         }
         sweep.span = *span;
-        sweep.emit(written);
-        renamed.push(written);
+        sweep.emit(*insn);
     }
-    let result = version
-        .get(&primal.result)
-        .copied()
-        .unwrap_or(primal.result);
+    let result = renamed.result;
 
     // Backward: adjoints, from the result down to the loads. This is
     // "reverse-mode automatic differentiation" — backpropagation — as in
@@ -123,7 +104,7 @@ pub(crate) fn differentiate(primal: &VirtualTape, positions: &[u32]) -> Option<V
     let mut adjoint: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
     let one = sweep.constant(1.0);
     adjoint.insert(result, one);
-    for (insn, span) in renamed.iter().zip(&primal.spans).rev() {
+    for (insn, span) in renamed.insns.iter().zip(&renamed.spans).rev() {
         let Some(dst) = insn.dst() else {
             continue;
         };

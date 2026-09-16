@@ -1,9 +1,10 @@
 //! Source text to [`Ast`].
 //!
 //! Everything here is meaning-preserving. [`parse`] lexes, parses and lowers to
-//! [`crate::ast`], then the rewrites in [`rewrite`] canonicalise the tree
+//! [`crate::ast`], then [`rewrite::canonicalize`] normalises the tree
 //! *without changing what it computes* — folding constants, inverting monotone
-//! comparisons, unrolling aggregates over literal bounds.
+//! comparisons, unrolling aggregates over literal bounds, collecting a term
+//! multiplied by itself into a power.
 //!
 //! That is the line this module draws. A pass that makes the tree easier to
 //! analyse belongs here; a pass that lowers it toward one consumer's needs
@@ -56,18 +57,10 @@ pub(crate) fn parse(source: &str) -> Result<Ast, CompilationFailure> {
             .collect(),
     };
 
-    // Constants collapse first, and everything after depends on it: a statically
-    // known value is a `Kind::Literal` from here on, so no later pass needs an
-    // evaluator of its own to recognise one. See `src/README.md`.
-    let program = rewrite::fold_constants(lowered.program).map_err(render)?;
-
-    // Then the monotone functions no solver will take are inverted away, while
-    // comparisons still exist to be matched on.
-    let program = rewrite::invert_monotone(program);
-
-    // Then aggregates over known bounds expand, which is also where a bound that
-    // is not a usable index stops being a run-time surprise.
-    let program = rewrite::unroll_aggregates(program).map_err(render)?;
+    // The canonical form: constants folded, monotone comparisons inverted,
+    // aggregates over known bounds unrolled, repeated factors collected into
+    // powers — in that order, for the reasons `rewrite::canonicalize` gives.
+    let program = rewrite::canonicalize(lowered.program).map_err(render)?;
 
     Ok(Ast {
         source: source.to_owned(),

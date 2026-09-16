@@ -1,7 +1,7 @@
 //! The evaluator: an `Ast` lowered to a flat tape, run a tile of samples at a
 //! time or one row at a time.
 //!
-//! `tape.rs` is the instruction set, `lower.rs` produces it, `regalloc.rs`
+//! `tape.rs` is the instruction set, `irgen.rs` produces it, `regalloc.rs`
 //! packs its temporaries, `differentiate.rs` turns a tape into the tape of
 //! its gradient, and the two executors — `tile.rs` for a batch, `lane.rs`
 //! for a row — run either. Every tape is straight-line: the front end
@@ -11,11 +11,11 @@
 //! the corpus, the runtime-error tests and `tests/special_values.rs`.
 
 mod differentiate;
+pub(crate) mod irgen;
 mod lane;
-mod lower;
 mod regalloc;
 mod simd;
-mod tape;
+pub(crate) mod tape;
 mod tile;
 pub(crate) mod wgsl;
 
@@ -26,6 +26,7 @@ use faer::{Col, Mat, MatRef};
 use crate::Ast;
 use crate::diagnostics::EvaluationFailure;
 use crate::diagnostics::{BindError, CompileError, Fault, Problem, RuntimeProblem};
+use crate::frontend::rewrite;
 
 use tape::{AllocatedTape, Register};
 use tile::{RegisterFile, TILE};
@@ -133,7 +134,8 @@ pub(crate) fn bind(
     for symbol in &ast.symbols {
         match schema.names.iter().position(|name| name == symbol) {
             Some(position) => {
-                global_positions.push(u32::try_from(position).unwrap_or(u32::MAX));
+                let pos = u32::try_from(position).unwrap_or(u32::MAX);
+                global_positions.push(pos);
             }
             None => missing.push(symbol.clone()),
         }
@@ -143,8 +145,11 @@ pub(crate) fn bind(
         return Err(BindError { missing });
     }
 
-    let virtual_tape = lower::lower(&ast.program, &global_positions, schema.len());
-    let gradient =
+    // The evaluator's own view of the tree: whole powers as the
+    // multiplications they are, which no other consumer wants.
+    let program = rewrite::unroll_powers(ast.program.clone());
+    let virtual_tape = irgen::emit(&program, &global_positions, schema.len());
+    let partial_diff =
         match gradient {
             Gradient::Never => None,
             Gradient::BestEffort => differentiate::differentiate(&virtual_tape, &global_positions)
@@ -158,7 +163,7 @@ pub(crate) fn bind(
 
     Ok(CompiledExpression {
         tape: virtual_tape.allocate(),
-        gradient,
+        gradient: partial_diff,
         source: ast.source.clone(),
         schema: schema.clone(),
         symbols: ast.symbols.clone(),

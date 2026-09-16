@@ -230,7 +230,7 @@ thing to read, and is the first work item rather than an admission.
 - [x] **`eval` desugars `a == b +/- t`; the AST keeps it.** Half of the entry
       below, and the half that turned out to be safe.
 
-      `eval::lower` emits `b - t`, `b + t`, a comparison against each and a
+      `eval::irgen` emits `b - t`, `b + t`, a comparison against each and a
       `Worst` fold. `Compare::Gte` is `right - left` and `Compare::Lte` is
       `left - right`, so the result is `max((b - t) - a, a - (b + t))` node for
       node — **bit-identical, and `corpus.rs` passes unchanged**, which is the
@@ -600,7 +600,7 @@ thing to read, and is the first work item rather than an admission.
       invisible to it.
 
       The same blind spot cost a real measurement once: there was no equality
-      case either, so desugaring `a == b +/- t` in `eval::lower` tripled the
+      case either, so desugaring `a == b +/- t` in `eval::irgen` tripled the
       instructions for that shape with the whole table still inside budget. A
       row was added. **The rule the miss suggests: every shape the evaluator
       gives a dedicated instruction deserves a row**, or removing that
@@ -2875,6 +2875,135 @@ price of a design that is a pure function of its seed. The default `solve` on be
 count of contractions, and a contraction at 200 variables walks every constraint's tree
 per coordinate); without `Strategy::Prune` it is 21 ms. Both are pre-existing, both are
 recorded here as the next two performance items rather than fixed.
+
+**2026-09-16: where a design's time goes, by count and by flame graph.** A `judged` tally on
+the walker (`burn_in` and `walk` spans at `debug`) and a `samply` run on
+`tests/profiling.rs::a_design_on_the_100_segment_beam` (200 variables, two dense
+constraints, 14 s in release). The counts: burn-in is 8 chains × 3200 steps, 39k candidates
+judged, 4.1 s; the walk is 148 pool points × 400 steps of thinning, 107k judged, 9.9 s; one
+`is_feasible` is 20 µs. So a step costs ~100 µs per candidate judged, and the flame graph
+says where the other 80 µs are: `axis_chord` → `interval::slice` → `narrow`, the HC4 pass
+over the *AST* of the two deflection sums, with `alloc::vec` under every node — `Narrowing::
+backward` re-runs `forward` on each subtree it descends into, and `in_expr` collects a `Vec`
+per fold. `is_feasible` is ~10%, all of it the count (the walker judges every constraint on
+every candidate; an axis move can change four of 201). In order of expected payoff:
+
+- [x] **The interval tape.** Compile each constraint's narrowing once, at
+      `ConstraintSystem::new`, to the *virtual* (SSA, unallocated) tape `eval::irgen` already
+      produces — every intermediate written once, which is what HC4's backward pass needs —
+      and run it as two straight-line sweeps over a preallocated frame of intervals: forward,
+      one interval per register; backward, in reverse, each instruction narrowing its
+      operands from its result through the `invert_*` rules that exist today. No recursion,
+      no re-evaluation, no allocation per call; the root's truth (`<= 0`, `± t`) is pushed
+      onto the two sides' registers, and the wanted coordinate is read off its `Load`s. The
+      shape of `eval/differentiate.rs`, over the same instruction set; `Gather` declines as
+      it does there and the constraint narrows nothing, as now. Lives in `cvg`, beside the
+      interval arithmetic it drives. Expected 5–10× on the narrowing, which is ~75% of a walk.
+
+      **Spiked 2026-09-16** (a test-only HC4 over the virtual tape, deleted after the
+      measurement): on beam-100's deflection constraint — 200 symbols, 2802 instructions —
+      the AST walk is 174–185 µs a narrowing and the tape 21.8 µs, **8.5×**; on a local
+      two-variable constraint 431 ns against 221 ns, 2×. Three things the spike settled:
+      *(i)* the tape's forward pass is the floor, 18.6 µs at ~7 ns an interval op with the
+      ulp padding; the backward pass was the other 30 µs until a per-slot bitset of the
+      inputs each value depends on, computed once at compile time, let it skip every
+      instruction that cannot reach the wanted input — a `sum` hands a requirement to every
+      term and only one term holds the coordinate — after which it is ~3 µs. *(ii)* The
+      emitter's `x^n → x·x·…·x` is the right transform for evaluation and a lossy one for
+      narrowing: the inverse through repeated multiplication by `h ∈ [5, 100]` gave
+      `[5, 100]` where `invert_power`'s root enclosure gives `[26.1, 100]`. The interval
+      tape therefore keeps `Pow` with a literal exponent as one instruction (an option on
+      `lower`), forward by `power`, backward by `invert_power`. Exactly where an AST
+      transform happens turns out to matter per consumer; accepted as a per-consumer option
+      rather than a second lowering, and revisited only when a test needs the interval side
+      to reason harder. *(iii)* `a == b ± t` needs no special root: the emitter already
+      emits it as two `Compare`s under `Worst`, and `max ≤ hi ⇒ both ≤ hi` recovers
+      `a − b ∈ [−t, t]` exactly. Amdahl: ~3× on a 200-variable design from the tape alone,
+      4–5× with burn-in in `solve` and affected-only judging. The floor after that is the
+      forward pass, and the only way under it is incremental evaluation across the walker's
+      axis moves (one coordinate changes per move) — noted, not planned.
+
+      **Built 2026-09-16**: `cvg/hc4.rs`. `hc4::compile` lowers the canonical tree
+      as parsed, whole powers intact (the evaluator unrolls them on its own copy first —
+      see the next item), takes it to single assignment (`VirtualTape::single_assignment`,
+      now shared with `differentiate`), numbers the registers into dense slots and computes
+      the per-slot dependency bitset; `narrow` is the two sweeps over caller-owned `Frames`;
+      `slice` moved in beside it, leaving `interval.rs` the arithmetic.
+      `Constraint` carries its narrower beside its tape and gradient; `slice_conditioned`
+      and `prune::contract` run it; the AST walker (`in_expr`, `Narrowing`) is gone. The
+      whole interval test suite — containment against the evaluator, the sweep-based
+      soundness of every inverse, the whole-power root — passes unchanged on the tape, and
+      `a_whole_power_narrows_through_its_root` alone fell from 14 s to under a second in
+      debug. Release: the 200-variable beam design 14.1 s → **3.4 s**; the 99-equation chain
+      2.1 → 1.8 s; the full test suite 61 s → 31 s. The conjunction rule
+      (`worst(a, b) ≤ hi ⇒ a ≤ hi ∧ b ≤ hi`) is the `Combine { Worst }` instruction's
+      inverse wherever it sits, and a user's `max(a, b)` still answers `ENTIRE`.
+- [x] **Powers get a canonical form at parse — the whole-power half.** `a*a*a`, `a^3`
+      and `a^(6/2)` reached every consumer as written, so narrowing quality depended on
+      spelling: `h*h` inverted through `Mul` (weak) where `h^2` inverted through its root.
+      Built 2026-09-16, test-first: `rewrite::canonicalize` names the pass sequence `parse`
+      runs and ends with `collect_powers` — `f * f`, `(f * f) * f`, `f * (f * f)`,
+      `f^n * f^m`, `prod(1, n, i -> f)` become `Pow(f, n)` whatever the grouping. The one
+      pass that is not bit-exact, decided so: the unroll multiplies left to right, so a
+      right-associated spelling can move by an ulp, and one power with one tape and one
+      bound was worth more than a spelling's rounding (a `powf` would round differently
+      again). The reds that
+      drove it: the parsed tree is a power; `h * h < 9` narrows `h` to `[0, 3]`, the same
+      bound as `h^2 < 9`; the tapes of `f*f*f*f` and `f^4` are the same length. Then
+      `WholePowers` went: `rewrite::unroll_powers` is the evaluator's own pass, applied in
+      `eval::bind` on a copy of the tree, `(t·t)·t` with a compound base bound to a fresh
+      `let` (the first pass to mint a slot), and the emitter knows nothing about powers. A
+      property test pins that the tree before and after collecting evaluates to the same
+      bits where the order was kept and within four ulps where it was not. The narrower's
+      slices moved by ulps against the AST walk's (its chain inverse
+      through a sum is the Gauss–Seidel form where the walk was Jacobi), so the walker's
+      tallies on the beam shifted by under one percent; both are sound supersets.
+
+- [ ] **Canonical form, the rest.** Candidates, each wanting a red test first:
+      - *Rational and half exponents.* `expr^0.5` and `expr^(1/2)` are `sqrt(expr)`, which
+        has an inverse (`invert_unary`) and a cheap kernel where a real-exponent `Pow` has
+        neither; `^(1/3)` is `cbrt`. `^(3/2)` and the general `expr^(p/q)` want an
+        `nth_root` the arithmetic does not have — `root_enclosure` is the interval half of
+        one; the evaluator half is `powf`, which is what it does today, so only the
+        narrowing side gains.
+      - *The unary spellings.* `sqr(x)`, `cube(x)` and `x^2`, `x^3` are one thing; fold the
+        unary forms into `Pow` (or the other way) so the evaluator's unroll and the
+        narrower's root see one node kind. `abs(x)^2` is `x^2`, exactly.
+      - *Operand order.* `a * b` and `b * a` (and `+`) are the same bits in IEEE, so sorting
+        a commutative node's two operands by a canonical order costs nothing and makes the
+        two spellings one shape — the precondition for the next item to find them.
+        Reassociating a chain is not exact and is not this.
+      - *Duplicate subexpressions into a `let`.* A non-leaf subtree that occurs twice
+        (structurally, `same_shape`) is computed once: bind it in the nearest enclosing
+        block and read the local. `collect_powers` is the special case where the two
+        occurrences are the factors of one product; `unroll_powers`'s slot-minting is the
+        mechanism. Open questions before building: a depth or cost threshold below which a
+        recomputation is cheaper than a slot; scoping when the occurrences sit in different
+        blocks; and fault order — a shared subtree faults once, at one span, where the
+        duplicates faulted at the first evaluated, which the diagnostics tests pin. Arguably
+        the evaluator's concern alone, but the narrower reads the same tree and a value
+        computed once is one slot for it too.
+      - *Identities that are exact.* `x * 1`, `x / 1`, `x^1` are `x` to the bit; `x + 0` is
+        not (`-0.0 + 0.0` is `0.0`), so it stays.
+- [ ] **Burn-in into `solve`.** The walker is fresh per `sample` call so that a design is a
+      pure function of `(region, existing, count, seed)`; the chains' burn-in — 30% of the
+      profile — is a function of the region alone and can be paid once, the region holding
+      the eight burnt-in chains and the preconditioner (`d×d`, 320 KB at 200) and `sample`
+      cloning them to walk from. Still pure, still seeded.
+- [ ] **Judge only what a move touched.** An axis move changes one coordinate;
+      `Incidence::affected` names the constraints that read it, and the walker calls
+      `is_feasible` over all of them. ~2× on the axis half of the judgements.
+- [ ] **Thinning for a design.** `THINNING_PER_DIMENSION = 2` decorrelates a *uniform
+      sample*; a design is chosen farthest-first from the pool and wants spread, not
+      independence. A count knob to measure after the tape lands, since it changes what the
+      pool is rather than how fast it is made.
+- [ ] **Batch the shrink loop.** Judge several draws along the chord through the SIMD tile
+      at once and take the first feasible in order; where the "SIMD × cores" question (rayon
+      for brute force, a parked global pool or a per-call one) would land.
+- [ ] **The rng at the API.** A seed on the builder *and* on `sample` is unidiomatic;
+      `solve(&system, &mut rng)`, `sample(existing, count, &mut rng)` — and `repair` needs
+      none — is the standard shape, and makes "same generator state, same answer" the
+      caller's contract. Deferred until the surface settles.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),

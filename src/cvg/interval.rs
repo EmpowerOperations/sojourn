@@ -1,10 +1,16 @@
-//! Interval arithmetic, and what an expression evaluates to over a box.
+//! Interval arithmetic: the image of each operator over a box, and what each
+//! operand must be for the image to land somewhere.
 //!
 //! # What it is for
 //!
 //! The walker's central question is *conditional*: with every other coordinate
 //! held where it is, what values may this one take? Answering it needs an
 //! expression evaluated over a set rather than a point, which is what this is.
+//! The evaluation itself — forward over a constraint, then backward through
+//! these inverses — is HC4-revise over the constraint's tape, in
+//! [`hc4`](super::hc4), with [`hc4::slice`](super::hc4::slice) asking it
+//! across every constraint naming a coordinate. This module is the arithmetic
+//! it runs.
 //!
 //! # The only invariant that matters
 //!
@@ -31,9 +37,7 @@
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, UnaryOp};
-use crate::cvg::incidence::Row;
-use crate::{Ast, ConstraintSystem, Point};
+use crate::ast::{BinaryOp, UnaryOp};
 
 /// A closed interval of reals, represented by two `f64` endpoints.
 ///
@@ -87,19 +91,21 @@ impl Interval {
         self.hi
     }
 
-    /// Negated deliberately, and clippy is told so below.
-    ///
-    /// `lo > hi` would answer *false* for a `NaN` endpoint, letting it through
-    /// to `width` and then to `random_range`, which panics on a `NaN` bound.
-    /// The negated form reads `NaN` as empty, so a caller skips the coordinate
-    /// and the walk stands still instead of dying. `new` already keeps `NaN`
-    /// out; this is the belt to that pair of braces.
-    #[allow(
-        clippy::neg_cmp_op_on_partial_ord,
-        reason = "a NaN endpoint must read as empty rather than as a usable interval"
-    )]
+    /// Empty is `lo > hi`, and that is the whole test because an endpoint is
+    /// never `NaN`: [`new`](Self::new) turns one into [`ENTIRE`](Self::ENTIRE),
+    /// the constants are finite or infinite, and `widened` only moves an
+    /// endpoint by ulps. The fields are private to this module, so that is a
+    /// discipline the compiler does not enforce; this is the function that
+    /// relies on it — a `NaN` would read as non-empty and reach `width`, then
+    /// `random_range`, which panics on a `NaN` bound — so it asserts it, in
+    /// every build. Two comparisons on the hottest path in the crate,
+    /// measured as nothing.
     pub(crate) fn is_empty(self) -> bool {
-        !(self.lo <= self.hi)
+        assert!(
+            !self.lo.is_nan() && !self.hi.is_nan(),
+            "an interval endpoint is never NaN: {self:?}"
+        );
+        self.lo > self.hi
     }
 
     /// The width, or zero when empty. Infinite for an unbounded interval.
@@ -146,6 +152,12 @@ impl Interval {
             result.lo = result.lo.next_down();
             result.hi = result.hi.next_up();
         }
+        // The one place an endpoint is written outside `new`, so the one
+        // place the invariant is re-established rather than relied on.
+        assert!(
+            !result.lo.is_nan() && !result.hi.is_nan(),
+            "widening kept an endpoint finite or infinite: {result:?}"
+        );
         result
     }
 
@@ -365,7 +377,7 @@ fn whole_power(x: f64, n: u32) -> f64 {
 /// minimum at zero, odd ones are monotone, and a negative `n` is the reciprocal
 /// of the positive one — through the division rule, so a base straddling zero
 /// answers everything, which is the truth.
-fn power(x: Interval, n: i64) -> Interval {
+pub(crate) fn power(x: Interval, n: i64) -> Interval {
     let count = u32::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
     let positive = if count == 0 {
         Interval::point(1.0)
@@ -419,363 +431,7 @@ fn crosses(x: Interval, offset: f64, period: f64) -> bool {
     first <= x.hi
 }
 
-/// Folds already-evaluated terms, seeding from the fold's identity exactly as
-/// `lower::fold` does.
-fn fold(kind: AggregateKind, terms: &[Interval]) -> Interval {
-    let op = match kind {
-        AggregateKind::Sum => BinaryOp::Add,
-        AggregateKind::Prod => BinaryOp::Mul,
-    };
-    terms
-        .iter()
-        .fold(Interval::point(kind.identity()), |accumulated, term| {
-            binary(op, accumulated, *term)
-        })
-}
-
 // -------------------------------------------------------- over an expression
-
-fn in_expr(expr: &Expr, globals: &[Interval], frame: &mut Vec<Interval>) -> Interval {
-    match &expr.kind {
-        Kind::Literal(value) => Interval::point(*value),
-        Kind::Global(id) => globals.get(id.index()).copied().unwrap_or(Interval::ENTIRE),
-        Kind::Local(slot) => frame.get(slot.index()).copied().unwrap_or(Interval::ENTIRE),
-
-        Kind::Unary { op, arg } => unary(*op, in_expr(arg, globals, frame)),
-        Kind::Binary { op, lhs, rhs } => {
-            if *op == BinaryOp::Pow
-                && let Some(n) = rhs.whole_exponent()
-            {
-                return power(in_expr(lhs, globals, frame), n);
-            }
-            let a = in_expr(lhs, globals, frame);
-            let b = in_expr(rhs, globals, frame);
-            binary(*op, a, b)
-        }
-        Kind::Fold { kind, terms } => {
-            let evaluated: Vec<Interval> = terms
-                .iter()
-                .map(|term| in_expr(term, globals, frame))
-                .collect();
-            fold(*kind, &evaluated)
-        }
-        Kind::Block(block) => in_block(block, globals, frame),
-
-        // A computed subscript reads a coordinate chosen by the point itself,
-        // so there is no static answer. This one is permanent rather than
-        // pending: `ConstraintSystem::new` resolves every subscript it can, and
-        // what survives is genuinely unknowable.
-        Kind::DynamicIndex(_) => Interval::ENTIRE,
-
-        // The residual convention is the evaluator's and nothing here wants it.
-        // A boolean's *truth* is where propagation starts, and that arrives as
-        // a target interval rather than as a value.
-        Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. } => Interval::ENTIRE,
-
-        // `unroll_aggregates` runs during `parse` and run-time-bounded
-        // aggregates were removed, so this should be unreachable. Answering
-        // rather than panicking keeps the promise that this is total.
-        Kind::Aggregate { .. } => Interval::ENTIRE,
-    }
-}
-
-fn in_block(block: &Block, globals: &[Interval], frame: &mut Vec<Interval>) -> Interval {
-    for assignment in &block.assignments {
-        let value = in_expr(&assignment.value, globals, frame);
-        let slot = assignment.slot.index();
-        if frame.len() <= slot {
-            frame.resize(slot + 1, Interval::ENTIRE);
-        }
-        frame[slot] = value;
-    }
-    in_expr(&block.result, globals, frame)
-}
-
-// ------------------------------------------------------------- over a system
-
-/// The interval `coordinate` may take with every other coordinate held at its
-/// value in `point`.
-///
-/// The declared box, narrowed by each constraint naming the coordinate in turn
-/// through [`narrow`]. **A superset of the feasible slice**, so a value drawn
-/// from it is still judged by [`ConstraintSystem::is_feasible`] like any other
-/// candidate — see the module doc for why that leaves the distribution alone.
-///
-/// Constraints are applied in order and each sees what the previous ones
-/// concluded, so a system narrows further than any one of its constraints
-/// would. Nothing here iterates to a fixpoint: every coordinate but this one
-/// is a point, which leaves a second pass with nothing to tighten.
-pub(crate) fn slice(system: &ConstraintSystem, point: &Point, coordinate: usize) -> Interval {
-    slice_conditioned(system, point, coordinate, None)
-}
-
-/// [`slice`], optionally ignoring constraints that mention a coordinate whose
-/// value is about to change.
-///
-/// `settled[row]` says the point's value there is one to condition on. A
-/// constraint naming an unsettled coordinate is skipped, because narrowing
-/// against a value that is about to be overwritten conditions on a stale
-/// number — see [`retract`](crate::cvg::classify::retract), which is the only
-/// caller that passes a mask.
-pub(crate) fn slice_conditioned(
-    system: &ConstraintSystem,
-    point: &Point,
-    coordinate: usize,
-    settled: Option<&[bool]>,
-) -> Interval {
-    let input = &system.variables[coordinate];
-    let mut interval = Interval::new(input.lower_bound, input.upper_bound);
-
-    let coordinate = Row(coordinate);
-    for id in system.incidence.naming(coordinate) {
-        let rows = system.incidence.rows_of(*id);
-        if let Some(settled) = settled
-            && rows
-                .iter()
-                .any(|row| *row != coordinate && !settled[row.index()])
-        {
-            continue;
-        }
-        let wanted = rows
-            .iter()
-            .position(|row| *row == coordinate)
-            .expect("`naming` lists only constraints that name the coordinate");
-
-        // The constraint's symbols, in its own order, as intervals: a point
-        // for everything held, and the running narrowing for the one asked
-        // about.
-        let globals: Vec<Interval> = rows
-            .iter()
-            .enumerate()
-            .map(|(symbol, row)| {
-                if symbol == wanted {
-                    interval
-                } else {
-                    Interval::point(point[row.index()])
-                }
-            })
-            .collect();
-
-        let wanted = u32::try_from(wanted).expect("fewer than four billion symbols");
-        interval = interval.intersect(narrow(
-            &system.constraints[id.index()].written,
-            &globals,
-            GlobalId::from_index(wanted),
-        ));
-        if interval.is_empty() {
-            break;
-        }
-    }
-
-    interval
-}
-
-// ------------------------------------------------------------------ backward
-
-/// The interval `wanted` may take if `constraint` is to hold, with every other
-/// variable at the interval `globals` gives it.
-///
-/// This is HC4-revise: evaluate forward to learn what each subexpression can
-/// be, then walk back down pushing the requirement that the constraint be
-/// *true* through each operator's inverse. The backward step is the same table
-/// [`classify::isolate`](super::classify) uses to rearrange an expression, and
-/// `rewrite::monotone` uses to invert a comparison — applied to intervals.
-///
-/// [`Interval::ENTIRE`] means "nothing concluded", which is the answer for
-/// every operator without an inverse here and for anything not a constraint.
-/// Returning it is always safe: the caller intersects with the declared box and
-/// is back to searching the coordinate's whole range.
-///
-/// The result is a **superset** of the values that satisfy the constraint, for
-/// the same reason everything else here is. Where `wanted` occurs more than
-/// once each occurrence contributes a necessary condition, and their
-/// intersection is still one — sound, and weaker than a solve.
-pub(crate) fn narrow(constraint: &Ast, globals: &[Interval], wanted: GlobalId) -> Interval {
-    let body = &constraint.program.body;
-
-    let mut frame: Vec<Interval> = Vec::new();
-    for assignment in &body.assignments {
-        let value = in_expr(&assignment.value, globals, &mut frame);
-        let slot = assignment.slot.index();
-        if frame.len() <= slot {
-            frame.resize(slot + 1, Interval::ENTIRE);
-        }
-        frame[slot] = value;
-    }
-
-    let mut state = Narrowing {
-        globals,
-        frame,
-        wanted,
-        found: Interval::ENTIRE,
-        slots: Vec::new(),
-    };
-    state.root(&body.result);
-
-    // Assignments in reverse, so a target collected on a `let` slot reaches the
-    // expression that computed it, and an earlier binding sees what a later one
-    // required of it.
-    for assignment in body.assignments.iter().rev() {
-        let target = state
-            .slots
-            .get(assignment.slot.index())
-            .copied()
-            .unwrap_or(Interval::ENTIRE);
-        if target != Interval::ENTIRE {
-            state.backward(&assignment.value, target);
-        }
-    }
-
-    state.found
-}
-
-struct Narrowing<'a> {
-    globals: &'a [Interval],
-    frame: Vec<Interval>,
-    wanted: GlobalId,
-    /// What has been concluded about `wanted` so far. Every occurrence
-    /// intersects into it.
-    found: Interval,
-    /// The same, per `let` slot, collected on the way down and discharged
-    /// against the assignments afterwards.
-    slots: Vec<Interval>,
-}
-
-impl Narrowing<'_> {
-    /// Turns a constraint's truth into a target interval, which is the only
-    /// place the *kind* of boolean is read.
-    ///
-    /// Everything below is one uniform backward pass, which is why desugaring
-    /// `a == b +/- t` to a conjunction of two bounds would change nothing:
-    /// `(-inf, t]` intersected with `[-t, inf)` is the interval this reads off
-    /// the tolerance directly.
-    fn root(&mut self, expr: &Expr) {
-        match &expr.kind {
-            Kind::Compare { op, lhs, rhs } => {
-                let target = match op {
-                    CompareOp::Lt | CompareOp::Lte => Interval::new(f64::NEG_INFINITY, 0.0),
-                    CompareOp::Gt | CompareOp::Gte => Interval::new(0.0, f64::INFINITY),
-                };
-                // A strict comparison is given the closed interval. One point
-                // wider than the truth, and the endpoint is rejected downstream
-                // like any other infeasible proposal.
-                self.difference(lhs, rhs, target);
-            }
-            Kind::NearEq {
-                lhs,
-                rhs,
-                tolerance,
-            } => self.difference(lhs, rhs, Interval::new(-*tolerance, *tolerance)),
-            Kind::And { terms } => {
-                for term in terms {
-                    self.root(term);
-                }
-            }
-            // Not a constraint, so there is no truth to propagate.
-            _ => {}
-        }
-    }
-
-    /// Pushes `target` onto `lhs - rhs`, which is not a node in the tree — the
-    /// comparison holds the two sides apart. The inverses are `Sub`'s.
-    ///
-    /// First the forward check: the difference's enclosure is a superset of
-    /// what it can be, so an enclosure that misses `target` altogether means
-    /// the constraint holds nowhere on this box, whatever its inverses can
-    /// or cannot say — `x^1.234 > 1000000` on `[0, 10]` is settled here, with
-    /// no inverse for a real exponent needed. The conclusion is `EMPTY`, the
-    /// one thing distinct from "nothing concluded".
-    fn difference(&mut self, lhs: &Expr, rhs: &Expr, target: Interval) {
-        let left = self.forward(lhs);
-        let right = self.forward(rhs);
-        if binary(BinaryOp::Sub, left, right)
-            .intersect(target)
-            .is_empty()
-        {
-            self.found = Interval::EMPTY;
-            return;
-        }
-        self.backward(lhs, binary(BinaryOp::Add, target, right));
-        self.backward(rhs, binary(BinaryOp::Sub, left, target));
-    }
-
-    fn forward(&mut self, expr: &Expr) -> Interval {
-        in_expr(expr, self.globals, &mut self.frame)
-    }
-
-    /// Requires `expr` to lie in `target`, and concludes what it can about
-    /// `wanted` from that.
-    fn backward(&mut self, expr: &Expr, target: Interval) {
-        if target == Interval::ENTIRE {
-            return;
-        }
-        match &expr.kind {
-            Kind::Global(id) if *id == self.wanted => {
-                self.found = self.found.intersect(target);
-            }
-
-            Kind::Local(slot) => {
-                let slot = slot.index();
-                if self.slots.len() <= slot {
-                    self.slots.resize(slot + 1, Interval::ENTIRE);
-                }
-                self.slots[slot] = self.slots[slot].intersect(target);
-            }
-
-            Kind::Unary { op, arg } => {
-                let current = self.forward(arg);
-                let required = invert_unary(*op, target, current);
-                self.backward(arg, current.intersect(required));
-            }
-
-            Kind::Binary { op, lhs, rhs } => {
-                // A whole power is inverted through its root, the way `sqr`
-                // and `cube` are; the literal exponent has nothing to learn.
-                if *op == BinaryOp::Pow
-                    && let Some(n) = rhs.whole_exponent()
-                {
-                    let current = self.forward(lhs);
-                    let required = invert_power(target, n, current);
-                    self.backward(lhs, current.intersect(required));
-                    return;
-                }
-                let left = self.forward(lhs);
-                let right = self.forward(rhs);
-                let (a, b) = invert_binary(*op, target, left, right);
-                self.backward(lhs, left.intersect(a));
-                self.backward(rhs, right.intersect(b));
-            }
-
-            // A sum narrows each term against the target less the others, which
-            // is `Add`'s inverse applied once per term. A product would need
-            // the same with division, and division by a term straddling zero
-            // concludes nothing, so it is left alone.
-            Kind::Fold {
-                kind: AggregateKind::Sum,
-                terms,
-            } => {
-                let values: Vec<Interval> = terms.iter().map(|term| self.forward(term)).collect();
-                let total = fold(AggregateKind::Sum, &values);
-                for (term, value) in terms.iter().zip(&values) {
-                    let others = binary(BinaryOp::Sub, total, *value);
-                    let required = binary(BinaryOp::Sub, target, others);
-                    self.backward(term, value.intersect(required));
-                }
-            }
-
-            Kind::Block(block) => {
-                // The result carries the target; the assignments were already
-                // evaluated forward into the frame by whoever built it.
-                self.backward(&block.result, target);
-            }
-
-            // A literal cannot be narrowed, a global that is not the one asked
-            // about tells us nothing about the one that was, and everything
-            // else has no inverse here.
-            _ => {}
-        }
-    }
-}
 
 /// Whether [`invert_binary`] has an inverse for `op`, rather than declining.
 ///
@@ -811,7 +467,12 @@ pub(crate) const fn invertible_unary(op: UnaryOp) -> bool {
 /// The seven arithmetic rules of `classify::isolate`, as intervals. Anything
 /// without an entry answers [`Interval::ENTIRE`] twice, which narrows nothing
 /// and is always safe.
-fn invert_binary(op: BinaryOp, target: Interval, a: Interval, b: Interval) -> (Interval, Interval) {
+pub(crate) fn invert_binary(
+    op: BinaryOp,
+    target: Interval,
+    a: Interval,
+    b: Interval,
+) -> (Interval, Interval) {
     match op {
         // `a + b in T` means `a in T - b` and `b in T - a`.
         BinaryOp::Add => (
@@ -844,7 +505,7 @@ fn invert_binary(op: BinaryOp, target: Interval, a: Interval, b: Interval) -> (I
         // `classify::isolate` gives; `log` because it would want its base held
         // apart from one, which is more bookkeeping than the narrowing is
         // worth until something needs it. A whole exponent never arrives:
-        // `backward` inverts it through its root before consulting this table.
+        // the narrower inverts it through its root before consulting this table.
         _ => (Interval::ENTIRE, Interval::ENTIRE),
     }
 }
@@ -855,7 +516,7 @@ fn invert_binary(op: BinaryOp, target: Interval, a: Interval, b: Interval) -> (I
 /// non-injective rows possible: `sqr(u) in [4, 9]` says `u` is in `[-3, -2]` or
 /// `[2, 3]`, and intersecting the hull of those with a `current` on one side of
 /// zero recovers the branch without representing a union.
-fn invert_unary(op: UnaryOp, target: Interval, current: Interval) -> Interval {
+pub(crate) fn invert_unary(op: UnaryOp, target: Interval, current: Interval) -> Interval {
     match op {
         UnaryOp::Negate => Interval::exact(-target.hi, -target.lo),
 
@@ -941,7 +602,7 @@ fn symmetric(positive: Interval, current: Interval) -> Interval {
 /// negative `n` is inverted through the reciprocal first, after which a target
 /// straddling zero concludes nothing — which is the truth, since the base can
 /// then be anything large.
-fn invert_power(target: Interval, n: i64, current: Interval) -> Interval {
+pub(crate) fn invert_power(target: Interval, n: i64, current: Interval) -> Interval {
     let count = u32::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
     if count == 0 {
         return Interval::ENTIRE;
@@ -1016,7 +677,8 @@ mod tests {
 
     use crate::ast::GlobalId;
 
-    use super::{Interval, in_block, slice};
+    use super::Interval;
+    use crate::cvg::hc4::{self, Frames, slice};
     use crate::eval;
     use crate::system::tests::system;
     use crate::{Ast, InputVariable, Point};
@@ -1182,13 +844,10 @@ mod tests {
     /// Total, like everything else here: a node it cannot read answers
     /// [`Interval::ENTIRE`].
     ///
-    /// Only the tests call this: `narrow` runs the forward pass itself, interleaved
-    /// with the backward one so that each node's operands are evaluated where they
-    /// are needed. This is the same walk with nothing to invert, and it is what the
+    /// The narrower's forward sweep with nothing to invert, which is what the
     /// containment property is stated against.
-    pub(crate) fn evaluate(ast: &Ast, globals: &[Interval]) -> Interval {
-        let mut frame: Vec<Interval> = Vec::new();
-        in_block(&ast.program.body, globals, &mut frame)
+    fn evaluate(ast: &Ast, globals: &[Interval]) -> Interval {
+        hc4::compile(ast).evaluate(globals, &mut Frames::default())
     }
 
     /// Points drawn per expression. Enough that a wrong sign or a missed
@@ -1786,7 +1445,11 @@ mod tests {
             .collect();
 
         let index = u32::try_from(position).expect("fewer than four billion symbols");
-        super::narrow(&ast, &globals, GlobalId::from_index(index))
+        hc4::compile(&ast).narrow(
+            &globals,
+            GlobalId::from_index(index),
+            &mut Frames::default(),
+        )
     }
 
     /// **The soundness check for the backward pass.**
@@ -2081,6 +1744,20 @@ mod tests {
         ] {
             assert_narrows_nothing(source, "x1", (-10.0, 10.0), &[("x2", 1.0)]);
         }
+    }
+
+    /// The bound must not depend on how the power was spelled: `h * h` is
+    /// `h^2` and narrows through its root, not through `Mul`'s inverse, which
+    /// divides by `h`'s whole range and concludes nothing.
+    #[test]
+    fn a_product_of_a_term_with_itself_narrows_as_its_power() {
+        let spelled_as_product = narrowed("h * h < 9", "h", (0.0, 10.0), &[]);
+        let spelled_as_power = narrowed("h^2 < 9", "h", (0.0, 10.0), &[]);
+        assert!(
+            spelled_as_power.hi() >= 3.0 && spelled_as_power.hi() < 3.0 + 1e-9,
+            "{spelled_as_power:?}"
+        );
+        assert_eq!(spelled_as_product, spelled_as_power);
     }
 
     /// A whole power narrows like `sqr` and `cube`: the even root picks its

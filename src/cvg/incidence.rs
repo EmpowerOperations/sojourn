@@ -113,7 +113,7 @@ impl Incidence {
     /// it is the search's business and not the graph's — see
     /// `ConstraintSystem::new`, where both entries are soundness rather than
     /// efficiency. The readers are the repair clamp's per-coordinate filter
-    /// and `interval::slice`.
+    /// and `hc4::slice`.
     pub(crate) fn with_always(mut self, always: &[ConstraintId]) -> Self {
         for constraints in &mut self.affected {
             constraints.extend_from_slice(always);

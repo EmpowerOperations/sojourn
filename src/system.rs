@@ -24,6 +24,7 @@
 use faer::MatRef;
 
 use crate::cvg::classify;
+use crate::cvg::hc4::{self, IntervalTape};
 use crate::cvg::incidence::{ConstraintId, Incidence, Row};
 use crate::diagnostics::CompilationFailure;
 use crate::eval::Gradient;
@@ -86,13 +87,15 @@ impl std::fmt::Display for ConstraintRef {
 /// Kept as a pair rather than two parallel lists because everything that
 /// indexes one indexes the other by the same [`ConstraintId`], and two lists
 /// aligned only by the loop that built them are one refactor from silently
-/// disagreeing. The AST is what narrowing walks; the tape is what every
+/// disagreeing. The AST is what the classifier reads; the tape is what every
 /// feasibility check runs, and its gradient, compiled alongside where the
-/// constraint has one, is what a projection's Newton step reads.
+/// constraint has one, is what a projection's Newton step reads; the interval
+/// tape is the same tape over intervals, what every slice and contraction runs.
 #[derive(Debug, Clone)]
 pub(crate) struct Constraint {
     pub(crate) written: Ast,
     pub(crate) compiled: CompiledExpression,
+    pub(crate) intervals: IntervalTape,
 }
 
 impl Constraint {
@@ -342,7 +345,11 @@ impl ConstraintSystem {
         let constraints = resolved
             .into_iter()
             .zip(compiled)
-            .map(|(written, compiled)| Constraint { written, compiled })
+            .map(|(written, compiled)| Constraint {
+                intervals: hc4::compile(&written),
+                written,
+                compiled,
+            })
             .collect();
 
         Ok(Self {

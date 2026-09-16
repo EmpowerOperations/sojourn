@@ -118,7 +118,7 @@ easier to *analyse*, it belongs in `frontend::rewrite`; if it makes it faster to
 *run*, it belongs in `eval`; if it makes it *narrowable*, in `cvg::interval`.
 The `<= 0 is true` residual convention is `eval`'s, not the language's.
 
-`a == b +/- t` is the worked example of that seam. `eval::lower` desugars it into
+`a == b +/- t` is the worked example of that seam. `eval::irgen` desugars it into
 `b - t`, `b + t`, a comparison against each, and a `Worst` fold — `Compare::Gte`
 is `right - left` and `Compare::Lte` is `left - right`, so the result is
 `max((b - t) - a, a - (b + t))` node for node, and `corpus.rs` pins that by
@@ -208,7 +208,7 @@ chains across the tie. Three rules hold the whole thing up:
 a variable that occurs **exactly once** (*linear* in it, in the term-rewriting
 sense) can all be undone, so `x1 + x2 == 3` drives `x1`. It answers *whether*,
 not *what*: it used to build the rearrangement `3 - x2` for `retract` to
-evaluate, and `interval::slice` derives that band by narrowing the constraint
+evaluate, and `hc4::slice` derives that band by narrowing the constraint
 itself, so the expression lost its consumer and the walk down the path is all
 that survives. The arithmetic those rules encoded lives in
 `interval::invert_binary`, tested there against the same cases — the two arms
@@ -241,11 +241,21 @@ symbols while `var[i]` indexes the schema. After that
 `Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
 than "a subscript", and nothing downstream special-cases one.
 
-**A constraint says what interval a coordinate may take.** `cvg::interval` is
-HC4-revise: evaluate an expression forward over a box, then push the requirement
-that the constraint be *true* back down through each operator's inverse.
-`interval::slice` intersects that across every constraint naming a coordinate, and
-both the walker's axis moves and `retract` draw from it.
+**A constraint says what interval a coordinate may take.** `cvg::hc4` is
+HC4-revise over the constraint's *tape*: the evaluator's IR in single assignment
+(`VirtualTape::single_assignment`), lowered from the canonical tree with its
+whole powers intact (the evaluator unrolls them on its own copy first,
+`rewrite::unroll_powers` — `x·x·x` over intervals is wider than `x³` and inverts
+worse), compiled once per constraint at `ConstraintSystem::new`. One forward
+sweep computes every instruction's interval into a slot; one backward sweep,
+from the requirement that the residual be `<= 0`, pushes each instruction's
+requirement onto its operands through the inverses in `cvg::interval`, skipping
+every instruction whose dependency bitset says it cannot reach the wanted
+symbol. `hc4::slice` intersects that across every constraint naming a
+coordinate, and both the walker's axis moves and `retract` draw from it. The
+tape replaced a walk over the AST that re-evaluated every subtree it descended
+into — 8.5× on a 200-term sum, a 200-variable design 14 s → 3.4 s — with the
+same containment and soundness tests passing unchanged.
 
 **Every interval is a superset of what it models, and that asymmetry is the
 whole design.** A value drawn from a superset and then judged by `is_feasible`
@@ -289,7 +299,7 @@ together. Its fields are crate-visible and it answers the simple questions
 only: `is_feasible` (with a clearance) and `worst_residual`. The moves are the
 engine's, as free functions over `&ConstraintSystem` in the module that owns
 the idea — `classify::retract`, `classify::settle` and `classify::centre` for
-the plan, `interval::slice` for the narrowing question, `prune::contract` and
+the plan, `hc4::slice` for the narrowing question, `prune::contract` and
 `prune::bisect` for the box. There is no wrapper type around the system.
 
 **`FeasibleRegion` is the solved system.** `ConstraintSolver::solve` takes the

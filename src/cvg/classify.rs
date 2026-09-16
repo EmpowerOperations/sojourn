@@ -61,7 +61,7 @@ use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
 use crate::ast::{Expr, GlobalId, Kind, Program};
-use crate::cvg::interval;
+use crate::cvg::{hc4, interval};
 use crate::{Ast, ConstraintSystem, Point, Schema};
 
 /// What one equality lets us conclude.
@@ -123,7 +123,7 @@ pub(crate) struct Plan {
     ///
     /// Positions, and nothing else. This used to carry each coordinate's
     /// defining expression and tolerance so that `retract` could evaluate
-    /// `f(free) ± t`; [`interval::slice`] derives that band from the constraint
+    /// `f(free) ± t`; [`hc4::slice`] derives that band from the constraint
     /// itself, along with every other constraint naming the coordinate, so the
     /// only thing the walker still needs from a reading of the equalities is
     /// **which coordinates are computed and in what order**.
@@ -170,7 +170,7 @@ impl Plan {
 /// conditional slice is the move that leaves the uniform distribution
 /// invariant. Evaluating to the centre would not.
 ///
-/// The slice comes from [`interval::slice`] rather than from the one
+/// The slice comes from [`hc4::slice`] rather than from the one
 /// equality that defined the coordinate, so **every** constraint mentioning
 /// it has a say. The band `f(free) ± t` is what that equality contributes
 /// and the intersection can only be tighter, which turns draws that used to
@@ -275,7 +275,7 @@ fn drive(
     }
 
     for driven in plan.driven().iter().copied() {
-        let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
+        let slice = hc4::slice_conditioned(system, point, driven, Some(&settled));
         if !slice.is_empty() {
             point[driven] = place(slice, point[driven]);
         }
@@ -308,7 +308,7 @@ pub(crate) fn tightest(system: &ConstraintSystem, point: &Point) -> Vec<usize> {
         }
         let mut score = 0.0;
         for driven in plan.driven().iter().copied() {
-            let slice = interval::slice_conditioned(system, point, driven, Some(&settled));
+            let slice = hc4::slice_conditioned(system, point, driven, Some(&settled));
             let variable = &system.variables[driven];
             let width = variable.upper_bound - variable.lower_bound;
             score += if slice.is_empty() || width <= 0.0 {
@@ -444,7 +444,7 @@ pub(crate) fn drivable(constraint: &Ast) -> Vec<GlobalId> {
 /// # It answers whether, not what
 ///
 /// This used to *build* the rearrangement — `3 - x2` — for `retract` to
-/// evaluate. [`interval::slice`] derives the same band by narrowing the constraint
+/// evaluate. [`hc4::slice`] derives the same band by narrowing the constraint
 /// itself, so the expression had no consumer left and the walk down the path is
 /// all that survives. The arithmetic those rules encoded now lives in
 /// `interval::invert_binary`, tested there against the same cases.
@@ -955,7 +955,7 @@ mod tests {
     /// It refused because it *built* the rearrangement, and a symbolic inverse
     /// of a non-injective function has to choose a branch — `sqr` gives two
     /// answers and `asin` infinitely many. `reaches` chooses nothing: it says
-    /// the coordinate is determined, and `interval::slice` narrows it by
+    /// the coordinate is determined, and `hc4::slice` narrows it by
     /// intersecting the branches with what the argument can already be.
     #[test]
     fn a_function_with_an_inverse_is_reached_through() {
@@ -1034,7 +1034,9 @@ mod tests {
     fn two_independent_drives_are_both_taken() {
         let names = &["x1", "x2", "x3", "x4"];
         let sources = &["x1 == sqrt(x2) +/- 0.001", "x3 == cbrt(x4) +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next()
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
             .expect("both should drive");
 
         let driven = plan.driven();
@@ -1048,7 +1050,9 @@ mod tests {
     fn a_chain_of_drives_is_ordered() {
         let names = &["x", "y", "z"];
         let sources = &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next()
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
             .expect("both should drive");
 
         let driven = plan.driven();
@@ -1068,7 +1072,9 @@ mod tests {
     fn evaluation_order_beats_declaration_order() {
         let names = &["z", "y", "x"];
         let sources = &["y == sin(x) +/- 0.001", "z == y + 1 +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next()
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
             .expect("both should drive");
 
         let driven = plan.driven();
@@ -1150,7 +1156,10 @@ mod tests {
     /// alone admits driving either, which is two plans, and `x1 == pi` one.
     #[test]
     fn plans_are_distinct_by_what_they_drive() {
-        assert_eq!(plans_over(&["x1", "x2"], &["x1 + x2 == 3 +/- 0.001"]).len(), 2);
+        assert_eq!(
+            plans_over(&["x1", "x2"], &["x1 + x2 == 3 +/- 0.001"]).len(),
+            2
+        );
         assert_eq!(plans_over(&["x1", "x2"], &["x1 == pi +/- 0.001"]).len(), 1);
     }
 
@@ -1161,7 +1170,9 @@ mod tests {
     fn two_equations_wanting_the_same_variable_are_matched() {
         let names = &["x1", "x2", "x3"];
         let sources = &["x1 + x2 == 3 +/- 0.001", "x1 + x3 == 2 +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next()
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
             .expect("both equations should drive");
         assert_eq!(plan.driven().len(), 2);
         assert_eq!(plan.free().len(), 1);
@@ -1173,7 +1184,10 @@ mod tests {
     fn an_equation_with_nothing_left_to_drive_stays_a_constraint() {
         let names = &["x"];
         let sources = &["x == 1 +/- 0.001", "x == 2 +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next().expect("one pins");
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
+            .expect("one pins");
         assert_eq!(plan.driven(), [0]);
     }
 
@@ -1212,7 +1226,9 @@ mod tests {
     fn a_fully_pinned_system_leaves_nothing_free() {
         let names = &["x1", "x2"];
         let sources = &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"];
-        let plan = plans_over(names, sources).into_iter().next()
+        let plan = plans_over(names, sources)
+            .into_iter()
+            .next()
             .expect("both should pin");
         assert_eq!(plan.free(), &[] as &[usize]);
         assert_eq!(plan.driven().len(), 2);

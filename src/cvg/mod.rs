@@ -60,6 +60,7 @@ pub(crate) mod classify;
 #[cfg(feature = "gpu")]
 #[doc(hidden)]
 pub mod gpu;
+pub(crate) mod hc4;
 pub(crate) mod incidence;
 pub(crate) mod interval;
 pub(crate) mod local;

@@ -121,7 +121,7 @@ use faer::{Mat, Side};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use super::{classify, interval};
+use super::{classify, hc4};
 use crate::{ConstraintSystem, Point};
 
 /// How many chains to run at once.
@@ -200,6 +200,9 @@ pub(crate) struct HitAndRunWalker {
     /// The region's shape, fitted once the chains have burnt in; `None` until
     /// then, and afterwards if there was nothing to fit or it would not factor.
     transform: Option<Preconditioner>,
+    /// Candidates judged so far, over every move: the walker's cost in the
+    /// unit it is paid in, reported at `debug` with each phase.
+    judged: u64,
 }
 
 /// The shape of the region as the chains learnt it: the lower Cholesky factor
@@ -328,6 +331,7 @@ impl HitAndRunWalker {
             chains: Vec::new(),
             movable: Vec::new(),
             transform: None,
+            judged: 0,
         }
     }
 
@@ -398,6 +402,8 @@ impl HitAndRunWalker {
                 .collect()
         };
 
+        let _span =
+            tracing::debug_span!("burn_in", chains = CHAIN_COUNT, steps = burn_in).entered();
         let mut chosen: Vec<&Point> = Vec::new();
         while self.chains.len() < CHAIN_COUNT {
             let spread = chosen.len() < CHAIN_COUNT / 2;
@@ -427,7 +433,7 @@ impl HitAndRunWalker {
                 plan: (!tied.is_empty()).then(|| tied[self.chains.len() % tied.len()]),
             };
             for step in 0..burn_in {
-                chain.point = advance(
+                let (moved, judged) = advance(
                     chain.point,
                     step,
                     &mut self.rng,
@@ -436,6 +442,8 @@ impl HitAndRunWalker {
                     &self.movable,
                     self.transform.as_ref(),
                 );
+                chain.point = moved;
+                self.judged += judged;
                 if step >= burn_in / 2 && step % cadence == 0 {
                     states.push(self.movable.iter().map(|&slot| chain.point[slot]).collect());
                 }
@@ -443,6 +451,7 @@ impl HitAndRunWalker {
             chain.steps = burn_in;
             self.chains.push(chain);
         }
+        tracing::debug!(judged = self.judged, "burnt in on the sphere");
 
         self.transform = Preconditioner::fit(&states);
 
@@ -458,7 +467,7 @@ impl HitAndRunWalker {
             let mut states: Vec<Vec<f64>> = Vec::new();
             for chain in &mut self.chains {
                 for _ in 0..burn_in {
-                    chain.point = advance(
+                    let (moved, judged) = advance(
                         std::mem::take(&mut chain.point),
                         chain.steps,
                         &mut self.rng,
@@ -467,12 +476,15 @@ impl HitAndRunWalker {
                         &self.movable,
                         self.transform.as_ref(),
                     );
+                    chain.point = moved;
+                    self.judged += judged;
                     chain.steps += 1;
                     if chain.steps % cadence == 0 {
                         states.push(self.movable.iter().map(|&slot| chain.point[slot]).collect());
                     }
                 }
             }
+            tracing::debug!(judged = self.judged, "burnt in under the shape");
             if let Some(refit) = Preconditioner::fit(&states) {
                 self.transform = Some(refit);
             }
@@ -502,17 +514,19 @@ impl HitAndRunWalker {
             return Vec::new();
         }
         let thinning = thinning_for(from[0].len());
+        let _span = tracing::debug_span!("walk", count, thinning).entered();
+        let before = self.judged;
 
         // Sequential by nature — a chain cannot take its next step until it has
         // judged this one — so the points are walked one at a time.
-        (0..count)
+        let points: Vec<Point> = (0..count)
             .map(|emitted| {
                 let index = emitted % self.chains.len();
                 let mut point = std::mem::take(&mut self.chains[index].point);
                 let mut steps = self.chains[index].steps;
                 let plan = self.chains[index].plan.map(|plan| &problem.plans[plan]);
                 for _ in 0..thinning {
-                    point = advance(
+                    let (moved, judged) = advance(
                         point,
                         steps,
                         &mut self.rng,
@@ -521,13 +535,17 @@ impl HitAndRunWalker {
                         &self.movable,
                         self.transform.as_ref(),
                     );
+                    point = moved;
+                    self.judged += judged;
                     steps += 1;
                 }
                 self.chains[index].point = point.clone();
                 self.chains[index].steps = steps;
                 point
             })
-            .collect()
+            .collect();
+        tracing::debug!(judged = self.judged - before, "walked");
+        points
     }
 }
 
@@ -569,8 +587,9 @@ fn advance(
     plan: Option<&classify::Plan>,
     movable: &[usize],
     transform: Option<&Preconditioner>,
-) -> Point {
+) -> (Point, u64) {
     let dimensions = from.len();
+    let mut judged = 0;
     // The chain's own free coordinates: `movable` where there is one plan or
     // none, a subset of it where the chain is on one branch of several.
     let free: &[usize] = plan.map_or(movable, classify::Plan::free);
@@ -583,11 +602,12 @@ fn advance(
         if let Some(plan) = plan {
             classify::retract(problem, plan, &mut candidate, rng);
         }
-        return if problem.is_feasible(&candidate, 0.0) {
+        let moved = if problem.is_feasible(&candidate, 0.0) {
             candidate
         } else {
             from
         };
+        return (moved, 1);
     }
 
     // Swept in order rather than picked at random: a random scan needs
@@ -620,7 +640,7 @@ fn advance(
     };
 
     // An axis move is a move in one coordinate, which is the one question the
-    // constraints can be asked directly: `interval::slice` propagates them and
+    // constraints can be asked directly: `hc4::slice` propagates them and
     // answers with the interval this coordinate may occupy. A random direction
     // has no such answer — narrowing works per coordinate — so it still clips
     // against the box alone and finds feasibility by shrinking.
@@ -646,8 +666,9 @@ fn advance(
             classify::retract(problem, plan, &mut candidate, rng);
         }
 
+        judged += 1;
         if problem.is_feasible(&candidate, 0.0) {
-            return candidate;
+            return (candidate, judged);
         }
 
         // Shrink toward `from`, which is feasible by the chain's invariant, so
@@ -659,7 +680,7 @@ fn advance(
             upper = step;
         }
     }
-    from
+    (from, judged)
 }
 
 /// A point uniformly distributed on the unit sphere.
@@ -702,7 +723,7 @@ fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64>
 /// after each draw is still doing the deciding and this is still only a
 /// proposal.
 fn axis_chord(from: &Point, axis: usize, problem: &ConstraintSystem) -> (f64, f64) {
-    let slice = interval::slice(problem, from, axis);
+    let slice = hc4::slice(problem, from, axis);
     if slice.is_empty() {
         return (0.0, 0.0);
     }

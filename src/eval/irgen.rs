@@ -1,6 +1,9 @@
-//! `ast::Program` → [`VirtualTape`]: one post-order walk emitting instructions in
-//! exactly the order the tree-walker evaluated nodes, so that a fault lands
-//! on the same span and a fold accumulates in the same order.
+//! IR generation: `ast::Program` → [`VirtualTape`], one post-order walk
+//! emitting instructions in exactly the order the tree-walker evaluated
+//! nodes, so that a fault lands on the same span and a fold accumulates in
+//! the same order. The name is Clang's for the same step (`CodeGen`, or
+//! "IRGen": the front end's tree walked once, instructions emitted into a
+//! function); the tape is this crate's IR.
 //!
 //! Register classes are decided here and packed by [`super::regalloc`]:
 //! literals become constant registers, `LocalSlot`s become local registers
@@ -12,12 +15,12 @@ use crate::diagnostics::Span;
 
 use super::tape::{Accumulate, Constants, Instruction, VirtualRegister, VirtualTape};
 
-/// Lowers `program` against a schema of `row_len` variables, with
+/// Emits `program` against a schema of `row_len` variables, with
 /// `global_positions[GlobalId]` giving each symbol's row — to the virtual
 /// tape, which [`VirtualTape::allocate`] turns into the one the executors run
 /// and `differentiate` turns into its gradient's.
-pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize) -> VirtualTape {
-    let mut lowerer = Lowerer {
+pub(crate) fn emit(program: &Program, global_positions: &[u32], row_len: usize) -> VirtualTape {
+    let mut emitter = Emitter {
         global_positions,
         row_len,
         consts: Constants::default(),
@@ -27,11 +30,11 @@ pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize)
         loads: Vec::new(),
         assigned: vec![false; program.frame_size as usize],
     };
-    let result = lowerer.block(&program.body, None);
-    lowerer.finish(result, program.frame_size)
+    let result = emitter.block(&program.body, None);
+    emitter.finish(result, program.frame_size)
 }
 
-struct Lowerer<'a> {
+struct Emitter<'a> {
     global_positions: &'a [u32],
     row_len: usize,
     consts: Constants,
@@ -43,12 +46,12 @@ struct Lowerer<'a> {
     /// the same variable need no instruction.
     loads: Vec<(u32, VirtualRegister)>,
     /// Which local slots are definitely written by the time they are read.
-    /// A read the lowerer cannot prove gets a `Check`, preserving the walker's
+    /// A read the emitter cannot prove gets a `Check`, preserving the walker's
     /// NaN-sentinel semantics for a front-end slot bug.
     assigned: Vec<bool>,
 }
 
-impl Lowerer<'_> {
+impl Emitter<'_> {
     fn emit(&mut self, insn: Instruction<VirtualRegister>, span: Span) {
         self.insns.push(insn);
         self.spans.push(span);
@@ -157,44 +160,10 @@ impl Lowerer<'_> {
                 self.emit(Instruction::Unary { dst, op: *op, a }, span);
                 dst
             }
+            // A whole power reaches here as the multiplications
+            // `rewrite::unroll_powers` made of it; what is still a `Pow` is a
+            // real or variable exponent, and goes through `powf`.
             Kind::Binary { op, lhs, rhs } => {
-                // A whole power is the multiplication chain a fold of `n`
-                // copies of the base would be, with the base lowered once.
-                // `powf` is a per-lane libm call with no vector form and the
-                // shader's `pow` is NaN for a negative base; a multiply is one
-                // instruction on both and sign-safe. A real or variable
-                // exponent stays `Binary { Pow }` and goes through `powf`.
-                if *op == BinaryOp::Pow
-                    && let Some(n) = rhs.whole_exponent()
-                {
-                    // `x^0` is one for every base, including one that would
-                    // fault, which is what `powf` answers: the base is not
-                    // lowered at all.
-                    if n == 0 {
-                        let one = self.constant(1.0);
-                        return self.place(one, dst, span);
-                    }
-                    let count = usize::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
-                    let base = self.expr(lhs, None);
-                    if n > 0 {
-                        return self.chain(Accumulate::Prod, count, |_, _| base, dst, span);
-                    }
-                    // A negative exponent is the reciprocal of the positive
-                    // power: a division, with a division's fault at zero.
-                    let product = self.chain(Accumulate::Prod, count, |_, _| base, None, span);
-                    let one = self.constant(1.0);
-                    let dst = dst.unwrap_or_else(|| self.temp());
-                    self.emit(
-                        Instruction::Binary {
-                            dst,
-                            op: BinaryOp::Div,
-                            a: one,
-                            b: product,
-                        },
-                        span,
-                    );
-                    return dst;
-                }
                 let a = self.expr(lhs, None);
                 let b = self.expr(rhs, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
@@ -568,8 +537,27 @@ mod tests {
         );
     }
 
-    /// A whole power is the fold's multiplication chain with the base lowered
-    /// once: `(x1 + 1)^3` adds once and multiplies three times.
+    /// `f * f * f * f` and `f^4` are the same tape: the base once, four
+    /// multiplications. The count is the cost, and it must not depend on the
+    /// spelling — without the canonical form the product spells the base out
+    /// four times.
+    #[test]
+    fn a_repeated_factor_costs_what_its_power_costs() {
+        const F: &str = "(cos(x1) * ln(x1 + 2) + sqrt(x1) / (1 + x1))";
+        let base = tape_for(F, &["x1"]).insns.len();
+        let power = tape_for(&format!("{F}^4"), &["x1"]).insns.len();
+        let product = tape_for(&format!("{F} * {F} * {F} * {F}"), &["x1"])
+            .insns
+            .len();
+        assert_eq!(product, power, "the spelling changed the tape's length");
+        assert!(
+            power < 2 * base,
+            "the base was lowered more than once: {power} vs {base}"
+        );
+    }
+
+    /// A whole power is a multiplication chain with the base lowered once:
+    /// `(x1 + 1)^3` adds once and multiplies twice.
     #[test]
     fn a_whole_power_lowers_its_base_once() {
         let tape = tape_for("(x1 + 1)^3", &["x1"]);
@@ -592,14 +580,14 @@ mod tests {
             .filter(|i| {
                 matches!(
                     i,
-                    Instruction::Combine {
-                        how: Accumulate::Prod,
+                    Instruction::Binary {
+                        op: BinaryOp::Mul,
                         ..
                     }
                 )
             })
             .count();
-        assert_eq!((adds, multiplies), (1, 3), "{:?}", tape.insns);
+        assert_eq!((adds, multiplies), (1, 2), "{:?}", tape.insns);
         assert!(
             !tape.insns.iter().any(|i| matches!(
                 i,
@@ -764,7 +752,7 @@ mod tests {
             },
             frame_size: 1,
         };
-        let tape = super::lower(&program, &[], 0).allocate();
+        let tape = super::emit(&program, &[], 0).allocate();
         assert_eq!(tape.insns, vec![Instruction::Check { reg: R(0) }]);
         assert_eq!(tape.spans, vec![Span::new(0, 1)]);
         assert_eq!(tape.result, R(0));

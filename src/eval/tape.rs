@@ -103,7 +103,7 @@ pub(crate) struct VirtualTape {
 }
 
 impl VirtualTape {
-    /// A lowered program's tape: `temps` is the count the lowerer minted.
+    /// An emitted program's tape: `temps` is the count the emitter minted.
     pub(crate) fn new(
         consts: Constants,
         locals: u16,
@@ -134,6 +134,45 @@ impl VirtualTape {
         let t = VirtualRegister::Temp(self.temps);
         self.temps += 1;
         t
+    }
+
+    /// The same computation with every write to a fresh temporary and every
+    /// read naming the write it sees, so that each value has one register
+    /// for the life of the tape: what a sweep that reads intermediates after
+    /// the fact — the reverse sweep of a derivative, the backward pass of a
+    /// narrowing — relies on. The emitter writes a fold's accumulator once
+    /// per term and a `let` slot where the front end put it; this undoes
+    /// both. Straight-line code needs no more than renaming — "SSA
+    /// construction" (Cytron et al. 1991) is the general form, for code with
+    /// branches. Constants stay pinned; the temporary numbering continues
+    /// past this tape's own.
+    pub(crate) fn single_assignment(&self) -> Self {
+        let mut renamed = Self::new(
+            self.consts.clone(),
+            self.locals,
+            self.temps,
+            Vec::with_capacity(self.insns.len()),
+            self.spans.clone(),
+            self.result,
+        );
+        let mut version: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
+        for insn in &self.insns {
+            let read = insn.map(|reg| version.get(&reg).copied().unwrap_or(reg));
+            let written = match read {
+                Instruction::Check { .. } => read,
+                _ => {
+                    let fresh = renamed.fresh_temp();
+                    let dst = insn.dst().expect("every instruction but a check writes");
+                    version.insert(dst, fresh);
+                    read.with_dst(fresh)
+                }
+            };
+            renamed.insns.push(written);
+        }
+        let current = |reg: VirtualRegister| version.get(&reg).copied().unwrap_or(reg);
+        renamed.result = current(self.result);
+        renamed.partials = self.partials.iter().map(|reg| current(*reg)).collect();
+        renamed
     }
 
     /// Packs the temporaries and pins everything else: the tape the
@@ -249,7 +288,7 @@ pub(crate) enum Instruction<R> {
         last: bool,
     },
     /// Test `reg` for a finite value and fault at this instruction's span if it
-    /// is not. Emitted for a local the lowerer cannot prove was assigned — the
+    /// is not. Emitted for a local the emitter cannot prove was assigned — the
     /// tree-walker's NaN-sentinel read, preserved.
     Check {
         reg: R,
