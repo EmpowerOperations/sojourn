@@ -3000,11 +3000,20 @@ every candidate; an axis move can change four of 201). In order of expected payo
         computed once is one slot for it too.
       - *Identities that are exact.* `x * 1`, `x / 1`, `x^1` are `x` to the bit; `x + 0` is
         not (`-0.0 + 0.0` is `0.0`), so it stays.
-- [ ] **Burn-in into `solve`.** The walker is fresh per `sample` call so that a design is a
-      pure function of `(region, existing, count, seed)`; the chains' burn-in — 30% of the
-      profile — is a function of the region alone and can be paid once, the region holding
-      the eight burnt-in chains and the preconditioner (`d×d`, 320 KB at 200) and `sample`
-      cloning them to walk from. Still pure, still seeded.
+- [x] **Burn-in into `solve`.** The walker was fresh per `sample` call so that a design is
+      a pure function of `(region, existing, count, seed)`; the chains' burn-in is a
+      function of the region alone. Done 2026-09-16: `Ladder` draws one more stream after
+      the strategies' (so every seeded fixture is what it was), `solve` burns the walker in
+      from the opening's points on `Satisfied`, the region holds it, and `sample` clones and
+      reseeds it under the design's seed — still pure, still seeded, and two designs from
+      one region walk from the same chains. Beam-100: `solve` 21 ms → 1.26 s, `sample`
+      4.0 s → 3.0 s, the sum what it was. The debug suite is ten seconds slower, since
+      every `solve` now burns in whether or not anything samples — accepted: solving a
+      space is where the library thinks about it. The fit's data is the burn-in itself,
+      not the opening's point count, so more starts would not sharpen it; a longer burn-in
+      or a cheaper estimator past ~30 variables would, if a fixture ever asks (95% of use
+      is under thirty variables, and the diagonal the fit degrades to at two hundred is
+      what the sphere-plus-axis moves want anyway).
 - [ ] **Judge only what a move touched.** An axis move changes one coordinate;
       `Incidence::affected` names the constraints that read it, and the walker calls
       `is_feasible` over all of them. ~2× on the axis half of the judgements.

@@ -70,7 +70,7 @@ mod prune;
 pub(crate) mod sampling;
 #[cfg(feature = "gpu")]
 mod sieve;
-mod walking;
+pub(crate) mod walking;
 
 use std::collections::VecDeque;
 
@@ -141,6 +141,10 @@ pub(crate) struct Ladder {
     /// configured. Not a strategy object: a contraction reads the whole
     /// system, and it runs on the opening rather than per batch.
     prune: Option<u32>,
+    /// The stream the region's walker burns in under, whatever the strategy
+    /// list says: a design is always walked. Drawn after the strategies'
+    /// streams, so their draws are what they were.
+    burn_in: Xoshiro256PlusPlus,
 }
 
 impl std::fmt::Debug for Ladder {
@@ -166,6 +170,7 @@ impl Ladder {
             walker: None,
             local: None,
             prune: None,
+            burn_in: Xoshiro256PlusPlus::seed_from_u64(0),
         };
         // Each strategy gets its own stream, derived from the one passed in and
         // drawn in list order, so that adding or removing a strategy does not
@@ -189,7 +194,14 @@ impl Ladder {
                 Strategy::LocalSolve => ladder.local = Some(stream),
             }
         }
+        ladder.burn_in = Xoshiro256PlusPlus::from_rng(&mut rng);
         ladder
+    }
+
+    /// The walker the region will burn in and keep, once the opening is
+    /// done with the ladder.
+    pub(crate) fn into_walker(self) -> HitAndRunWalker {
+        HitAndRunWalker::new(self.burn_in)
     }
 
     /// Whether the walker will do most of the delivering, judged on the
@@ -463,11 +475,12 @@ pub(crate) fn open(
 /// `existing` and from each other.
 ///
 /// The pool: `held` (what the opening found, the witness first), a round of
-/// uniform proposals over the box, and the walker from all of that for the
-/// rest — sampling first because it is unbiased and needs no burn-in, and on
-/// a region it reaches it is the whole pool; the walker is what reaches a
-/// region sampling cannot. Both from streams derived from `seed`, so the pool
-/// is a function of the region and the seed. Then farthest-first: each
+/// uniform proposals over the box, and the walker for the rest — sampling
+/// first because it is unbiased and on a region it reaches it is the whole
+/// pool; the walker is what reaches a region sampling cannot. The walker is
+/// the region's, its chains burnt in at `solve`, cloned and reseeded here;
+/// the proposals and the walk draw from streams derived from `seed`, so the
+/// pool is a function of the region and the seed. Then farthest-first: each
 /// choice is the pool point whose nearest neighbour among `existing` and the
 /// choices so far is farthest, in box-normalised Euclidean distance, the
 /// metric `repair` lands by. With nothing to spread from, the first choice is
@@ -482,6 +495,7 @@ pub(crate) fn open(
 /// same point). Every point returned is feasible and judged here.
 pub(crate) fn design(
     problem: &ConstraintSystem,
+    walker: &HitAndRunWalker,
     held: &[Point],
     existing: &[Point],
     count: usize,
@@ -498,7 +512,9 @@ pub(crate) fn design(
         0,
         1,
     );
-    let mut walker = HitAndRunWalker::new(Xoshiro256PlusPlus::from_rng(&mut rng));
+    let mut walker = walker
+        .clone()
+        .reseeded(Xoshiro256PlusPlus::from_rng(&mut rng));
 
     let wanted = count * POOL_FACTOR + POOL_FLOOR;
     let mut pool: Vec<Point> = held.to_vec();

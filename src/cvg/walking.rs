@@ -188,6 +188,7 @@ const MINIMUM_THINNING: usize = 2;
 /// still be halved meaningfully. A move that exhausts it stays put.
 const SHRINK_LIMIT: usize = 64;
 
+#[derive(Clone)]
 pub(crate) struct HitAndRunWalker {
     rng: Xoshiro256PlusPlus,
     chains: Vec<Chain>,
@@ -209,6 +210,7 @@ pub(crate) struct HitAndRunWalker {
 /// of the covariance of their burn-in states, over the movable coordinates,
 /// shrunk toward its diagonal. See the module documentation for why this is
 /// sound whatever it estimates, and why it is frozen.
+#[derive(Clone)]
 struct Preconditioner {
     /// `L`, with `L Lᵀ` the shrunk covariance; zero above the diagonal.
     factor: Mat<f64>,
@@ -315,6 +317,7 @@ fn thinning_for(dimensions: usize) -> usize {
 /// The cursor is per chain rather than global so that each chain sweeps every
 /// coordinate; sharing one would let chains interleave and leave coordinates
 /// untouched.
+#[derive(Clone)]
 struct Chain {
     point: Point,
     steps: usize,
@@ -333,6 +336,13 @@ impl HitAndRunWalker {
             transform: None,
             judged: 0,
         }
+    }
+
+    /// This walker — its chains where they stand, its shape as learnt —
+    /// drawing from `rng` from here on: what a design walks with, from a
+    /// clone of the region's burnt-in walker, under the design's own seed.
+    pub(crate) fn reseeded(self, rng: Xoshiro256PlusPlus) -> Self {
+        Self { rng, ..self }
     }
 
     /// Starts any chains that do not exist yet, spread as widely across what has
@@ -369,7 +379,12 @@ impl HitAndRunWalker {
     /// fitted once the last chain is in. That burn-in runs on the sphere; a
     /// second one runs under the estimate and refits it, for the reason given
     /// where it happens.
-    fn start_chains(&mut self, existing: &[Point], problem: &ConstraintSystem) {
+    ///
+    /// A function of the region — its points and this walker's stream — and
+    /// of nothing a design asks for, which is why `solve` pays it once and
+    /// the region keeps the chains; [`extend`](Self::extend) still runs it
+    /// where nothing has. Nothing to do once the chains are placed.
+    pub(crate) fn burn_in(&mut self, existing: &[Point], problem: &ConstraintSystem) {
         if self.chains.len() >= CHAIN_COUNT {
             return;
         }
@@ -509,7 +524,7 @@ impl HitAndRunWalker {
         if count == 0 || from.is_empty() {
             return Vec::new();
         }
-        self.start_chains(from, problem);
+        self.burn_in(from, problem);
         if self.chains.is_empty() {
             return Vec::new();
         }

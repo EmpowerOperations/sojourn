@@ -17,7 +17,8 @@ use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Strategy};
 /// chains burnt in for 3200 steps each, then a pool of 148 points walked at
 /// 400 steps of thinning apiece. 14 s in release on 2026-09-16 with the axis
 /// move's slice walking the deflection sums' ASTs; 3.4 s with the slice on
-/// the interval tape.
+/// the interval tape; then the burn-in moved into `solve` (1.26 s there,
+/// 3.0 s in the walk).
 #[test]
 #[ignore = "a profiling target, not a check"]
 fn a_design_on_the_100_segment_beam() -> anyhow::Result<()> {

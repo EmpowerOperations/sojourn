@@ -16,6 +16,7 @@ use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 
 use crate::cvg;
+use crate::cvg::walking::HitAndRunWalker;
 use crate::cvg::{Ladder, Opening, local};
 use crate::repair::RepairError;
 use crate::{ConstraintRef, ConstraintSystem, Point};
@@ -461,10 +462,13 @@ impl ConstraintSolver {
     /// the same verdict on every machine. That is also the shape of "this
     /// may take a while": the budgets say how much may be spent, and a
     /// search that spends them without a point is [`Infeasibility::NotFound`]
-    /// rather than a call that never returns. Milliseconds on most systems;
-    /// brute force on a region it cannot reach is the default budget's
-    /// seconds. Runs on the calling thread; brute force fans out over the
-    /// cores and joins them before returning, and nothing runs after.
+    /// rather than a call that never returns. Milliseconds on most systems,
+    /// plus the walker's burn-in — eight chains, `16·d` steps each, twice —
+    /// which is the second a solve costs at two hundred variables and what
+    /// every design afterwards is spared; brute force on a region it cannot
+    /// reach is the default budget's seconds. Runs on the calling thread;
+    /// brute force fans out over the cores and joins them before returning,
+    /// and nothing runs after.
     ///
     /// # Errors
     /// There is no region: the constraints were proved to conflict, or nothing
@@ -503,10 +507,17 @@ impl ConstraintSolver {
                         )
                     })
                     .unwrap_or_else(|| points[0].clone());
+                // The walker's chains, burnt in once here rather than on
+                // every design: a function of the region, and the one cost
+                // of a solve that is not milliseconds at two hundred
+                // variables.
+                let mut walker = ladder.into_walker();
+                walker.burn_in(&points, system);
                 Ok(FeasibleRegion {
                     system: system.clone(),
                     points,
                     reference,
+                    walker,
                 })
             }
             Opening::Impossible { blamed } => Err(Infeasibility::Proved {
@@ -538,10 +549,11 @@ pub enum SampleError {
 /// A solved region: the system a search found feasible points in, and those
 /// points.
 ///
-/// A value, immutable, holding no search state: the engine's ladder and its
-/// progress lived for the opening and are gone. What is here is the system
-/// and every feasible point the opening ended with, the witness first. From
-/// it a space-filling design is [`sample`](Self::sample)d, and a point that
+/// A value, immutable: the engine's ladder and its progress lived for the
+/// opening and are gone. What is here is the system, every feasible point the
+/// opening ended with (the witness first), the reference a repair walks in
+/// from, and the walker with its chains already burnt in. From it a
+/// space-filling design is [`sample`](Self::sample)d, and a point that
 /// is not one is brought to the region by [`repair`](Self::repair): a region
 /// that could not be solved has nothing to repair toward, which is why that
 /// lives here and not on the system.
@@ -559,6 +571,9 @@ pub struct FeasibleRegion {
     /// box centre reaches: the reference a repair on a flat constraint walks
     /// in from. A function of the system alone.
     reference: Point,
+    /// The walker, its eight chains burnt in from `points` and its shape
+    /// fitted, at `solve`. A design clones it and walks.
+    walker: HitAndRunWalker,
 }
 
 impl std::fmt::Debug for FeasibleRegion {
@@ -675,14 +690,15 @@ impl FeasibleRegion {
     /// chosen so far is farthest, in Euclidean distance over box-normalised
     /// coordinates — the metric [`repair`](Self::repair) lands by. The pool
     /// is the region's own points, a round of uniform proposals, and
-    /// hit-and-run from all of that, under streams derived from `seed`; so
-    /// the design is a function of this region, `existing`, `count` and
-    /// `seed`, and the same call gives the same matrix. Not a Latin
-    /// hypercube: a design of fewer points than variables — the usual case
-    /// — has no useful stratification, and "far from what I have" is the
-    /// whole requirement. Cost is `O(count² · dimensions)` in the selection
-    /// plus the walk, which is a burn-in per call: milliseconds at twenty
-    /// variables, seconds at two hundred.
+    /// hit-and-run from the region's chains, burnt in at `solve`, under
+    /// streams derived from `seed`; so the design is a function of this
+    /// region, `existing`, `count` and `seed`, and the same call gives the
+    /// same matrix. Not a Latin hypercube: a design of fewer points than
+    /// variables — the usual case — has no useful stratification, and "far
+    /// from what I have" is the whole requirement. Cost is
+    /// `O(count² · dimensions)` in the selection plus the walk: milliseconds
+    /// at twenty variables, a few seconds at two hundred for a pool of a
+    /// hundred and fifty.
     ///
     /// # Errors
     /// [`SampleError::Degenerate`] when the region has fewer than `count`
@@ -709,7 +725,14 @@ impl FeasibleRegion {
         let anchors: Vec<Point> = (0..existing.ncols())
             .map(|column| (0..rows).map(|row| existing[(row, column)]).collect())
             .collect();
-        let chosen = cvg::design(&self.system, &self.points, &anchors, count, seed);
+        let chosen = cvg::design(
+            &self.system,
+            &self.walker,
+            &self.points,
+            &anchors,
+            count,
+            seed,
+        );
         let found = Mat::from_fn(rows, chosen.len(), |row, column| chosen[column][row]);
         if chosen.len() < count {
             return Err(SampleError::Degenerate {

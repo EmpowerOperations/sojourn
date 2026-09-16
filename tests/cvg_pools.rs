@@ -330,6 +330,40 @@ fn the_same_seed_designs_the_same_points() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One region, several designs: the walker's chains were burnt in at
+/// `solve` and every design walks from them, so two calls with one seed give
+/// one matrix — a design is still a function of the region and its
+/// arguments — and two with different seeds give different, feasible ones.
+#[test]
+fn two_designs_from_one_region_share_their_chains() -> anyhow::Result<()> {
+    let sources = &["x^2 + y^2 < 1"];
+    let system = system(variables(&[("x", -1.0, 1.0), ("y", -1.0, 1.0)]), sources)?;
+    let region = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
+        .with_gpu(false)
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(&system)?;
+
+    let first = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED)?;
+    let again = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED)?;
+    let other = region.sample(Mat::zeros(0, 0).as_ref(), 12, SEED + 1)?;
+
+    assert_eq!(
+        columns(&first),
+        columns(&again),
+        "one region, one seed, one design"
+    );
+    assert_ne!(
+        columns(&first),
+        columns(&other),
+        "another seed is another design"
+    );
+    for point in columns(&other) {
+        assert!(system.is_feasible(&point, 0.0), "{point:?}");
+    }
+    Ok(())
+}
+
 // ------------------------------------------- only a solver can say this
 
 #[test]

@@ -305,7 +305,8 @@ the plan, `hc4::slice` for the narrowing question, `prune::contract` and
 **`FeasibleRegion` is the solved system.** `ConstraintSolver::solve` takes the
 system by reference and clones it once for the region, so the region can
 answer for the system after the search: `system()`, `witness()` and
-`points()` for what the opening found, `sample` for a design, and `repair` —
+`points()` for what the opening found, `sample` for a design — walked from the
+region's own chains, burnt in at `solve` and cloned per call — and `repair` —
 which lives here rather than on the system because a region that could not
 be solved has nothing to repair toward. `repair` is a function of the region,
 the point and the clearance and of nothing else — it consults no census,
