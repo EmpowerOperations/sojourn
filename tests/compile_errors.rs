@@ -215,6 +215,115 @@ fn a_subscript_past_the_variables_is_caught_at_bind_time() {
     );
 }
 
+/// A subscript the row decides is a whole number *by construction* or it
+/// does not compile: an integer literal, an aggregate's parameter, `floor`
+/// or `ceil` of anything, or exact integer arithmetic over those. Anything
+/// else — a bare variable, a division, a power — is refused where it is
+/// written, with the fix in the message. There is no runtime rounding check
+/// to fall back on, because none is needed.
+#[test]
+fn a_subscript_the_row_decides_must_say_how_it_rounds() {
+    let names = ["x1", "x2", "x3"];
+    for (source, span) in [
+        ("var[x2]", Span::new(4, 6)),
+        ("sum(1, 3, i -> var[i/2])", Span::new(19, 22)),
+        ("var[x1 - 0.5]", Span::new(4, 12)),
+        ("var[x1^2]", Span::new(4, 8)),
+        // Integral operands do not rescue an operator outside the table.
+        ("var[floor(x1) / 2]", Span::new(4, 17)),
+        ("var[2 ^ floor(x1)]", Span::new(4, 17)),
+        ("var[floor(x1) ^ 0.5]", Span::new(4, 19)),
+        ("var[sqrt(floor(x1))]", Span::new(4, 19)),
+        ("var[log(floor(x1), 2)]", Span::new(4, 21)),
+    ] {
+        let failure = sojourn::compile(source, &names).expect_err(source);
+        assert_eq!(
+            failure.problems.len(),
+            1,
+            "{source}: {:#?}",
+            failure.problems
+        );
+        let problem = &failure.problems[0];
+        assert_eq!(problem.kind, ProblemKind::SubscriptNotIntegral, "{source}");
+        assert_eq!(problem.span, span, "{source}");
+    }
+    let problem = &sojourn::compile("var[x2]", &names)
+        .expect_err("x2")
+        .problems[0];
+    assert_eq!(
+        problem.to_string(),
+        "this subscript is not a whole number by construction at 'x2': \
+         wrap it in floor() or ceil() to say which"
+    );
+}
+
+/// The forms that are whole by construction — one of each — every one exact
+/// in `f64`: `floor`, `ceil` and `sgn` by definition; `+`, `-`, `*`, `%`,
+/// `abs`, negation, `sqr`, `cube`, `max`/`min` of integers below 2^53 because
+/// the exact result is representable and IEEE arithmetic is correctly
+/// rounded; a whole power because the backends make repeated multiplication
+/// of it. An aggregate's parameter, an aggregate of these, and a `var` bound
+/// to any of them count too.
+#[test]
+fn a_subscript_that_is_whole_by_construction_compiles() {
+    let names: Vec<String> = (1..=10).map(|i| format!("x{i}")).collect();
+    for source in [
+        // the two ways to say how a value rounds, and the sign
+        "var[floor(x2)]",
+        "var[ceil(x1 * 2)]",
+        "var[sgn(x1) + 2]",
+        // arithmetic over integral operands
+        "var[floor(x1) + 1]",
+        "var[floor(x1) - 1 + 2]",
+        "var[floor(x1) * 2]",
+        "var[floor(x1) % 3 + 1]",
+        "var[-floor(x1) + 5]",
+        "var[abs(floor(x1))]",
+        "var[sqr(floor(x1))]",
+        "var[cube(floor(x1))]",
+        "var[floor(x1) ^ 2]",
+        "var[max(floor(x1), 1)]",
+        "var[min(floor(x1), 3)]",
+        // an aggregate's parameter, an aggregate as the subscript, a binding
+        "sum(1, 3, i -> var[2*i - 1])",
+        "prod(1, 2, i -> var[i + 1])",
+        "var[sum(1, 2, j -> j)]",
+        "sum(1, 2, i -> var a = i + 1; var[a])",
+        // and the rule applies inside a subscript as well
+        "var[floor(var[floor(x1)])]",
+    ] {
+        sojourn::compile(source, &names)
+            .unwrap_or_else(|e| panic!("{source:?} should compile: {e:#}"));
+    }
+}
+
+/// Every offender is reported, in source order, so one round trip fixes all.
+#[test]
+fn every_non_integral_subscript_is_reported() {
+    let failure =
+        sojourn::compile("var[x1] + var[x2 / 2]", &["x1", "x2"]).expect_err("two offenders");
+    let spans: Vec<Span> = failure.problems.iter().map(|p| p.span).collect();
+    assert!(
+        failure
+            .problems
+            .iter()
+            .all(|p| p.kind == ProblemKind::SubscriptNotIntegral),
+        "{:#?}",
+        failure.problems
+    );
+    assert_eq!(spans, vec![Span::new(4, 6), Span::new(14, 20)]);
+}
+
+/// An aggregate whose parameter runs onto zero puts `var[0]` in the tree
+/// when it unrolls, and that is refused like a written `var[0]` rather than
+/// left for the first row.
+#[test]
+fn an_aggregate_that_unrolls_onto_zero_is_refused() {
+    assert_reports("sum(0, 2, i -> var[i])", "var[0] from the unrolling", |p| {
+        p.kind == ProblemKind::ZeroIndex
+    });
+}
+
 /// And one that is not a whole number, for the same reason
 /// [`a_fractional_bound_is_caught_at_compile_time`] gives: the JVM rounded.
 #[test]

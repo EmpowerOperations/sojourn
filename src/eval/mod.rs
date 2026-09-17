@@ -768,7 +768,7 @@ mod tests {
     /// one never reaches a row.
     #[test]
     fn a_zero_subscript_is_out_of_bounds() {
-        let error = eval_one("var[x1 - 7]", &[("x1", 7.0)])
+        let error = eval_one("var[floor(x1) - 7]", &[("x1", 7.0)])
             .expect_err("a subscript computed as zero names nothing");
 
         match error {
@@ -778,27 +778,6 @@ mod tests {
                     requested_1index: 0,
                     available: 1,
                 }
-            ),
-            other => panic!("expected a runtime problem, got {other:?}"),
-        }
-    }
-
-    /// Strict here too, for the same reason as the aggregate bounds: the JVM
-    /// implementation rounded, so `var[1.7]` silently became `var[2]`. A
-    /// literal fraction is refused at compile time, so this one is computed.
-    #[test]
-    fn a_non_integral_subscript_is_an_error() {
-        let error = eval_one("var[x1 / 2]", &[("x1", 3.0), ("x2", 8.0)])
-            .expect_err("1.5 is not an index and must not be rounded");
-
-        match error {
-            crate::diagnostics::EvaluationFailure::Runtime(problem) => assert!(
-                matches!(
-                    problem.problem.kind,
-                    crate::diagnostics::ProblemKind::DynamicIndexNotAnInteger { .. }
-                ),
-                "expected a non-integer subscript, got {:?}",
-                problem.problem.kind
             ),
             other => panic!("expected a runtime problem, got {other:?}"),
         }

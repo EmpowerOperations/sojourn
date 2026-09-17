@@ -629,7 +629,7 @@ mod tests {
                 InputVariable::new("n", 1.0, 2.0),
                 InputVariable::new("x2", -10.0, 10.0),
             ],
-            &["var[n] < 4", "x2 < 3"],
+            &["var[floor(n)] < 4", "x2 < 3"],
         );
         let (result, unexpressed) = pruned_with_silence(&subscripted, 16);
         assert!(matches!(result, Pruned::Live { .. }), "{result:?}");

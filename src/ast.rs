@@ -435,6 +435,86 @@ pub fn to_index(value: f64) -> Option<i64> {
     (value.is_finite() && value.fract() == 0.0 && value.abs() <= LIMIT).then_some(value as i64)
 }
 
+/// Whether `expr` is a whole number *by construction* — the crate's one type
+/// judgement, and the reason a subscript needs no rounding check at run time.
+///
+/// `env[slot]` says whether a local is integral: an aggregate's parameter is,
+/// and a `var a = …` is when its value was; the caller's walk marks them as it
+/// enters the binding. The forms:
+///
+/// | form                                 | integral when |
+/// | ------------------------------------ | ----------------------------------------------------------|
+/// | literal                              | [`to_index`] accepts it |
+/// | local                                | `env[slot]` |
+/// | global, `var[…]`                     | never — a point's value |
+/// | `floor`, `ceil`, `sgn`               | always |
+/// | negation, `abs`, `sqr`, `cube`       | the argument is |
+/// | `+`, `-`, `*`, `%`, `max`, `min`     | both operands are |
+/// | `^`                                  | the base is and the exponent is a whole literal, `0..=64`: repeated multiplication, which is what the backends make of it |
+/// | `/`, any other `^`                   | never |
+/// | `sum`/`prod`, unrolled or not        | the body (every term) is, the parameter counting as integral |
+/// | a block                              | its result, with its assignments marked as they go |
+/// | anything boolean, any other function | never |
+///
+/// Every form that passes is exact in `f64`: `floor`, `ceil` and `sgn`
+/// produce integers by definition, and the arithmetic in the table is
+/// correctly rounded, so an integer result below 2^53 — which is
+/// representable — *is* the result; a whole power is a chain of such
+/// multiplications (`rewrite::unroll_powers`). Division and real powers are
+/// excluded for exactly the reason `1/3` gives. So a value this accepts round-trips through
+/// [`to_index`] without a rounding step anywhere, and [`to_index`]'s one
+/// remaining refusal is magnitude.
+///
+/// Deliberately a table and not an analysis: extending it is a decision about
+/// the language, taken here, once.
+///
+/// A function over the tree, recomputed on every call, and not a flag on the
+/// node: every rewrite that builds or moves a node would otherwise have to
+/// keep the flag true, and a stale `true` here would put a non-integer on a
+/// gather with no runtime check behind it. Asked once per subscript at parse
+/// (`rewrite::check_subscripts`) and nowhere hot; a caller with a loop asks
+/// once and keeps the answer.
+#[must_use]
+pub(crate) fn is_integral(expr: &Expr, env: &[bool]) -> bool {
+    match &expr.kind {
+        Kind::Literal(value) => to_index(*value).is_some(),
+        Kind::Local(slot) => env[slot.index()],
+        Kind::Global(_) | Kind::DynamicIndex(_) => false,
+        Kind::Unary { op, arg } => match op {
+            UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Sgn => true,
+            UnaryOp::Negate | UnaryOp::Abs | UnaryOp::Sqr | UnaryOp::Cube => is_integral(arg, env),
+            _ => false,
+        },
+        Kind::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Rem
+            | BinaryOp::Max
+            | BinaryOp::Min => is_integral(lhs, env) && is_integral(rhs, env),
+            BinaryOp::Pow => is_integral(lhs, env) && rhs.whole_exponent().is_some_and(|n| n >= 0),
+            BinaryOp::Div | BinaryOp::LogB => false,
+        },
+        Kind::Aggregate { param, body, .. } => {
+            let mut env = env.to_vec();
+            env[param.index()] = true;
+            block_is_integral(body, &mut env)
+        }
+        Kind::Fold { terms, .. } => terms.iter().all(|term| is_integral(term, env)),
+        Kind::Block(block) => block_is_integral(block, &mut env.to_vec()),
+        Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. } => false,
+    }
+}
+
+/// [`is_integral`] over a block: each assignment marks its slot for the
+/// expressions after it, and the result decides.
+pub(crate) fn block_is_integral(block: &Block, env: &mut [bool]) -> bool {
+    for assignment in &block.assignments {
+        env[assignment.slot.index()] = is_integral(&assignment.value, env);
+    }
+    is_integral(&block.result, env)
+}
+
 /// The largest whole exponent a backend lowers into repeated multiplication.
 ///
 /// Past this a chain of multiplications is the wrong shape for a solver as
@@ -461,8 +541,46 @@ impl Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::{Expr, GlobalId, Kind};
+    use super::{Expr, GlobalId, Kind, is_integral};
     use crate::diagnostics::Span;
+
+    fn integral(source: &str) -> bool {
+        let ast = crate::parse(source).expect("the fixture parses");
+        let env = vec![false; ast.program.frame_size as usize];
+        is_integral(&ast.program.body.result, &env)
+    }
+
+    /// One row of the table each, for the rows the compile-time tests do not
+    /// reach on their own.
+    #[test]
+    fn the_integral_forms_are_the_table() {
+        assert!(integral("floor(x1) + ceil(x2) * 3"));
+        assert!(integral("abs(-floor(x1)) % 2"));
+        assert!(integral("max(floor(x1), min(2, sgn(x2)))"));
+        assert!(integral("sqr(floor(x1))"));
+        assert!(!integral("x1"), "a point's value");
+        assert!(!integral("floor(x1) / 2"), "division is not exact");
+        assert!(integral("floor(x1) ^ 2"), "a whole power is multiplication");
+        assert!(!integral("floor(x1) ^ 0.5"), "a real power is not");
+        assert!(
+            !integral("2 ^ floor(x1)"),
+            "nor an exponent the row decides"
+        );
+        assert!(!integral("sqrt(x1)"), "a function outside the table");
+        assert!(!integral("2.5"));
+    }
+
+    /// A `var` bound to something integral is integral after it; an
+    /// aggregate's parameter is integral inside it.
+    #[test]
+    fn locals_are_integral_when_what_bound_them_was() {
+        let ast = crate::parse("var a = floor(x1); var b = a / 2; a + 1").expect("parses");
+        let mut env = vec![false; ast.program.frame_size as usize];
+        assert!(super::block_is_integral(&ast.program.body, &mut env));
+        assert_eq!(env, vec![true, false]);
+        assert!(integral("sum(1, 3, i -> 2 * i - 1)"));
+        assert!(!integral("sum(1, 3, i -> i / 2)"));
+    }
 
     #[test]
     fn a_whole_exponent_is_a_literal_integer_within_the_cap() {

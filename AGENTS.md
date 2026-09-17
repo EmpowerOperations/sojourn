@@ -257,7 +257,13 @@ the variable it names on every path: a load, a reference, an incidence row,
 or a problem with a caret if the schema has no such position — the same
 `CompilationFailure` an unbound name gets. After that
 `Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
-than "a subscript", and nothing downstream special-cases one.
+than "a subscript", and nothing downstream special-cases one. A subscript the
+row decides must be a whole number by construction — `floor`/`ceil` outermost
+or inside exact integer arithmetic, an aggregate's parameter; the table is
+`ast::is_integral`, the crate's one type judgement, and extending it is a
+language decision taken there — or it does not compile. Every form in the
+table is exact in `f64`, which is why the runtime has no rounding check on a
+gather and never needs one.
 
 **A constraint says what interval a coordinate may take.** `cvg::hc4` is
 HC4-revise over the constraint's *tape*: the evaluator's IR in single assignment

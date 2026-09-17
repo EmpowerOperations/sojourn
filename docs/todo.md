@@ -313,6 +313,11 @@ thing to read, and is the first work item rather than an admission.
 
 ### Standing
 
+- [ ] **`ast::is_integral` is the crate's one type judgement.** A table, not an analysis:
+      the forms that are whole numbers by construction, each exact in `f64`. Anything that wants
+      to read a value as an integer — a subscript today; an integer-typed exponent or a
+      non-constant aggregate bound if either ever lands — asks it rather than growing a second
+      copy, and a new row in the table is a language decision taken there, once.
 - [ ] **Compatibility nobody wants.** `irgen` kept an out-of-range literal subscript faulting
       at run time "as the walker did" — preserved because it was there, not because anyone
       asked — while `ConstraintSystem::new` refused the same subscript at construction, so
@@ -2247,10 +2252,18 @@ keeps a fallible signature.
       (`ProblemKind::ZeroIndex`, "var[0] is not the first parameter (did you mean var[1]?)"),
       negative (`NegativeDynamicIndex`) or not a whole number (`DynamicIndexNotAnInteger`)
       at the subscript's span, after folding, so `var[2 - 2]` is caught too. Which parameters
-      *exist* still needs a schema and stays with `resolve_subscripts`; a subscript an aggregate
-      unrolls into (`sum(0, 2, i -> var[i])`) is folded after this pass runs and is still the
-      row's to report. `Driven by:` `compile_errors::a_subscript_below_one_is_caught_at_compile_time`,
-      `a_fractional_subscript_is_caught_at_compile_time`.
+      *exist* still needs a schema and stays with `resolve_subscripts`.
+      Later the same day the rule went onto the *shape*: `rewrite::check_subscripts` refuses a
+      subscript the row decides unless `ast::is_integral` says it is a whole number by
+      construction — `floor`/`ceil`/`sgn` of anything, an aggregate's parameter, a `var` bound to
+      one of these, and `+ - * % max min abs` negation and whole powers over them, every one
+      exact in `f64` below 2^53 — with "wrap it in floor() or ceil() to say which" in the
+      message. The runtime `NotAnInteger` fault is unreachable and gone; a gather's one fault is
+      "past the end". `substitute` propagates the fold's verdict now, so `sum(0, 2, i -> var[i])`
+      is `ZeroIndex` at parse rather than the row's. `Driven by:`
+      `compile_errors::a_subscript_the_row_decides_must_say_how_it_rounds`,
+      `a_subscript_that_is_whole_by_construction_compiles`, `every_non_integral_subscript_is_reported`,
+      `an_aggregate_that_unrolls_onto_zero_is_refused`, and `ast::tests` for the table's rows.
 - [ ] Revisit whether anything else deserves rejecting rather than evaluating: division by a
       literal zero, a lambda whose parameter is unused, a bound range that is statically empty.
       Kotlin allowed all three, and the first is load-bearing — `0/0` producing NaN is how the

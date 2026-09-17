@@ -141,8 +141,19 @@ pub enum ProblemKind {
         requested_1index: i64,
         available: usize,
     },
-    /// `var[i]` was given something that is not a whole number.
+    /// `var[i]` was given a literal that is not a whole number: `var[1.5]`.
+    /// A computed subscript never gets this far — see
+    /// [`SubscriptNotIntegral`](Self::SubscriptNotIntegral).
     DynamicIndexNotAnInteger { value: f64 },
+    /// A subscript the row decides that is not a whole number by
+    /// construction: `var[x2]`, `var[i/2]`, `var[x1 - 0.5]`. The forms that
+    /// are — `floor`/`ceil` of anything, an aggregate's parameter, exact
+    /// integer arithmetic over those — are the table on `ast::is_integral`
+    /// (crate-private, the one type judgement); a subscript in that
+    /// shape cannot be un-integral by rounding, which is why there is no
+    /// runtime check behind this one. The JVM implementation rounded
+    /// silently instead, so `var[1.7]` read `var[2]`.
+    SubscriptNotIntegral,
     /// `var[0]`, written as such. Subscripts are one-based, and zero is the
     /// one mistake common enough to answer with the fix: the first parameter
     /// is `var[1]`. Known from the source alone, so reported at compile time,
@@ -223,6 +234,9 @@ impl ProblemKind {
             Self::DynamicIndexNotAnInteger { .. } => {
                 "attempted to use a non-integer as an index".to_owned()
             }
+            Self::SubscriptNotIntegral => {
+                "this subscript is not a whole number by construction".to_owned()
+            }
             Self::ZeroIndex => {
                 "var[0] is not the first parameter (did you mean var[1]?)".to_owned()
             }
@@ -264,6 +278,7 @@ impl ProblemKind {
             | Self::AggregateTooWide { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
             Self::Unbound { .. } => "no input variable by that name".to_owned(),
+            Self::SubscriptNotIntegral => "wrap it in floor() or ceil() to say which".to_owned(),
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value }
             | Self::NonFiniteConstant { value }

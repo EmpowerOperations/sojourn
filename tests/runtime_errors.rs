@@ -17,9 +17,9 @@ use sojourn::diagnostics::{EvaluationFailure, ProblemKind, Span};
 #[test]
 fn dynamic_index_out_of_bounds() {
     // The literal subscripts the aggregate unrolls into are bound like names
-    // and must exist; the miss is the computed `var[x2]`, which only a row can
+    // and must exist; the miss is the computed `var[floor(x2)]`, which only a row can
     // reveal.
-    let expr = "sum(1, 2, i -> var[i] + var[x2] + i) + var[x2]";
+    let expr = "sum(1, 2, i -> var[i] + var[floor(x2)] + i) + var[floor(x2)]";
     let err = common::eval_one(expr, &[("x1", 3.0), ("x2", 4.0)])
         .expect_err("var[4] with only 2 parameters should fail");
 

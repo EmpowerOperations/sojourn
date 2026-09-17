@@ -15,10 +15,13 @@ use super::tape::{AllocatedTape, FaultKind, Instruction, LaneFault};
 /// The single place a `var[i]` subscript becomes a row position.
 ///
 /// One-based, so `var[0]` lands on `-1` and the one range check covers zero
-/// and negatives as well as overrun.
+/// and negatives as well as overrun. No rounding check: a subscript that
+/// reaches a gather is a whole number by construction (`ast::is_integral`,
+/// enforced at parse), so the only way [`ast::to_index`] declines is
+/// magnitude — `floor(1e300)` — which is "past the end" too.
 pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, FaultKind> {
-    let requested_1index = ast::to_index(value).ok_or(FaultKind::NotAnInteger(value))?;
-    usize::try_from(requested_1index - 1)
+    let requested_1index = ast::to_index(value).unwrap_or(i64::MAX);
+    usize::try_from(requested_1index.saturating_sub(1))
         .ok()
         .filter(|position| *position < available)
         .ok_or(FaultKind::OutOfBounds {

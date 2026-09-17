@@ -166,7 +166,7 @@ fn a_non_finite_value_in_a_batch_names_its_column() {
 #[test]
 fn an_out_of_range_subscript_in_a_batch_names_its_column() {
     let problem = batch_error(
-        "var[x1] + x2",
+        "var[floor(x1)] + x2",
         &["x1", "x2"],
         &[&[1.0, 0.0], &[2.0, 0.0], &[3.0, 0.0]],
     );
@@ -179,22 +179,7 @@ fn an_out_of_range_subscript_in_a_batch_names_its_column() {
         }
     );
     // The subscript, not the whole `var[...]`.
-    assert_eq!(problem.problem.span, Span::new(4, 6));
-}
-
-#[test]
-fn a_fractional_subscript_in_a_batch_names_its_column() {
-    let problem = batch_error(
-        "var[x1] + x2",
-        &["x1", "x2"],
-        &[&[1.0, 0.0], &[1.5, 0.0], &[2.0, 0.0]],
-    );
-    assert_eq!(problem.sample, Some(1));
-    assert_eq!(
-        problem.problem.kind,
-        ProblemKind::DynamicIndexNotAnInteger { value: 1.5 }
-    );
-    assert_eq!(problem.problem.span, Span::new(4, 6));
+    assert_eq!(problem.problem.span, Span::new(4, 13));
 }
 
 /// Two faulting columns: the lower index wins, whatever order the tile found

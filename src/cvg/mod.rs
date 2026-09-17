@@ -671,7 +671,7 @@ mod tests {
                 InputVariable::new("x1", 0.0, 1.0),
                 InputVariable::new("n", 1.0, 1.0),
             ],
-            ["var[n] > 0.99999"],
+            ["var[floor(n)] > 0.99999"],
         )
         .expect("the fixture binds");
         let by_brute_force = ConstraintSolver::new()

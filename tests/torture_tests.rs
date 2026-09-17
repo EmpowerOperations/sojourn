@@ -149,7 +149,7 @@ fn what_an_enclosure_rules_out_is_proved_before_sampling() -> anyhow::Result<()>
 /// would be the bug.
 #[test]
 fn what_sampling_cannot_find_is_reported_not_proved() -> anyhow::Result<()> {
-    let source = "var[n] > 20";
+    let source = "var[floor(n)] > 20";
     let system = system(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0), ("n", 1.0, 2.0)],
         &[source],

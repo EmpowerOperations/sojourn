@@ -36,6 +36,7 @@ use crate::{Ast, Schema};
 /// [`fold_constants`]'s and [`unroll_aggregates`]'s.
 pub(crate) fn canonicalize(program: Program) -> Result<Program, Vec<Fault>> {
     let program = fold_constants(program)?;
+    check_subscripts(&program)?;
     let program = invert_monotone(program);
     let program = unroll_aggregates(program)?;
     let program = collect_powers(program);
@@ -207,6 +208,77 @@ fn fold_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
 /// released rather than passed through.
 fn fold_descend(expr: Expr) -> Result<Box<Expr>, Vec<Fault>> {
     Ok(Box::new(fold_expr(expr)?))
+}
+
+// ------------------------------------------------------------------- subscripts
+
+/// Refuses every subscript that is not a whole number by construction.
+///
+/// After [`fold_constants`], so a literal subscript has been folded and
+/// value-checked already, and before [`unroll_aggregates`], so an aggregate's
+/// parameter is still a local the judgement can see and the span is the one
+/// the user wrote. The judgement itself is [`ast::is_integral`]; this walk
+/// only supplies its `env` — a parameter is integral inside its aggregate, a
+/// `var` when its value was — and collects one fault per offending
+/// subscript, so a round trip fixes all of them. Descends into a subscript
+/// too: `var[floor(var[x1])]` has an inner one to judge.
+fn check_subscripts(program: &Program) -> Result<(), Vec<Fault>> {
+    let mut faults = Vec::new();
+    let mut env = vec![false; program.frame_size as usize];
+    check_block(&program.body, &mut env, &mut faults);
+    if faults.is_empty() {
+        Ok(())
+    } else {
+        Err(faults)
+    }
+}
+
+fn check_block(block: &Block, env: &mut Vec<bool>, faults: &mut Vec<Fault>) {
+    for assignment in &block.assignments {
+        check_expr(&assignment.value, env, faults);
+        env[assignment.slot.index()] = crate::ast::is_integral(&assignment.value, env);
+    }
+    check_expr(&block.result, env, faults);
+}
+
+fn check_expr(expr: &Expr, env: &mut Vec<bool>, faults: &mut Vec<Fault>) {
+    match &expr.kind {
+        Kind::DynamicIndex(subscript) => {
+            if !crate::ast::is_integral(subscript, env) {
+                faults.push(Fault {
+                    kind: ProblemKind::SubscriptNotIntegral,
+                    span: subscript.span,
+                });
+            }
+            check_expr(subscript, env, faults);
+        }
+        Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => {}
+        Kind::Unary { arg, .. } => check_expr(arg, env, faults),
+        Kind::Binary { lhs, rhs, .. }
+        | Kind::Compare { lhs, rhs, .. }
+        | Kind::NearEq { lhs, rhs, .. } => {
+            check_expr(lhs, env, faults);
+            check_expr(rhs, env, faults);
+        }
+        Kind::And { terms } | Kind::Fold { terms, .. } => {
+            for term in terms {
+                check_expr(term, env, faults);
+            }
+        }
+        Kind::Block(block) => check_block(block, env, faults),
+        Kind::Aggregate {
+            lower,
+            upper,
+            param,
+            body,
+            ..
+        } => {
+            check_expr(lower, env, faults);
+            check_expr(upper, env, faults);
+            env[param.index()] = true;
+            check_block(body, env, faults);
+        }
+    }
 }
 
 /// Turns `var[1]` into an ordinary reference to the schema's first variable.
@@ -842,7 +914,7 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
                         let term = Expr::new(Kind::Block(body.clone()), span);
                         substitute(term, param, index)
                     })
-                    .collect(),
+                    .collect::<Result<_, _>>()?,
             }
         }
 
@@ -953,7 +1025,7 @@ fn static_range(
 /// By slot rather than by name, so a body that shadows the parameter —
 /// `sum(1, 3, i -> var i = 5; i)` — binds a different slot and is left alone.
 #[allow(clippy::cast_precision_loss)]
-fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
+fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Result<Expr, Vec<Fault>> {
     let Expr { kind, span } = expr;
 
     let kind = match kind {
@@ -961,12 +1033,12 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
 
         Kind::Unary { op, arg } => Kind::Unary {
             op,
-            arg: Box::new(substitute(*arg, param, index)),
+            arg: Box::new(substitute(*arg, param, index)?),
         },
         Kind::Binary { op, lhs, rhs } => Kind::Binary {
             op,
-            lhs: Box::new(substitute(*lhs, param, index)),
-            rhs: Box::new(substitute(*rhs, param, index)),
+            lhs: Box::new(substitute(*lhs, param, index)?),
+            rhs: Box::new(substitute(*rhs, param, index)?),
         },
         Kind::DynamicIndex(subscript) => {
             // Folded here, and not left to the pass that folds: `fold_constants`
@@ -977,12 +1049,15 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
             // nothing can resolve, so `interval` narrows nothing through it
             // and `classify` refuses the whole constraint.
             //
-            // Best effort: a subscript that will not fold — `var[1/0]`, whose
-            // literal is not finite — is left as it was, and reported by
-            // whatever meets it next rather than turned into an error here.
-            let substituted = substitute(*subscript, param, index);
-            let folded = fold_expr(substituted.clone()).unwrap_or(substituted);
-            Kind::DynamicIndex(Box::new(folded))
+            // The fold judges the literal it makes — `sum(0, 2, i -> var[i])`
+            // puts a `var[0]` here — and that verdict is this pass's too,
+            // which is why the whole subscript node is folded, not its index.
+            let subscript = substitute(*subscript, param, index)?;
+            fold_expr(Expr {
+                kind: Kind::DynamicIndex(Box::new(subscript)),
+                span,
+            })?
+            .kind
         }
         Kind::Aggregate {
             kind,
@@ -992,18 +1067,18 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
             body,
         } => Kind::Aggregate {
             kind,
-            lower: Box::new(substitute(*lower, param, index)),
-            upper: Box::new(substitute(*upper, param, index)),
+            lower: Box::new(substitute(*lower, param, index)?),
+            upper: Box::new(substitute(*upper, param, index)?),
             param: inner,
-            body: Box::new(substitute_block(*body, param, index)),
+            body: Box::new(substitute_block(*body, param, index)?),
         },
-        Kind::Block(block) => Kind::Block(Box::new(substitute_block(*block, param, index))),
+        Kind::Block(block) => Kind::Block(Box::new(substitute_block(*block, param, index)?)),
         Kind::Fold { kind, terms } => Kind::Fold {
             kind,
             terms: terms
                 .into_iter()
                 .map(|term| substitute(term, param, index))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         },
 
         leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
@@ -1013,45 +1088,47 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
         // walk is total and a grammar change cannot leave a parameter behind.
         Kind::Compare { op, lhs, rhs } => Kind::Compare {
             op,
-            lhs: Box::new(substitute(*lhs, param, index)),
-            rhs: Box::new(substitute(*rhs, param, index)),
+            lhs: Box::new(substitute(*lhs, param, index)?),
+            rhs: Box::new(substitute(*rhs, param, index)?),
         },
         Kind::NearEq {
             lhs,
             rhs,
             tolerance,
         } => Kind::NearEq {
-            lhs: Box::new(substitute(*lhs, param, index)),
-            rhs: Box::new(substitute(*rhs, param, index)),
+            lhs: Box::new(substitute(*lhs, param, index)?),
+            rhs: Box::new(substitute(*rhs, param, index)?),
             tolerance,
         },
         Kind::And { terms } => Kind::And {
             terms: terms
                 .into_iter()
                 .map(|term| substitute(term, param, index))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         },
     };
 
-    Expr { kind, span }
+    Ok(Expr { kind, span })
 }
 
-fn substitute_block(block: Block, param: LocalSlot, index: i64) -> Block {
+fn substitute_block(block: Block, param: LocalSlot, index: i64) -> Result<Block, Vec<Fault>> {
     let Block {
         assignments,
         result,
     } = block;
-    Block {
+    Ok(Block {
         assignments: assignments
             .into_iter()
-            .map(|Assignment { slot, value, span }| Assignment {
-                slot,
-                value: substitute(value, param, index),
-                span,
+            .map(|Assignment { slot, value, span }| {
+                Ok(Assignment {
+                    slot,
+                    value: substitute(value, param, index)?,
+                    span,
+                })
             })
-            .collect(),
-        result: substitute(result, param, index),
-    }
+            .collect::<Result<_, Vec<Fault>>>()?,
+        result: substitute(result, param, index)?,
+    })
 }
 
 // --------------------------------------------------------------------- powers
@@ -1761,7 +1838,8 @@ mod tests {
     /// nothing could resolve" - rather than "a subscript".
     #[test]
     fn a_computed_subscript_survives() {
-        let ast = resolved("var[n] + 1", &["n", "x2"]).expect("n is a variable, not an index");
+        let ast =
+            resolved("var[floor(n)] + 1", &["n", "x2"]).expect("n is a variable, not an index");
         assert!(
             ast.contains_dynamic_lookup,
             "a computed subscript is still dynamic"

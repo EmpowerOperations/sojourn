@@ -424,7 +424,6 @@ pub(crate) struct LaneFault {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum FaultKind {
     NonFinite(f64),
-    NotAnInteger(f64),
     OutOfBounds {
         requested_1index: i64,
         available: usize,
@@ -483,10 +482,6 @@ impl AllocatedTape {
             FaultKind::NonFinite(value) => Fault {
                 kind: ProblemKind::NonFiniteValue { value },
                 span: self.spans[at],
-            },
-            FaultKind::NotAnInteger(value) => Fault {
-                kind: ProblemKind::DynamicIndexNotAnInteger { value },
-                span: subscript,
             },
             FaultKind::OutOfBounds {
                 requested_1index,

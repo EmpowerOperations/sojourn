@@ -415,10 +415,11 @@ mod tests {
         assert_eq!(tape.consts, Vec::<f64>::new());
     }
 
-    /// What is left for a gather: a subscript the point decides.
+    /// What is left for a gather: a subscript the point decides, which says
+    /// how it rounds.
     #[test]
     fn a_computed_subscript_is_a_gather() {
-        let tape = tape_for("var[x1]", &["x1", "x2"]);
+        let tape = tape_for("var[floor(x1)]", &["x1", "x2"]);
         assert_eq!(
             tape.insns,
             vec![
@@ -426,10 +427,16 @@ mod tests {
                     dst: R(0),
                     input: 0
                 },
-                Instruction::Gather {
+                Instruction::Unary {
                     dst: R(1),
-                    index: R(0),
-                    subscript: Span::new(4, 6)
+                    op: UnaryOp::Floor,
+                    a: R(0)
+                },
+                // The load is dead once floored, so its register is reused.
+                Instruction::Gather {
+                    dst: R(0),
+                    index: R(1),
+                    subscript: Span::new(4, 13)
                 }
             ]
         );

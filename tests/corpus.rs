@@ -221,7 +221,7 @@ case!(index_mixed_with_names:
 // A computed subscript is what "dynamic lookup" means now: which variable it
 // reads depends on the point, so `x2` is read here and referenced nowhere.
 case!(index_computed:
-    Case::new("var[x1]", 7.0)
+    Case::new("var[floor(x1)]", 7.0)
         .vars([("x1", 2.0), ("x2", 7.0)])
         .dynamic()
         .statics(["x1"]));

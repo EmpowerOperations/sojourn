@@ -41,10 +41,10 @@ It is crate-private: a caller hands source text to `compile` or to
 two backends'.
 
 ```
-              fold_constants   invert_monotone   unroll_aggregates   collect_powers
- source ─►  ──────────────►  ──────────────►  ──────────────►  ─────────────►  Ast
-      translate (fallible)                        (fallible)
-            └──────────────────── rewrite::canonicalize ─────────────────────┘
+              fold_constants   check_subscripts   invert_monotone   unroll_aggregates   collect_powers
+ source ─►  ──────────────►  ───────────────►  ──────────────►  ──────────────►  ─────────────►  Ast
+      translate (fallible)      (fallible)                          (fallible)
+            └───────────────────────────── rewrite::canonicalize ─────────────────────────────┘
 ```
 
 The output is an `Ast`, not an evaluable thing: turning one into something that
@@ -55,6 +55,7 @@ is `cvg`, which never lowers it at all.
 |---|---|---|
 | parse & lower | `frontend::translate` | ANTLR parse tree to `ast::Program`; resolves names to `GlobalId`/`LocalSlot`, records `is_constraint` |
 | fold constants | `rewrite::fold_constants` | every subtree made only of literals becomes one `Kind::Literal` |
+| check subscripts | `rewrite::check_subscripts` | a subscript is integral by construction (`ast::is_integral`) or a compile error; nothing is rewritten |
 | invert monotone | `rewrite::invert_monotone` | `f(u) op c` becomes `u op' c'` for the strictly monotone `f` |
 | unroll aggregates | `rewrite::unroll_aggregates` | every `Kind::Aggregate` becomes `Kind::Fold`; a bound that is not a constant, or a span past the cap, is a compile error |
 | collect powers | `rewrite::collect_powers` | a term multiplied by itself becomes `Pow(term, n)` — `f * f`, `f * (f * f)`, `f^2 * f^3`, `prod(1, n, i -> f)` — so a power has one form whatever was written; the one pass that may move a value by an ulp, since the unroll multiplies left to right whatever the spelling's grouping |
@@ -79,11 +80,18 @@ nothing about powers; a `Pow` that reaches it is a real or variable exponent.
 base and for leaving nothing to invert; the `let` answers the first and applying
 it only on the eval path the second.)
 
-Two passes are fallible, and both refuse rather than defer:
+Three passes are fallible, and all refuse rather than defer:
 
 - `fold_constants` rejects a constant subexpression that works out to NaN or an
   infinity — `sqrt(-1)`, `1/0`, and the literal `1.0e400`, which babel's grammar
-  admits and `f64` cannot hold.
+  admits and `f64` cannot hold — and a literal subscript that is zero, negative
+  or fractional.
+- `check_subscripts` rejects a subscript the row decides unless it is a whole
+  number *by construction* — `floor`/`ceil` of anything, an aggregate's
+  parameter, exact integer arithmetic over those; the table is
+  `ast::is_integral`, the crate's one type judgement. Every form in it is exact
+  in `f64`, so the runtime has no rounding check: a subscript that reaches a
+  gather is an integer, and the only fault left there is "past the end".
 - `unroll_aggregates` rejects a bound that is not a constant, one that is a
   constant but not a usable index (`sum(1, 20/3, …)`), and an aggregate wider
   than its cap. `sum` is big-sigma over a fixed index set, not a loop; after

@@ -560,7 +560,7 @@ mod tests {
             "x % 2 < 1",
             "sgn(x) * y",
             "ceil(x) + y",
-            "var[y] < 3",
+            "var[floor(y)] < 3",
         ] {
             assert!(
                 gradient_of(source, &["x", "y"]).is_none(),

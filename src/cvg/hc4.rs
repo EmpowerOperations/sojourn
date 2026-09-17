@@ -471,7 +471,7 @@ mod tests {
     /// narrows what it can around it.
     #[test]
     fn a_computed_subscript_concludes_nothing_about_itself() {
-        let (narrower, ast) = narrower("x + var[n] < 5");
+        let (narrower, ast) = narrower("x + var[floor(n)] < 5");
         let mut frames = Frames::default();
         let globals = [Interval::new(0.0, 10.0), Interval::point(1.0)];
         let got = narrower.narrow(&globals, symbol(&ast, "x"), &mut frames);
