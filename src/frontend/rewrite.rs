@@ -465,30 +465,10 @@ fn resolve_expr(expr: Expr, schema: &Schema, symbols: &mut Vec<String>) -> Resul
 }
 
 /// Whether any subscript survives in `block`.
-fn holds_subscript(block: &Block) -> bool {
-    fn in_expr(expr: &Expr) -> bool {
-        match &expr.kind {
-            Kind::DynamicIndex(_) => true,
-            Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => false,
-            Kind::Unary { arg, .. } => in_expr(arg),
-            Kind::Binary { lhs, rhs, .. }
-            | Kind::Compare { lhs, rhs, .. }
-            | Kind::NearEq { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
-            Kind::And { terms } | Kind::Fold { terms, .. } => terms.iter().any(in_expr),
-            Kind::Block(block) => in_block(block),
-            Kind::Aggregate {
-                lower, upper, body, ..
-            } => in_expr(lower) || in_expr(upper) || in_block(body),
-        }
-    }
-    fn in_block(block: &Block) -> bool {
-        block
-            .assignments
-            .iter()
-            .any(|assignment| in_expr(&assignment.value))
-            || in_expr(&block.result)
-    }
-    in_block(block)
+pub(crate) fn holds_subscript(block: &Block) -> bool {
+    block
+        .iter_preorder()
+        .any(|node| matches!(node.kind, Kind::DynamicIndex(_)))
 }
 
 /// Rewrites `f(u) op c` into a comparison on `u`, for the strictly monotone `f`
@@ -1637,9 +1617,9 @@ mod tests {
             let program = unroll_aggregates(invert_monotone(program)).expect("unrolls");
             let raw = Ast {
                 source: source.to_owned(),
+                contains_dynamic_lookup: holds_subscript(&program.body),
                 program,
                 symbols: raw.symbols,
-                contains_dynamic_lookup: raw.contains_dynamic_lookup,
                 is_constraint: raw.is_constraint,
             };
             let rewritten = crate::parse(source).expect("should compile");
@@ -1866,21 +1846,17 @@ mod tests {
 
         // `2 + 3` and `sqrt(16)` both collapse, so what is left is
         // `x1 * 5 + 4` — three leaves and two operators.
-        let mut literals = Vec::new();
-        collect_literals(&expression.program.body.result, &mut literals);
-        assert_eq!(literals, vec![5.0, 4.0]);
+        assert_eq!(literals(&expression.program.body.result), vec![5.0, 4.0]);
     }
 
-    fn collect_literals(node: &Expr, into: &mut Vec<f64>) {
-        match &node.kind {
-            Kind::Literal(value) => into.push(*value),
-            Kind::Unary { arg, .. } => collect_literals(arg, into),
-            Kind::Binary { lhs, rhs, .. } => {
-                collect_literals(lhs, into);
-                collect_literals(rhs, into);
-            }
-            _ => {}
-        }
+    fn literals(node: &Expr) -> Vec<f64> {
+        node.iter_preorder()
+            .filter_map(|node| match node.kind {
+                Kind::Literal(value) => Some(value),
+                // A query for one kind.
+                _ => None,
+            })
+            .collect()
     }
 
     /// Folding may not change a value, ever. A folded chain and the same chain
@@ -1990,17 +1966,8 @@ mod tests {
     }
 
     fn mentions_unary(node: &Expr, wanted: UnaryOp) -> bool {
-        match &node.kind {
-            Kind::Unary { op, arg } => *op == wanted || mentions_unary(arg, wanted),
-            Kind::Binary { lhs, rhs, .. } => {
-                mentions_unary(lhs, wanted) || mentions_unary(rhs, wanted)
-            }
-            Kind::Compare { lhs, rhs, .. } => {
-                mentions_unary(lhs, wanted) || mentions_unary(rhs, wanted)
-            }
-            Kind::Fold { terms, .. } => terms.iter().any(|t| mentions_unary(t, wanted)),
-            _ => false,
-        }
+        node.iter_preorder()
+            .any(|node| matches!(node.kind, Kind::Unary { op, .. } if op == wanted))
     }
 
     /// The test that matters. A wrong inverse or a flipped direction survives
@@ -2143,13 +2110,8 @@ mod tests {
     }
 
     fn mentions_any_unary(node: &Expr) -> bool {
-        match &node.kind {
-            Kind::Unary { .. } => true,
-            Kind::Binary { lhs, rhs, .. } | Kind::Compare { lhs, rhs, .. } => {
-                mentions_any_unary(lhs) || mentions_any_unary(rhs)
-            }
-            _ => false,
-        }
+        node.iter_preorder()
+            .any(|node| matches!(node.kind, Kind::Unary { .. }))
     }
 
     /// Nothing to invert against. `ln(x1) > x2` has no constant side, so the
@@ -2164,23 +2126,12 @@ mod tests {
     }
 
     fn holds_comparison(node: &Expr) -> bool {
-        match &node.kind {
-            Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. } => true,
-            Kind::Unary { arg, .. } => holds_comparison(arg),
-            Kind::Binary { lhs, rhs, .. } => holds_comparison(lhs) || holds_comparison(rhs),
-            Kind::DynamicIndex(index) => holds_comparison(index),
-            Kind::Aggregate {
-                lower, upper, body, ..
-            } => holds_comparison(lower) || holds_comparison(upper) || block_holds(body),
-            Kind::Block(block) => block_holds(block),
-            Kind::Fold { terms, .. } => terms.iter().any(holds_comparison),
-            Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => false,
-        }
-    }
-
-    fn block_holds(block: &Block) -> bool {
-        block.assignments.iter().any(|a| holds_comparison(&a.value))
-            || holds_comparison(&block.result)
+        node.iter_preorder().any(|node| {
+            matches!(
+                node.kind,
+                Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. }
+            )
+        })
     }
 
     /// Unrolling accumulates left to right from the identity, in the order the
@@ -2260,7 +2211,7 @@ mod tests {
             let expression = crate::parse(source)
                 .unwrap_or_else(|e| panic!("compile failed for {source:?}: {e}"));
             assert!(
-                block_holds(&expression.program.body),
+                expression.program.body.expressions().any(holds_comparison),
                 "the comparison in {source:?} was flattened during compilation"
             );
         }

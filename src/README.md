@@ -144,6 +144,13 @@ each new pass would need converting on both sides.
 `Kind::Compare`, `Kind::NearEq` and `Kind::And` reach both backends intact, and
 each lowers them its own way.
 
+The tree's shape is written once, in `Expr::children`, exhaustively; a new
+`Kind` goes there or no traversal sees it. `Expr::iter_preorder` walks it —
+parents first, source order — and is what a *query* uses: what a constraint
+reads, whether a subscript appears, where a symbol is first referenced, each a
+`filter`/`any`/`count` over the walk. A *pass* that builds a tree recurses,
+because its recursion is the traversal state in the language's own syntax.
+
 ## The boolean convention belongs to `eval`
 
 Babel has no boolean values at run time, so **the evaluator** turns a comparison

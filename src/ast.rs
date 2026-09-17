@@ -94,6 +94,70 @@ impl Expr {
     pub fn new(kind: Kind, span: Span) -> Self {
         Self { kind, span }
     }
+
+    /// The expressions directly under this one, in source order — the one
+    /// statement of the tree's shape. A new [`Kind`] is added here and
+    /// nowhere else for a traversal to see it; the match is exhaustive so the
+    /// compiler says where.
+    #[must_use]
+    pub(crate) fn children(&self) -> Vec<&Expr> {
+        match &self.kind {
+            Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => Vec::new(),
+            Kind::Unary { arg, .. } | Kind::DynamicIndex(arg) => vec![arg],
+            Kind::Binary { lhs, rhs, .. }
+            | Kind::Compare { lhs, rhs, .. }
+            | Kind::NearEq { lhs, rhs, .. } => vec![lhs, rhs],
+            Kind::And { terms } | Kind::Fold { terms, .. } => terms.iter().collect(),
+            Kind::Block(block) => block.expressions().collect(),
+            Kind::Aggregate {
+                lower, upper, body, ..
+            } => [lower.as_ref(), upper.as_ref()]
+                .into_iter()
+                .chain(body.expressions())
+                .collect(),
+        }
+    }
+
+    /// This node and everything under it, parents before children, left to
+    /// right — source order. For a query: what is read, whether a kind
+    /// appears, how many times, where first. A transform that builds a tree
+    /// recurses instead, since its recursion *is* the traversal state, in
+    /// the language's own syntax. Borrows, so nothing changes through it.
+    pub(crate) fn iter_preorder(&self) -> Preorder<'_> {
+        Preorder { stack: vec![self] }
+    }
+}
+
+/// [`Expr::iter_preorder`]: an explicit stack, the next node on top.
+pub(crate) struct Preorder<'a> {
+    stack: Vec<&'a Expr>,
+}
+
+impl<'a> Iterator for Preorder<'a> {
+    type Item = &'a Expr;
+
+    fn next(&mut self) -> Option<&'a Expr> {
+        let next = self.stack.pop()?;
+        // Reversed, so the leftmost child is popped first.
+        self.stack.extend(next.children().into_iter().rev());
+        Some(next)
+    }
+}
+
+impl Block {
+    /// The block's expressions in source order: each assignment's value,
+    /// then the result.
+    pub(crate) fn expressions(&self) -> impl Iterator<Item = &Expr> {
+        self.assignments
+            .iter()
+            .map(|assignment| &assignment.value)
+            .chain(std::iter::once(&self.result))
+    }
+
+    /// [`Expr::iter_preorder`] over every expression of the block, in order.
+    pub(crate) fn iter_preorder(&self) -> impl Iterator<Item = &Expr> {
+        self.expressions().flat_map(Expr::iter_preorder)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -541,7 +605,7 @@ impl Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::{Expr, GlobalId, Kind, is_integral};
+    use super::{AggregateKind, Expr, GlobalId, Kind, LocalSlot, is_integral};
     use crate::diagnostics::Span;
 
     fn integral(source: &str) -> bool {
@@ -568,6 +632,99 @@ mod tests {
         );
         assert!(!integral("sqrt(x1)"), "a function outside the table");
         assert!(!integral("2.5"));
+    }
+
+    fn kinds(source: &str) -> Vec<&'static str> {
+        let ast = crate::parse(source).expect("the fixture parses");
+        ast.program
+            .body
+            .iter_preorder()
+            .map(|expr| match &expr.kind {
+                Kind::Literal(_) => "literal",
+                Kind::Global(_) => "global",
+                Kind::Local(_) => "local",
+                Kind::DynamicIndex(_) => "subscript",
+                Kind::Unary { .. } => "unary",
+                Kind::Binary { .. } => "binary",
+                Kind::Aggregate { .. } => "aggregate",
+                Kind::Fold { .. } => "fold",
+                Kind::Block(_) => "block",
+                Kind::Compare { .. } => "compare",
+                Kind::NearEq { .. } => "near-eq",
+                Kind::And { .. } => "and",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preorder_is_parents_first_left_to_right() {
+        assert_eq!(
+            kinds("x1 * (x2 + 3)"),
+            ["binary", "global", "binary", "global", "literal"]
+        );
+    }
+
+    /// Bindings and aggregates are not leaves to a query: the walk reaches
+    /// the value a `var` was given and the body a `sum` unrolled into.
+    #[test]
+    fn preorder_reaches_under_bindings_and_aggregates() {
+        let seen = kinds("sum(1, 2, i -> var a = i + 1; a * x1)");
+        // Unrolled: a fold of two blocks, each `var a = <i> + 1; a * x1`.
+        assert_eq!(seen[0], "fold");
+        assert_eq!(seen.iter().filter(|k| **k == "block").count(), 2);
+        assert_eq!(seen.iter().filter(|k| **k == "global").count(), 2);
+        assert_eq!(seen.iter().filter(|k| **k == "local").count(), 2);
+        assert!(seen.contains(&"literal"));
+    }
+
+    /// Every kind a parse can leave in the tree, counted against the hand
+    /// count, so a variant `children` forgot would show as a short walk. An
+    /// aggregate never survives a parse (its bounds must be constant, so it
+    /// unrolls) and `And` is a rewrite's product, so those two are built by
+    /// hand and their children counted directly.
+    #[test]
+    fn every_kind_yields_its_children() {
+        let source = "var a = x1 + var[floor(x2)]; abs(a) < x3 * 2 - a";
+        let ast = crate::parse(source).expect("the fixture parses");
+        // the assignment: binary[global, subscript[unary[global]]] = 5
+        // the result: compare[unary[local], binary[binary[global, literal], local]] = 8
+        assert_eq!(ast.program.body.iter_preorder().count(), 13);
+
+        let at = Span::new(0, 1);
+        let leaf = || Expr::new(Kind::Literal(1.0), at);
+        let block = || {
+            Box::new(super::Block {
+                assignments: vec![super::Assignment {
+                    slot: LocalSlot::from_index(0),
+                    value: leaf(),
+                    span: at,
+                }],
+                result: leaf(),
+            })
+        };
+        let aggregate = Expr::new(
+            Kind::Aggregate {
+                kind: AggregateKind::Sum,
+                lower: Box::new(leaf()),
+                upper: Box::new(leaf()),
+                param: LocalSlot::from_index(1),
+                body: block(),
+            },
+            at,
+        );
+        assert_eq!(
+            aggregate.children().len(),
+            4,
+            "lower, upper, one assignment, result"
+        );
+        let and = Expr::new(
+            Kind::And {
+                terms: vec![leaf(), leaf(), leaf()],
+            },
+            at,
+        );
+        assert_eq!(and.children().len(), 3);
+        assert_eq!(Expr::new(Kind::Block(block()), at).children().len(), 2);
     }
 
     /// A `var` bound to something integral is integral after it; an

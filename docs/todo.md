@@ -2275,9 +2275,21 @@ keeps a fallible signature.
       has two possible shapes. Canonicalising would mean `BinaryOp` loses `Add` and `Mul` — a swap
       rather than an addition, so no consumer grows a case. Worth doing when SMT emission lands and
       the n-ary form is being consumed anyway.
-- [ ] **Traversal helper (`preorder`/`postorder`).** Would let `contains_dynamic_lookup` be a
-      read-only pass instead of an accumulator flag, and replace the hand-rolled recursion in
-      `rewrite.rs`'s tests. Three callers now, so it has probably earned its place.
+- [x] **Traversal helper (`preorder`/`postorder`).** Done 2026-09-17 as `Expr::iter_preorder`
+      over one exhaustive `Expr::children`. Nine read-only walks became one-line queries —
+      `classify::globals`/`mentions`/`occurrences`, `Ast::reference_spans`,
+      `rewrite::holds_subscript`, four test helpers — and `contains_dynamic_lookup` is read off
+      the finished tree instead of tracked by the translator. Three of the nine were partial
+      (`mentions_unary` never looked under a `Block`; `collect_literals` only under `Unary` and
+      `Binary`) and passed on shallow fixtures; the iterator makes every query total. The
+      transforms and the scoped judgements stay recursive on purpose — readability was the
+      reason, not stack depth, which hand-typed expressions never approach. Postorder is one
+      flag on the stack entry and unbuilt for want of a consumer.
+- [ ] **`max`/`min` as n-ary `Fold` kinds.** `max(max(max(x1, x2), x3), …)` over a hundred
+      variables is a hundred nodes deep for no reason the tree already has a convention against:
+      `Fold` is n-ary so a thousand-term sum is one node. The same for `max`/`min` would make the
+      chain one node, give HC4's `Combine{Worst}` its n-ary source directly, and take the one
+      plausible deep tree out of the language.
 - [ ] **Upstream bug report to `antlr-rust-runtime`.** The parser builds
       `AntlrError::MismatchedInput { expected, found }` and formats it into a string before any
       listener sees it (`parser.rs:6819`), with the recovery path passing `error: None`

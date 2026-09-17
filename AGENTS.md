@@ -105,6 +105,17 @@ exception, since they *define* the surface.
 **Assertions are exact by default.** Only cases that route through libm carry a
 tolerance. Do not add blanket tolerances to make something pass.
 
+**A `match` over an enum is exhaustive by default.** A `_ =>` arm is written
+only with cause — "this code really does care about these variants alone, and
+ignoring every other, including ones not yet written, is safe here" — and the
+cause goes in a comment on the arm. Adding a variant *should* break every
+match that has to think about it; that is the compiler doing the audit, not a
+lag on development. The tree's shape lives in one such match,
+`Expr::children`; a query over the tree is `Expr::iter_preorder` and a
+`filter`/`any`/`count`, and a pass that builds a tree recurses — the iterator
+is for readability where a query collapses to one line, not a rule that
+recursion is wrong.
+
 **The tape is the only evaluator, and the tests are its spec.** `eval/` lowers
 the AST to a three-address tape and runs it tiled or per lane. It was held to
 the tree-walker it replaced on a few thousand random and adversarial rows, then

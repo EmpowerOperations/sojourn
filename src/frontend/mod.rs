@@ -54,11 +54,15 @@ pub(crate) fn parse(source: &str) -> Result<Ast, CompilationFailure> {
     // powers — in that order, for the reasons `rewrite::canonicalize` gives.
     let program = rewrite::canonicalize(lowered.program).map_err(render)?;
 
+    // Read off the finished tree rather than tracked while building it: one
+    // definition of the flag, and the same one `resolve_subscripts` recomputes.
+    let contains_dynamic_lookup = rewrite::holds_subscript(&program.body);
+
     Ok(Ast {
         source: source.to_owned(),
         program,
         symbols: lowered.symbols,
-        contains_dynamic_lookup: lowered.contains_dynamic_lookup,
+        contains_dynamic_lookup,
         is_constraint: lowered.is_constraint,
     })
 }
@@ -139,55 +143,14 @@ impl Ast {
     /// produces but the walk does not assume.
     pub(crate) fn reference_spans(&self) -> Vec<Option<Span>> {
         let mut spans = vec![None; self.symbols.len()];
-        first_references(&self.program.body.result, &mut spans);
-        for assignment in &self.program.body.assignments {
-            first_references(&assignment.value, &mut spans);
+        for node in self.program.body.iter_preorder() {
+            if let ast::Kind::Global(id) = node.kind {
+                let slot = &mut spans[id.index()];
+                if slot.is_none_or(|held| node.span < held) {
+                    *slot = Some(node.span);
+                }
+            }
         }
         spans
-    }
-}
-
-/// Records the earliest-spanned reference of each global under `expr`.
-fn first_references(expr: &ast::Expr, spans: &mut [Option<Span>]) {
-    use ast::Kind;
-    match &expr.kind {
-        Kind::Global(id) => {
-            let slot = &mut spans[id.index()];
-            if slot.is_none_or(|held| expr.span < held) {
-                *slot = Some(expr.span);
-            }
-        }
-        Kind::Literal(_) | Kind::Local(_) => {}
-        Kind::Unary { arg, .. } => first_references(arg, spans),
-        Kind::Binary { lhs, rhs, .. } | Kind::Compare { lhs, rhs, .. } => {
-            first_references(lhs, spans);
-            first_references(rhs, spans);
-        }
-        Kind::NearEq { lhs, rhs, .. } => {
-            first_references(lhs, spans);
-            first_references(rhs, spans);
-        }
-        Kind::And { terms } | Kind::Fold { terms, .. } => {
-            for term in terms {
-                first_references(term, spans);
-            }
-        }
-        Kind::DynamicIndex(index) => first_references(index, spans),
-        Kind::Block(block) => {
-            for assignment in &block.assignments {
-                first_references(&assignment.value, spans);
-            }
-            first_references(&block.result, spans);
-        }
-        Kind::Aggregate {
-            lower, upper, body, ..
-        } => {
-            first_references(lower, spans);
-            first_references(upper, spans);
-            for assignment in &body.assignments {
-                first_references(&assignment.value, spans);
-            }
-            first_references(&body.result, spans);
-        }
     }
 }

@@ -484,38 +484,9 @@ fn reaches(side: &Expr, variable: GlobalId) -> bool {
 /// [`globals`] answers *whether*, which is not enough: peeling needs the
 /// variable to occur exactly once, or the path walk leaves it on both sides.
 fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
-    match &expr.kind {
-        Kind::Global(id) => usize::from(*id == variable),
-        Kind::Literal(_) | Kind::Local(_) => 0,
-        Kind::Unary { arg, .. } => occurrences(arg, variable),
-        Kind::Binary { lhs, rhs, .. }
-        | Kind::Compare { lhs, rhs, .. }
-        | Kind::NearEq { lhs, rhs, .. } => occurrences(lhs, variable) + occurrences(rhs, variable),
-        Kind::And { terms } | Kind::Fold { terms, .. } => {
-            terms.iter().map(|term| occurrences(term, variable)).sum()
-        }
-        Kind::DynamicIndex(index) => occurrences(index, variable),
-        Kind::Block(block) => {
-            block
-                .assignments
-                .iter()
-                .map(|assignment| occurrences(&assignment.value, variable))
-                .sum::<usize>()
-                + occurrences(&block.result, variable)
-        }
-        Kind::Aggregate {
-            lower, upper, body, ..
-        } => {
-            occurrences(lower, variable)
-                + occurrences(upper, variable)
-                + body
-                    .assignments
-                    .iter()
-                    .map(|assignment| occurrences(&assignment.value, variable))
-                    .sum::<usize>()
-                + occurrences(&body.result, variable)
-        }
-    }
+    expr.iter_preorder()
+        .filter(|node| node.kind == Kind::Global(variable))
+        .count()
 }
 
 /// How many plans a system keeps. A disjunction has a plan per branch and
@@ -736,55 +707,21 @@ fn position_in(schema: &Schema, constraint: &Ast, variable: GlobalId) -> Option<
 
 /// Whether `variable` is read anywhere in `expr`.
 fn mentions(expr: &Expr, variable: GlobalId) -> bool {
-    globals(expr).contains(&variable)
+    expr.iter_preorder()
+        .any(|node| node.kind == Kind::Global(variable))
 }
 
 /// Every global read anywhere in `expr`.
 fn globals(expr: &Expr) -> BTreeSet<GlobalId> {
-    let mut found = BTreeSet::new();
-    collect(expr, &mut found);
-    found
+    expr.iter_preorder()
+        .filter_map(|node| match node.kind {
+            Kind::Global(id) => Some(id),
+            // A query for one kind: every other is, by construction, not it.
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
 }
 
-fn collect(expr: &Expr, found: &mut BTreeSet<GlobalId>) {
-    match &expr.kind {
-        Kind::Global(id) => {
-            found.insert(*id);
-        }
-        Kind::Literal(_) | Kind::Local(_) => {}
-        Kind::Unary { arg, .. } => collect(arg, found),
-        Kind::Binary { lhs, rhs, .. } | Kind::Compare { lhs, rhs, .. } => {
-            collect(lhs, found);
-            collect(rhs, found);
-        }
-        Kind::NearEq { lhs, rhs, .. } => {
-            collect(lhs, found);
-            collect(rhs, found);
-        }
-        Kind::And { terms } | Kind::Fold { terms, .. } => {
-            for term in terms {
-                collect(term, found);
-            }
-        }
-        Kind::DynamicIndex(index) => collect(index, found),
-        Kind::Block(block) => {
-            for assignment in &block.assignments {
-                collect(&assignment.value, found);
-            }
-            collect(&block.result, found);
-        }
-        Kind::Aggregate {
-            lower, upper, body, ..
-        } => {
-            collect(lower, found);
-            collect(upper, found);
-            for assignment in &body.assignments {
-                collect(&assignment.value, found);
-            }
-            collect(&body.result, found);
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

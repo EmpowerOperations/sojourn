@@ -35,7 +35,6 @@ pub(crate) struct Lowered {
     pub program: Program,
     /// Distinct statically-referenced names in first-reference order.
     pub symbols: Vec<String>,
-    pub contains_dynamic_lookup: bool,
     pub is_constraint: bool,
 }
 
@@ -217,10 +216,6 @@ struct TranslationState {
     /// Monotonic — slots are never reused, so a single flat frame serves the
     /// whole tree and a nested block cannot alias an enclosing binding.
     next_slot: u32,
-    /// Whether any `var[i]` was translated. Really a property of the finished
-    /// AST — "does a `DynamicIndex` appear" — but deriving it would want a
-    /// traversal helper whose only other caller today is a test.
-    contains_dynamic_lookup: bool,
 }
 
 /// The bindings introduced by one lexical scope.
@@ -318,7 +313,6 @@ impl SemanticTranslator<'_> {
                 frame_size: state.next_slot,
             },
             symbols: state.globals,
-            contains_dynamic_lookup: state.contains_dynamic_lookup,
             is_constraint,
         })
     }
@@ -552,7 +546,6 @@ impl SemanticTranslator<'_> {
         // `assignment` is its own rule and owns its own `var` child.
         if ctx.var().is_some() {
             let subscript = self.operand(&children, 0, state)?;
-            state.contains_dynamic_lookup = true;
             return Ok(Expr::new(Kind::DynamicIndex(subscript), span));
         }
         // `(sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'`
