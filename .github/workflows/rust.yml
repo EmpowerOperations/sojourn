@@ -47,17 +47,11 @@ jobs:
 
       - run: cargo --version; rustc --version; just --version
 
-      - run: just fmt-check
-
       - run: just lint
 
       # Also exercises ANTLR code generation: build.rs regenerates the lexer
       # and parser from grammar/*.g4.
       - run: just build
-
-      # The real gate during the port. Tests are expected to fail; they are not
-      # expected to stop compiling.
-      - run: just test-compile
 
   # Expected RED until the port lands. Left failing on purpose rather than
   # dressed up as passing.

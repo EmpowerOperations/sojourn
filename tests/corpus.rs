@@ -157,11 +157,12 @@ case!(sum_identity_1_to_5: Case::new("sum(1, 5, i -> i)", 1.0 + 2.0 + 3.0 + 4.0 
 case!(prod_identity_1_to_4: Case::new("prod(1, 4, i -> i)", 1.0 * 2.0 * 3.0 * 4.0));
 case!(sum_negative_range: Case::new("sum(-5, -2, i -> i)", -14.0));
 
+// A literal subscript — including one an aggregate unrolls into — is the
+// variable it names: read, referenced, and not a dynamic lookup.
 case!(sum_with_dynamic_offset:
     Case::new("sum(2, 2, i -> var[i-1])", 2.0)
         .vars([("x1", 2.0), ("x2", 3.0), ("x3", 4.0)])
-        .dynamic()
-        .statics::<_, String>([]));
+        .statics(["x1"]));
 
 case!(sum_over_extra_variable:
     Case::new("sum(1, 2, i -> x1)", 1.0 + 1.0)
@@ -201,27 +202,29 @@ case!(han_identifier_short: Case::new("测试", 42.0).vars([("测试", 42.0)]));
 
 case!(index_first:
     Case::new("var[1]", 0.0)
-        .vars([("x1", 0.0)])
-        .dynamic()
-        .statics::<_, String>([]));
+        .vars([("x1", 0.0)]));
 
 case!(index_second:
     Case::new("var[2]", 2.0)
         .vars([("input-sds", 1.0), ("input-SDA", 2.0), ("input-SDJA", 3.0)])
-        .dynamic()
-        .statics::<_, String>([]));
+        .statics(["input-SDA"]));
 
 case!(index_third:
     Case::new("var[3]", 3.0)
         .vars([("input-sds", 1.0), ("input-SDA", 2.0), ("input-SDJA", 3.0)])
-        .dynamic()
-        .statics::<_, String>([]));
+        .statics(["input-SDJA"]));
 
 case!(index_mixed_with_names:
     Case::new("x + var[2] + z", 1.0 + 1.1 + 1.01)
-        .vars([("x", 1.0), ("y", 1.1), ("z", 1.01)])
+        .vars([("x", 1.0), ("y", 1.1), ("z", 1.01)]));
+
+// A computed subscript is what "dynamic lookup" means now: which variable it
+// reads depends on the point, so `x2` is read here and referenced nowhere.
+case!(index_computed:
+    Case::new("var[x1]", 7.0)
+        .vars([("x1", 2.0), ("x2", 7.0)])
         .dynamic()
-        .statics(["x", "z"]));
+        .statics(["x1"]));
 
 // ------------------------------------------------------------------ boolean
 //
@@ -258,16 +261,14 @@ case!(nested_lambda_shadows_outer:
 // -------------------------------------------------------------- integration
 
 case!(rosenbrock_10:
-    Case::new(
-        "sum(2, 10, i -> 100*(var[i]-var[i-1]^2)^2 + (1-var[i-1])^2)",
-        271_194.0,
-    )
-    .vars([
-        ("x1", 2.0), ("x2", 3.0), ("x3", 4.0), ("x4", 5.0), ("x5", 6.0),
-        ("x6", 6.0), ("x7", 2.0), ("x8", 3.0), ("x9", 4.0), ("x10", 5.0),
-    ])
-    .dynamic()
-    .statics::<_, String>([]));
+Case::new(
+    "sum(2, 10, i -> 100*(var[i]-var[i-1]^2)^2 + (1-var[i-1])^2)",
+    271_194.0,
+)
+.vars([
+    ("x1", 2.0), ("x2", 3.0), ("x3", 4.0), ("x4", 5.0), ("x5", 6.0),
+    ("x6", 6.0), ("x7", 2.0), ("x8", 3.0), ("x9", 4.0), ("x10", 5.0),
+]));
 
 case!(rastrigin_10:
     Case::new("10*10+sum(1, 10, i -> var[i]^2 - 10*cos(2*pi*var[i]))", 180.0)
@@ -275,8 +276,6 @@ case!(rastrigin_10:
             ("x1", 2.0), ("x2", 3.0), ("x3", 4.0), ("x4", -5.0), ("x5", 6.0),
             ("x6", -6.0), ("x7", 2.0), ("x8", 3.0), ("x9", 4.0), ("x10", 5.0),
         ])
-        .dynamic()
-        .statics::<_, String>([])
         .tol(1e-9));
 
 case!(from_the_manual:
@@ -290,9 +289,7 @@ fn large_sum_dynamic_access_no_whitespace() {
         "sum(1,50,i->((var[2*i-1]^2-var[2*i])^2+(var[2*i-1]-1)^2))",
         0.0,
     )
-    .vars((1..=100).map(|i| (format!("x{i}"), 1.0)))
-    .dynamic()
-    .statics::<_, String>([]));
+    .vars((1..=100).map(|i| (format!("x{i}"), 1.0))));
 }
 
 // ------------------------------------------------------- statements & scope

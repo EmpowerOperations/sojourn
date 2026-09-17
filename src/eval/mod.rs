@@ -49,7 +49,8 @@ pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 ///
 /// # Errors
 /// [`CompilationFailure`] with every problem found — parsing does not stop at
-/// the first, and a name `variables` lacks is one, at its first reference.
+/// the first; a name `variables` lacks is one, at its first reference, and so
+/// is a literal subscript past the end of `variables`, at the subscript.
 pub fn compile<S: AsRef<str>>(
     source: &str,
     variables: &[S],
@@ -121,14 +122,31 @@ impl Compiler {
 /// This is where missing values are reported — once per schema, rather than on
 /// every evaluation as the JVM implementation did.
 ///
+/// A literal subscript names a variable by position and is bound like a
+/// name: `var[2]` becomes the second variable — a load, a reference, an
+/// incidence row — or a problem at the subscript if there is no second. The
+/// caller that resolved already ([`ConstraintSystem::new`](crate::ConstraintSystem::new),
+/// which keeps the resolved tree for the search) arrives with nothing left to
+/// resolve and pays nothing here.
+///
 /// # Errors
 /// [`CompilationFailure`] naming every symbol the schema omits, each at its
-/// first reference in the source.
+/// first reference in the source, or the first literal subscript it cannot
+/// supply, at the subscript.
 pub(crate) fn bind(
     ast: &Ast,
     schema: &Schema,
     gradient: Gradient,
 ) -> Result<CompiledExpression, CompilationFailure> {
+    let resolved;
+    let ast = if ast.contains_dynamic_lookup {
+        resolved = rewrite::resolve_subscripts(ast.clone(), schema)
+            .map_err(|fault| crate::frontend::failure(&ast.source, vec![fault]))?;
+        &resolved
+    } else {
+        ast
+    };
+
     let mut global_positions = Vec::with_capacity(ast.symbols.len());
     let mut problems = Vec::new();
 
@@ -166,7 +184,7 @@ pub(crate) fn bind(
     // The evaluator's own view of the tree: whole powers as the
     // multiplications they are, which no other consumer wants.
     let program = rewrite::unroll_powers(ast.program.clone());
-    let virtual_tape = irgen::emit(&program, &global_positions, schema.len());
+    let virtual_tape = irgen::emit(&program, &global_positions);
     let partial_diff =
         match gradient {
             Gradient::Never => None,
@@ -745,12 +763,13 @@ mod tests {
         }
     }
 
-    /// Subscripts are one-based, so zero is out of range rather than the first
-    /// element. The same check covers negatives.
+    /// Subscripts are one-based, so a computed zero is out of range like any
+    /// other miss; only a *written* `var[0]` gets the special case, and that
+    /// one never reaches a row.
     #[test]
     fn a_zero_subscript_is_out_of_bounds() {
-        let error =
-            eval_one("var[0]", &[("x1", 7.0)]).expect_err("var[0] is not the first parameter");
+        let error = eval_one("var[x1 - 7]", &[("x1", 7.0)])
+            .expect_err("a subscript computed as zero names nothing");
 
         match error {
             crate::diagnostics::EvaluationFailure::Runtime(problem) => assert_eq!(
@@ -765,10 +784,11 @@ mod tests {
     }
 
     /// Strict here too, for the same reason as the aggregate bounds: the JVM
-    /// implementation rounded, so `var[1.7]` silently became `var[2]`.
+    /// implementation rounded, so `var[1.7]` silently became `var[2]`. A
+    /// literal fraction is refused at compile time, so this one is computed.
     #[test]
     fn a_non_integral_subscript_is_an_error() {
-        let error = eval_one("var[1.5]", &[("x1", 7.0), ("x2", 8.0)])
+        let error = eval_one("var[x1 / 2]", &[("x1", 3.0), ("x2", 8.0)])
             .expect_err("1.5 is not an index and must not be rounded");
 
         match error {

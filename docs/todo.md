@@ -169,6 +169,7 @@ thing to read, and is the first work item rather than an admission.
       customer expressions. If real formulations contain implicit trigonometry —
       `sin(x) == x/2` shapes — the SCC case returns and so does the tearing work.
       Worth asking Garry before committing to skip it.
+      The wave-2 write-up of the trick itself is in `todo-overtaken.md` under "Duplicates".
 - [x] **Interval propagation, in `cvg::interval`.** HC4-revise: with every other
       coordinate held, what interval does this constraint admit for this one?
       `ConstraintSystem::slice` intersects that across every constraint naming the
@@ -193,9 +194,6 @@ thing to read, and is the first work item rather than an admission.
       moves — `p118` is a sheet whose long axes are eigenvectors, not
       coordinates. What it did buy: inequalities inform the walk at all, fewer
       shrink iterations, and `sqrt`/`ln`/`asin` narrow where `isolate` refused.
-
-- [ ] **The two rows below were planned on top of this and are now in doubt.
-      Read the note under the desugaring entry before doing either.**
 
 - [x] **Rotational preconditioning, which is what `p118` actually implicates.**
       *Landed 2026-09-11; see "Preconditioning the walker" under "What the
@@ -261,85 +259,11 @@ thing to read, and is the first work item rather than an admission.
       that fuses the five instructions, not an AST node. An optimisation belongs
       where optimisations belong, and the front end stays simple either way.
 
-- [ ] **The rest of it — desugaring in the *AST* — is refused.**
-      **It depends on interval propagation above, and must not precede it.**
-
-      `a == b +/- t` would become `And[a - b <= t, a - b >= -t]` — one
-      constraint and not two, which keeps the one-to-one constraint-to-`cN`
-      mapping an unsat core reads back through.
-
-      **The blocker is `classify::shape`, and it is not incidental.** An
-      equality does not merely *bound* a variable, it **determines** one:
-      `x1 + x2 < 3` bounds `x1` where `x1 + x2 == 3 +/- t` computes it. That is
-      a dependency claim no pair of inequalities makes, and it is what driving
-      is built on. Recovering it from two `Compare` nodes means re-pairing them
-      by structure — matching `lhs - rhs` with opposite-signed bounds — which
-      `fold_constants` or `invert_monotone` can disturb on one side and not the
-      other, enforced by nothing.
-
-      A static test that would survive the desugaring was looked for and not
-      found. "Is the root target interval bounded?" reads the same on both
-      forms, but `Kind::And` already exists for `invert_monotone`'s domain
-      guards, where `ln(x) < 2` becomes `And[x < e^2, x > 0]` and narrows `x` to
-      a bounded `(0, e^2]` while determining nothing. **Bounded is not
-      determined.**
-
-      What was left after the eval half landed: `rewrite.rs` 14 sites of
-      structural recursion that any node costs, `emit` 7, `classify` 3,
-      `interval` 2, `parse` and `ast` 3.
-
-      **The precondition for this was going to be retiring `Plan` and `Shape`,
-      and that turned out to be wrong.** The argument was that a Gibbs sweep
-      "updates one coordinate at a time and always reads current values, so the
-      topological sort has nothing left to do". Reading current values *is* the
-      failure. On `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y`
-      on the current `z` pins it within `t` of `z - 1`, and then `z` is pinned
-      within `t` of the new `y`: the pair shuffles by `t` a sweep instead of
-      travelling. Measured, while building `retract`'s intersection:
-      **three occupied cells of eighty where twenty-four are wanted.**
-
-      So `Plan` carries two things that per-coordinate conditioning cannot
-      reconstruct — the evaluation order, and *which coordinates are not yet
-      safe to condition on*. `ConstraintSystem::retract` now marks a driven coordinate
-      settled only once it has been drawn, and skips any constraint naming an
-      unsettled one. A pure Gibbs sweep cannot traverse a chain of tight
-      equalities, and `plan`'s topological order has more to do rather than
-      less.
-      `Driven by:` `cvg_equalities::two_coupled_equalities_are_traversed`
-
-      **What it would cost, done anyway.** `classify` sees two comparisons,
-      `shape` answers `Opaque`, `plan` answers `None`, `retract` becomes a
-      no-op, and the walker silently goes back to jittering beside a
-      measure-zero surface — every taxonomy row regressing at once, detected
-      only by a statistical coverage assertion that reports `0.0000%` without
-      reporting why. `NearEq` is what makes "a band of half-width `t`"
-      unforgeable, and it earns its keep until no consumer wants the pre-image.
-
-      **The opposite direction — recognising a facing pair of inequalities and
-      promoting it to an equality — was raised and dropped, and then measured.**
-      `2.9999999 < x1 + x2 < 3.0000001` as two inequalities occupies **nine
-      cells of forty** where the same band written as an equality occupies
-      thirty-two: nothing is driven, because nothing is an equality, so the walk
-      jitters inside a band 2e-7 wide. So the capability gap is real and the
-      size of it is known.
-
-      Still not built, and the reason is unchanged: it pays only for someone who
-      wrote the pair *instead of* `==`, which babel's own grammar discourages.
-      Kept as a number rather than a red test, because a red test for a feature
-      nobody has asked for is noise on the bar. Revisit when a real formulation
-      turns up written that way — the measurement is here to save re-deriving
-      what it would buy.
-
-      **The rule this is an instance of:** desugar when nothing downstream needs
-      what was desugared — `sum` unrolls to arithmetic and no pass ever asks
-      whether it was a fold — and keep the node when something does and
-      reconstruction is a pattern a later pass can break. `var[i]` resolution
-      was judged the same way: it was right because `classify` needed no edit.
-
 - [ ] **A design of experiments over driven arguments.** Latin hypercube or
       Sobol over the argument expression's variables. A correctness issue, not a
       tuning one: pick one `x` and every point in the pool shares a `y`, which
       is a constant rather than a sample.
+      The reasoning — why one `x` makes `y` a constant, not a sample — is in `todo-overtaken.md` under "Duplicates".
 - [x] **Repair a near-miss point instead of discarding it.** Done in its minimal
       form: `ConstraintSystem::adjusted`, a bounded coordinate sweep run on a solver's seed.
       It landed because it had to. Emitting `a == b +/- t` as two bounds rather
@@ -382,15 +306,20 @@ thing to read, and is the first work item rather than an admission.
       tape was held to it on a few thousand random rows, then it was deleted.
       The spec is the corpus, `runtime_errors.rs` and `special_values.rs`.
       Measurements in the brute-squad plan.
-- [ ] **A BLAS evaluator over `faer` matrices**, taking a `MatRef` and never
-      handing out a `MatMut`: no mutation of a matrix not allocated in the same
-      lexical scope. Downstream of the tape, since it needs the flat form.
 - [ ] **A fast sine for the evaluator.** Remez/minimax coefficients,
       Cody–Waite reduction. Objective functions keep the exact path, and nothing
       here is ever emitted to a solver.
+      The accuracy notes (SLEEF, Cody–Waite, the `FSIN` story) are in `todo-overtaken.md` under "Duplicates".
 
 ### Standing
 
+- [ ] **Compatibility nobody wants.** `irgen` kept an out-of-range literal subscript faulting
+      at run time "as the walker did" — preserved because it was there, not because anyone
+      asked — while `ConstraintSystem::new` refused the same subscript at construction, so
+      `var[2]` meant two things depending on the door (fixed 2026-09-17: `bind` resolves, one
+      meaning). Audit for others: grep `as the .* did`, `used to`, `the JVM`, `Kotlin` in `src/`
+      (33 hits on 2026-09-17, most of them honest history) and decide each — keep with a reason
+      that names who wants it, or delete.
 - [x] **Equality constraints — the taxonomy is closed.** One syntax,
       `a == b +/- t`, covering six structurally different things. A, B and D are
       driven or reached; C and F turned out to be one row and are **refused**, a
@@ -549,6 +478,7 @@ thing to read, and is the first work item rather than an admission.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
       it was — every backend lowers a constant whole exponent itself and
       `invert_monotone` rescues `2^x5` before any restriction would see it.
+      The three reasons — evaluator speed, narrowing, the solver — are in `todo-overtaken.md` under "Duplicates".
 - [ ] **Relevance-filtered parameters in a runtime error.** Planned as wave 2's
       optional tail and **not done**. `RuntimeProblem::parameters` carries the
       whole row; narrowing it to the variables the failing subexpression
@@ -584,14 +514,6 @@ thing to read, and is the first work item rather than an admission.
       nowhere to report it. That is the autocorrelation the KS failures are
       downstream of, and it is a better target to optimise against than KS is:
       it needs one run rather than two, and it moves continuously.
-- [ ] **The JVM tree does not compile** on this branch, and the gap has widened.
-      `db9add8` commented out four `locals [...]` declarations `rewriters.kt`
-      needs; the grammar has since gained `scalarBlock` / `scalarReturnStatement`
-      and pointed `lambdaExpr` at the first, which the Kotlin front end knows
-      nothing about. Restoring it now means teaching `rewriters.kt` the new rules
-      as well. Deleting the tree is looking like the honest answer — but capture
-      the `jvm-11-map` ledger rows' provenance first, since they cannot be
-      reproduced without it.
 - [ ] **The benchmark cannot resolve small changes.** Run-to-run spread is about
       15% on this machine; anything under that is not a reading. Also, no
       benchmark expression contains a constant subexpression, so folding is
@@ -943,14 +865,6 @@ an assumption. It is now checkable, and it caught things. Three open findings:
       added before this lands will produce more red of exactly this kind. Judge them accordingly.
       One caveat specific to bands: the covariance of a slab is near-singular in the thin direction,
       so the map needs a floor on the smallest eigenvalue or it inverts into nonsense.
-
-- [ ] **Effective sample size is estimated, not exact.** `autocorrelation_time` uses Sokal's
-      automatic windowing over the autocorrelation function. It has to, because emission is
-      round-robin across chains and so the correlation sits at the chain count rather than at lag
-      one — the conventional "truncate at the first non-positive lag" rule stops at lag one and
-      reports full independence for a sequence that has none. It did exactly that, and briefly made
-      a correlated sample look like grounds for suspecting the walker. A per-chain estimate would be
-      exact, but the test cannot see chain boundaries; exposing them is a public-API question.
 
 ## Not ported from the Kotlin
 
@@ -1619,57 +1533,6 @@ centroid (catches a shell or a clump). All three compare against a reference
 sample, which is the catch — the regions rows C and E are about are exactly the
 ones no reference can reach.
 
-- [ ] **Nearest-neighbour clustering, or random projections, for a sample that
-      spreads without filling.** `Case::occupancy` measures a joint grid over one
-      or two coordinates, which is right at that size and does not scale: past
-      about three coordinates the cell count runs away from the point count,
-      every point lands in its own cell, and occupancy saturates at `n` for good
-      and bad samples alike.
-
-      A per-coordinate variant existed briefly, for a twenty-four dimensional
-      row C case, and went when that row was refused rather than built. It was
-      not *stronger* — both catch a handful of clumped seeds, and both are blind
-      to a sample strung along a curve through the sheet, which is the Latin
-      hypercube's own weakness seen from the other side. It was only cheaper.
-
-      What would actually see a sample that spreads without filling is a
-      nearest-neighbour count (`k` seeds make `k` clumps whatever the dimension;
-      costs a radius) or KS on random projections (already written, in
-      `cvg_benchmarks::assert_same_distribution`; costs a reference sample, which
-      these regions cannot provide).
-      `Driven by:` nothing yet, and deliberately — neither should be built until
-      a case fails without it.
-
-- [ ] **Occupancy over an expression rather than a coordinate grid.** Geoff's
-      idea, and it is the one that scales: collapse the space with a scalar
-      function and measure occupancy of *its* histogram. A coordinate is the
-      simplest such function, so this generalises what is there rather than
-      replacing it, and being one-dimensional it is unchanged at 200 dimensions.
-      A test writer picks something that varies over the region — `x1 + 3*x3` for
-      the row-C sheet, `sum(xi)` for a high-dimensional band — and babel already
-      compiles and evaluates arbitrary expressions, so the harness change is
-      small.
-
-      **Three things it must not be.** *Not the constraint's own residual*: on a
-      tight equality the feasible set is a level set, so every feasible point has
-      a residual in `[-t, 0]` and a whole sheet collapses to a `1e-9` interval —
-      maximally uninformative, precisely here. (On an *inequality* the residual
-      does vary usefully, which is the asymmetry that makes this tempting and
-      wrong.) *Not a point check on the median*: "is there a point whose `f` is
-      near the known median" is one bit, where the distribution of `f` is the
-      real claim. *Not necessarily a derived CDF*: comparing against an
-      analytically-known distribution is the strongest form and it is also
-      circular for the regions we cannot sample — knowing `f`'s distribution over
-      a region means knowing the region. Bin occupancy needs no CDF, because `n`
-      seeds fill at most `n` bins whatever their values.
-
-      **The blind spot, kept in view:** any one-dimensional collapse is satisfied
-      by a sample that spreads in `f` while collapsing in `x`, the same way the
-      diagonal defeats marginals. It complements the input-space instruments and
-      does not dominate them.
-      `Driven by:` nothing yet — it is a harness change, and the case that would
-      justify it is the same high-dimensional row-C or row-E case above.
-
 - [ ] **`Progress::remember` evicts FIFO, and the window has two jobs that want
       opposite policies.** It keeps the most recent `RECENT_POINTS = 1024`,
       dropping from the front. Its own doc says the job is "to be a fair sample
@@ -1784,46 +1647,6 @@ Not regressions — this is a semantic change and the churn is the point:
 - **`cvg_benchmarks::parabolic_roots_*`** (D again, with distribution oracles
   attached) — these are the ones that will say whether the surface-then-band
   split preserves uniformity, and they are the reason not to guess.
-
-- [ ] **Integer-only exponents, and one rewrite to go with them.** Restricting `a ^ b` so `b` is
-      integer-typed buys three separate things:
-      *Evaluator speed* — measured, a single `^2` costs about what `sin`+`cos`+`sqrt`+`abs` costs,
-      because `powf` is a libm call (`x1 + x2 > 20 - x3^2` at 9163 pts/ms against 9360).
-      *SMT coverage* — `Pow` leaves the `untranslated` list entirely, since every integer power
-      expands to multiplication.
-      *One uniform rewrite* rather than a special case per backend.
-      Rewrite straight to `Kind::Fold` rather than to a `prod` aggregate: `Fold` is already the
-      post-unroll n-ary form both the emitter and evaluator consume, and going via `prod` means
-      emitting a node whose only purpose is to be rewritten again — a fixed point you would then
-      have to prove terminates. Same pass that already unrolls aggregates.
-
-- [ ] **Causalization, for the terms no solver will take.** The trick is to stop asking the solver
-      about a transcendental at all: if `y == sin(x) +/- t` and `y` appears nowhere else awkward,
-      then `y` is *determined* — choose `x`, evaluate, done. `sin(sin(x))` is fine too, being still a
-      function of `x`. What breaks it is a term constraining its own argument, `sin(x) == x/2`,
-      where `x` is inside and outside and inversion is unavoidable.
-      This is **causalization** in the Modelica sense and the algorithms are mature: bipartite
-      **matching** of equations to variables, **BLT decomposition** (Tarjan SCC) for a dependency
-      order, and **tearing** to shrink the algebraic loops that remain. Acyclic blocks evaluate;
-      strongly-connected blocks need Newton. The solver is then only wanted for the SCCs, and only
-      when the question is UNSAT rather than "give me a point".
-
-- [ ] **A piecewise sine belongs to the evaluator, not the emitter.** Table lookup with quadratic
-      interpolation is `O(h^3)` error, SIMD-friendly, and much cheaper than libm — good for the
-      tape. Choose coefficients by **Remez/minimax**, not Taylor: Taylor is optimal at a point,
-      minimax across the interval. Bhaskara I's 7th-century rational approximation is the classic
-      no-polynomial reference and is already good to ~0.0016.
-      **Do not emit it to a solver.** A hundred pieces is a hundred-way `ite` split, and the modulo
-      range reduction drags an integer variable in, pushing QF_NRA to QF_NIRA. Solvers tolerate
-      degree far better than disjunction, so this would be worse than the Taylor series the JVM
-      tried.
-
-- [ ] **Capability metadata per backend, eventually.** Which rewrites to apply depends on what the
-      target can accept, and today that is hardcoded as "refuse the transcendentals". The cheap half
-      is worth doing whenever the second backend appears: give `emit` a capability set rather than
-      an implicit one, so the refusal becomes data. The expensive half — runtime-pluggable solvers
-      with discoverable feature flags — should wait for a second backend to actually exist, since
-      a plugin system with one plugin is a guess about the second.
 
 ## The plan: getting constraints in front of the solver
 
@@ -1949,41 +1772,6 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       Unplanned benefit: this makes the wave-2 restriction affordable. Restricting `a ^ b` to an
       integer `b` would make `2^x5` a compile error, and inversion rewrites it away first.
 
-- [ ] **4 — Causalization**, scoped by what 1–3 leave behind rather than by ambition. Details in the
-      section above. The corpus residue after three steps is small and instructive: `y == sin(x)`
-      and `y > sin(theta)` are feed-forward and yield to matching alone; `sin(x1) <= 0` is a
-      periodic set, decomposable into intervals on a bounded domain but not by inversion; and
-      `x1 > sin(ln(cos(2.1^x1)))` is implicit and will remain the thing nothing helps with. Build it
-      when the residue is measured, not before — the shape of the leftovers should choose the
-      algorithm.
-
-- [ ] **5 — A design of experiments over driven arguments.** Once causalization says "choose `x`,
-      then `y = sin(x)` follows", *how* `x` gets chosen is a real question and one point is the wrong
-      answer. The driven variable is a deterministic function of its argument, so the distribution
-      of `y` is entirely decided by the distribution of `x` — pick one `x` and every point in the
-      pool shares a `y`, which is not a sample, it is a constant. What is wanted is a set of
-      arguments spanning the feasible range, which is a space-filling design: Latin hypercube or
-      Sobol over however many variables the argument expression contains, usually one.
-      Worth flagging that this is not the sampler's job as currently written. The walker moves in
-      the free variables and the driven ones are evaluated afterwards, so the design has to be over
-      the *arguments*, and its quality shows up in `cvg_benchmarks` as the marginal of `y`.
-      Good news: the oracles already there will measure it without modification.
-
-- [ ] **6 — A fast sine, for the evaluator only.** Unchanged from the section above, with the
-      accuracy question answered: **yes, fp32-ULP is comfortably achievable, and rather better.**
-      SLEEF ships 1-ULP and 3.5-ULP variants of `sin` at `f64` using Cody-Waite argument reduction
-      to `[-pi/2, pi/2]` and a nine-term polynomial; at `f32` four or five terms reach +/-1 ULP. The
-      Intel hardware-table memory is real but points somewhere unhelpful: Tang and Story's IA-64
-      work is *table-driven reduction followed by a polynomial*, around 0.6 ULP, and modern SIMD
-      libms have mostly dropped the table because a multiply is cheaper than a cache miss. The x87
-      `FSIN` instruction is the cautionary half of that story — microcoded, and it reduces against a
-      66-bit pi, so near multiples of pi it is not approximating `sin x` at all. Intel documented
-      its worst-case error as 1 ULP for years; the true figure is about 1.3 quintillion.
-      So the tradeoff is not "fast or accurate". It is reduction quality against argument magnitude,
-      and for constraint arguments in any sane range a short minimax polynomial is both faster than
-      libm and accurate to the last bit or two. Objective functions can keep the exact path
-      regardless; nothing here asks them to give up precision.
-
 ## Wave 2 — nothing non-finite travels, and powers are multiplication
 
 - [x] **Non-finite is an error now, at both phases.** One rule:
@@ -2077,13 +1865,6 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       systematic warm-up drift on top. A single reading of this suite is not
       evidence. That is now in `performance-records/README.md`, where someone
       reading a row will see it.
-
-- [ ] **Not done: relevance-filtered parameters.** Planned as this wave's optional tail
-      and skipped. `RuntimeProblem::parameters` carries the whole row where it could
-      carry only the variables the failing subexpression reads — walk the program for the
-      node matching `fault.span`, collect its `Kind::Global` ids, map them through
-      `global_positions`. Error path only, so free on the happy path. `locals` is the
-      harder half and needs a slot-to-name table the AST discards.
 
 
 ## Next
@@ -2256,18 +2037,6 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       usually agrees to stop; when it does not (below) the thread is abandoned with an
       error-level `tracing` line and the search carries on without it.
 
-- [ ] **Z3 holes: report the `(^ x 617/500)` hang upstream.** Found 2026-09-11 while deciding
-      how backends lower powers. SSCCE, through the crate's own binding with `rlimit` 100 000
-      and `timeout` 5 000 set on the solver:
-      `(declare-const x Real) (assert (= (^ x 1.234) 9.0)) (assert (> x 0.0))`.
-      Parse 2 ms; `check()` 119 s before `unknown`; a first run with rlimit alone went eight
-      minutes before it was killed. `(^ x 0.5)` and `(^ x y)` answer `unknown` in 30 ms, so it
-      is the rational exponent — presumably the degree-617 encoding — in a loop that never
-      polls the cancel flag. Both budgets are that one flag, so `Z3_interrupt` will not land
-      either; the leash above is what covers it. Report with the SSCCE and offer a fix if it is
-      a missing checkpoint. Where one such hole was found there will be more: this list is
-      where they go, and `tests/torture_tests.rs` is where the crate proves it survives them.
-
 - [x] **Gap coverage is budgeted in Z3's own units; the stepped beam census returns.**
       *2026-09-12.* Artemis's `e06-stepped-beam-20` (`tests/regression_fixture.rs`): 40
       variables, 41 constraints, one a `sum` over every segment, and `solve` ran 3.7 CPU-hours
@@ -2411,10 +2180,6 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       `SystemError::Unbound` carries the same failure. `Driven by:` `compile_errors::
       an_unbound_name_gets_a_caret_at_its_first_reference`, `every_unbound_name_is_reported`,
       and `system::tests::an_unbound_name_in_a_constraint_points_at_it`.
-- [ ] **`RuntimeProblem.locals` ships empty.** Kotlin printed `local-variables{x=3.0}` — covering
-      `var x = …` bindings as well as lambda parameters, since both lived in the same runtime heap.
-      Filling it needs a slot-to-name table the AST deliberately discards. `parameters` is
-      populated; this is the remaining half.
 
 ## Coverage
 
@@ -2466,16 +2231,6 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       iterations where tiered HotSpot wants ten thousand before C2 engages. Left in place as the
       record of what that number meant.
 
-- [ ] **`Expression::evaluate` is slower than the JVM's, and it should not be.** 4680 against 9700
-      points/ms on `x1 + x2`; the JVM wins the small cases outright and only loses once expressions
-      get dear enough to hide the difference. The cause is not the evaluator, it is that the
-      convenience wrapper builds a whole `Schema` per call — `Schema::new` clones a `String` for
-      every name, so the 200-variable case allocates two hundred strings *per evaluation*, where
-      the JVM merely hashes into a map it already has.
-      Fixable without touching the evaluator: resolve symbols against the supplied pairs directly
-      rather than constructing a `Schema` and binding. Worth doing, because this is the method
-      whose name makes it the one a newcomer reaches for.
-
 - [x] **Flatten the AST to a tape**, batch loop innermost, and *measure before reaching for
       SIMD*. Done; see step 1 of `brute-squad.md`. The tree-walk evaluator was not kept
       as the differential oracle after all: the tests are the spec, and the walker is gone.
@@ -2486,15 +2241,20 @@ Babel is small but not so small that it has no semantics to check. These are *tr
 errors — knowable without running the expression — and they are the reason `SemanticTranslator`
 keeps a fallible signature.
 
-- [ ] **Statically illegal subscripts.** `var[0]` and `var[-1]` are wrong for *every* schema, since
+- [x] **Statically illegal subscripts.** `var[0]` and `var[-1]` are wrong for *every* schema, since
       indices are one-based — no need to wait for a row. Same for a non-integral literal subscript.
-      Aggregate bounds already get this treatment via constant folding; subscripts do not.
+      Done 2026-09-17: `fold_constants` refuses a literal subscript of zero
+      (`ProblemKind::ZeroIndex`, "var[0] is not the first parameter (did you mean var[1]?)"),
+      negative (`NegativeDynamicIndex`) or not a whole number (`DynamicIndexNotAnInteger`)
+      at the subscript's span, after folding, so `var[2 - 2]` is caught too. Which parameters
+      *exist* still needs a schema and stays with `resolve_subscripts`; a subscript an aggregate
+      unrolls into (`sum(0, 2, i -> var[i])`) is folded after this pass runs and is still the
+      row's to report. `Driven by:` `compile_errors::a_subscript_below_one_is_caught_at_compile_time`,
+      `a_fractional_subscript_is_caught_at_compile_time`.
 - [ ] Revisit whether anything else deserves rejecting rather than evaluating: division by a
       literal zero, a lambda whose parameter is unused, a bound range that is statically empty.
       Kotlin allowed all three, and the first is load-bearing — `0/0` producing NaN is how the
       illegal-bound check triggers.
-- [ ] **General constant folding.** Only aggregate bounds fold today. Kotlin folded more broadly.
-      An optimisation, not semantics.
 
 ## Cleanups
 
@@ -2513,19 +2273,20 @@ keeps a fallible signature.
 
 ## Tooling
 
-- [ ] **`just tag <version>`** — verify the tree is clean and `Cargo.toml`'s version matches the tag
-      before tagging and pushing. Artemis pins babel by git tag, so a mismatched tag resolves fine
-      and wastes an afternoon. `digital-twin`'s `sanity-check` job ports over nearly verbatim.
-- [ ] **`cargo test --doc` in the justfile.** nextest does not run doctests. The `lib.rs` example is
-      still ```` ```ignore ```` from when `compile()` was `todo!()`; it works now.
-- [ ] **Justfile arg passthrough breaks on nextest filtersets.** `just test add` works;
-      `just test 'test(/foo/)'` does not, because `{{ARGS}}` interpolates into a pwsh command line
-      and pwsh tries to execute the filter expression.
+- [x] **`just tag <name>`** — the tree must be clean and the tag must be `v<Cargo.toml version>`,
+      optionally suffixed (`v0.1.3-artemis`), because Artemis pins sojourn by git tag and a
+      mismatched one resolves fine and wastes an afternoon. Tags locally; pushing stays a
+      deliberate step. Done 2026-09-17, in a justfile trimmed to what is used: `test-compile`
+      (clippy `--all-targets` compiles every test), `test-list`, `fmt-check` (folded into `lint`),
+      `clean` and `test-gpu` (`just test --features gpu`) are gone.
+- [x] **`cargo test --doc` in the justfile.** nextest does not run doctests; `just test` runs them
+      after nextest now (2026-09-17). The `lib.rs` example had already become `no_run`.
+- [x] **Justfile arg passthrough breaks on nextest filtersets.** `{{ARGS}}` interpolates into a
+      pwsh command line, so a filterset's parentheses need quoting twice:
+      `just test "-E 'test(/repair/)'"`. Documented on the recipe (2026-09-17) rather than worked
+      around with a shebang recipe, which would move the whole justfile off `pwsh -Command`.
 - [x] **Delete the Kotlin tree** and promote `crates/babel` to the root. Done in 1c26ed9 and the commit after it; no workspace table until a second crate
       appears. `set working-directory` in the Justfile went away at the same time.
-- [ ] **Panama bindings** for the existing Java codebase. Mechanical, and the i64/f64 split will
-      force changes on that side — but its model for variables is higher fidelity than "string", so
-      it should bridge the gap without much trouble.
 
 ## Deliberately not doing
 
@@ -2899,16 +2660,10 @@ every candidate; an axis move can change four of 201). In order of expected payo
       or a cheaper estimator past ~30 variables would, if a fixture ever asks (95% of use
       is under thirty variables, and the diagonal the fit degrades to at two hundred is
       what the sphere-plus-axis moves want anyway).
-- [ ] **Judge only what a move touched.** An axis move changes one coordinate;
-      `Incidence::affected` names the constraints that read it, and the walker calls
-      `is_feasible` over all of them. ~2× on the axis half of the judgements.
 - [ ] **Thinning for a design.** `THINNING_PER_DIMENSION = 2` decorrelates a *uniform
       sample*; a design is chosen farthest-first from the pool and wants spread, not
       independence. A count knob to measure after the tape lands, since it changes what the
       pool is rather than how fast it is made.
-- [ ] **Batch the shrink loop.** Judge several draws along the chord through the SIMD tile
-      at once and take the first feasible in order; where the "SIMD × cores" question (rayon
-      for brute force, a parked global pool or a per-call one) would land.
 - [x] **The rng at the API.** A seed on the builder *and* on `sample` was unidiomatic;
       `solve(&system, &mut rng)`, `sample(existing, count, &mut rng)` — and `repair` needs
       none — is the standard shape, and makes "same generator state, same answer" the
@@ -3162,13 +2917,6 @@ Artemis's note already names.
       far outside a loose inequality.
 - [x] **Seed passthrough.** `ConstraintSolver::with_seed(u64)`, public; `with_rng` stays hidden.
       `Driven by:` the polytope property test anchors on a seeded census.
-- [ ] **The Z3 judge, tests only.** Taxicab distance is piecewise linear — one auxiliary per
-      coordinate, two linear constraints each, minimise the sum — so `Optimize` can take it.
-      When it answers `unknown`, fall back to the certificate form: assert the constraints and
-      `|x - x0|_1 < r`, binary-search `r` on `unsat`. Needs only the satisfiability engine,
-      which is the robust half. Seconds per fixture is fine. **The judge's norm must match the
-      norm repair claims to be near in**, or the score is meaningless; L1 throughout.
-      `Driven by:` nothing yet — this *is* test infrastructure.
 - [x] **Fixtures.** Closed-form L1 projections for a half-space, a disc, a rotated slab with a
       driven coordinate; two disjoint bands where the nearer wins; a domain hole; two hundred
       bounds landed exactly; properties over a polytope (feasible by an independent

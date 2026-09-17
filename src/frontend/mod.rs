@@ -47,15 +47,7 @@ pub(crate) fn parse(source: &str) -> Result<Ast, CompilationFailure> {
         }
     };
 
-    // Two of these passes report kind and span; rendering needs the source,
-    // which lives here rather than in the rewriter.
-    let render = |faults: Vec<Fault>| CompilationFailure {
-        source: source.to_owned(),
-        problems: faults
-            .into_iter()
-            .map(|fault| Problem::new(fault.kind, source, fault.span))
-            .collect(),
-    };
+    let render = |faults| failure(source, faults);
 
     // The canonical form: constants folded, monotone comparisons inverted,
     // aggregates over known bounds unrolled, repeated factors collected into
@@ -69,6 +61,22 @@ pub(crate) fn parse(source: &str) -> Result<Ast, CompilationFailure> {
         contains_dynamic_lookup: lowered.contains_dynamic_lookup,
         is_constraint: lowered.is_constraint,
     })
+}
+
+/// Faults rendered against the source they were found in.
+///
+/// A rewrite pass reports kind and span and never carries the source; the
+/// boundary that has it — this parse, [`eval::bind`](crate::eval::bind)
+/// resolving subscripts, [`ConstraintSystem::new`](crate::ConstraintSystem::new)
+/// doing the same — turns them into problems here.
+pub(crate) fn failure(source: &str, faults: Vec<Fault>) -> CompilationFailure {
+    CompilationFailure {
+        source: source.to_owned(),
+        problems: faults
+            .into_iter()
+            .map(|fault| Problem::new(fault.kind, source, fault.span))
+            .collect(),
+    }
 }
 
 /// A parsed expression, ready to be bound to a [`Schema`](crate::Schema).

@@ -74,8 +74,7 @@ pub(crate) fn compile(constraint: &Ast) -> IntervalTape {
     let positions: Vec<u32> = (0..symbol_count)
         .map(|index| u32::try_from(index).expect("fewer than four billion symbols"))
         .collect();
-    let tape: VirtualTape =
-        irgen::emit(&constraint.program, &positions, symbol_count).single_assignment();
+    let tape: VirtualTape = irgen::emit(&constraint.program, &positions).single_assignment();
 
     let consts = tape.consts.values().to_vec();
     let locals = usize::from(tape.locals);

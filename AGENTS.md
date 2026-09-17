@@ -48,11 +48,11 @@ Everything runs from the repository root (the Justfile uses `pwsh`).
 
 ```
 just build          cargo fmt, then cargo build --all-targets   (also regenerates the parser)
-just test-compile   cargo test --no-run         MUST stay green
-just test           cargo nextest run --no-fail-fast
-just lint           clippy -D warnings, check-only; formatting is build's job
+just test           cargo nextest run --no-fail-fast, then cargo test --doc
+just lint           fmt --check and clippy -D warnings, check-only; --all-targets compiles every test
 just bench          release-mode throughput, writes performance-records/*.csv
 just brute          time-to-first-hit rungs + checks/s, release, machine otherwise idle
+just tag NAME       tag the commit as v<version>[-suffix], checked against Cargo.toml
 ```
 
 - Use **nextest**, not `cargo test`: the AST is recursive and a stack overflow in one
@@ -249,9 +249,13 @@ equations wanting the *same* variable drove neither — now the matching. What
 stays open is seeding: a chain keeps the arm it started on, and the other arm's
 seed is the bisection's to find, which it can in low dimension only.
 
-`var[i]` is resolved at `ConstraintSystem::new` — the first moment a schema
-exists, since `parse` has none and `Kind::Global` indexes the expression's own
-symbols while `var[i]` indexes the schema. After that
+`var[i]` is resolved at the first moment a schema exists — `eval::bind`, and
+before it `ConstraintSystem::new`, which keeps the resolved tree for the
+search — since `parse` has none and `Kind::Global` indexes the expression's
+own symbols while `var[i]` indexes the schema. A literal subscript is then
+the variable it names on every path: a load, a reference, an incidence row,
+or a problem with a caret if the schema has no such position — the same
+`CompilationFailure` an unbound name gets. After that
 `Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
 than "a subscript", and nothing downstream special-cases one.
 
@@ -386,7 +390,7 @@ checked for the substrings that matter and for balance, and never recorded to
 a file.
 
 **The GPU is a sieve and never a judge.** Behind the opt-in `gpu` feature
-(`just brute`, `just bench` and `just test-gpu` turn it on), brute force runs
+(`just brute`, `just bench` and `just test --features gpu` turn it on), brute force runs
 on whatever wgpu adapter is present: the tape is rendered as
 WGSL through the templates, candidates are drawn and judged on the device in `f32`
 with a slack, and *every survivor is re-judged exactly on the CPU*. A false

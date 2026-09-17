@@ -25,8 +25,8 @@ Everything is a [`just`](https://github.com/casey/just) recipe, and CI runs exac
 
 ```
 just build          compile the crate and every test target
-just test           run the test suite with nextest
-just lint           rustfmt and clippy, warnings denied
+just test           run the test suite with nextest, then the doctests
+just lint           rustfmt drift and clippy, warnings denied
 ```
 
 The lexer and parser are generated from [`grammar/`](grammar) by `build.rs` at build time.

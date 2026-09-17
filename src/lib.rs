@@ -84,8 +84,9 @@ mod solve;
 mod system;
 
 pub(crate) use eval::Schema;
-pub use eval::{CompiledExpression, CompiledGradient, Compiler, Gradient, compile};
 pub(crate) use frontend::{Ast, parse};
+
+pub use eval::{CompiledExpression, CompiledGradient, Compiler, Gradient, compile};
 pub use repair::RepairError;
 pub use solve::{
     ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_PRUNE_BUDGET,

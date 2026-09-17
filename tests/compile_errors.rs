@@ -167,6 +167,64 @@ fn a_fractional_bound_is_caught_at_compile_time() {
     });
 }
 
+/// A literal subscript that no schema could satisfy is refused where it is
+/// written, the way an aggregate bound is: subscripts are one-based, so
+/// `var[0]` and `var[-1]` name nothing whatever the box declares. The caret
+/// lands on the subscript, not on `var`. Zero is the common mistake and gets
+/// the fix in the message.
+#[test]
+fn a_subscript_below_one_is_caught_at_compile_time() {
+    assert_reports("var[0] + 1", "a subscript of zero", |p| {
+        p.kind == ProblemKind::ZeroIndex
+            && p.span == Span::new(4, 5)
+            && p.to_string() == "var[0] is not the first parameter (did you mean var[1]?) at '0'"
+    });
+    assert_reports("var[-1]", "a negative subscript", |p| {
+        p.kind
+            == ProblemKind::NegativeDynamicIndex {
+                requested_1index: -1,
+            }
+            && p.span == Span::new(4, 6)
+    });
+    // Folded first, so an expression that works out to zero is caught too.
+    assert_reports("var[2 - 2]", "a subscript that folds to zero", |p| {
+        p.kind == ProblemKind::ZeroIndex
+    });
+}
+
+/// A literal subscript past the variable list is a binding failure by
+/// position, reported the way an unbound name is: at bind, with a caret on
+/// the subscript. `compile` and `ConstraintSystem::new` agree on this.
+#[test]
+fn a_subscript_past_the_variables_is_caught_at_bind_time() {
+    let failure = sojourn::compile("var[2] + x1", &["x1"]).expect_err("there is no var[2]");
+
+    assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
+    let problem = &failure.problems[0];
+    assert_eq!(
+        problem.kind,
+        ProblemKind::DynamicIndexOutOfBounds {
+            requested_1index: 2,
+            available: 1,
+        }
+    );
+    assert_eq!(problem.span, Span::new(4, 5));
+    assert_eq!(
+        problem.to_string(),
+        "attempted to access 'var[2]' (the 2nd parameter) when only 1 exist at '2': evaluates to 2"
+    );
+}
+
+/// And one that is not a whole number, for the same reason
+/// [`a_fractional_bound_is_caught_at_compile_time`] gives: the JVM rounded.
+#[test]
+fn a_fractional_subscript_is_caught_at_compile_time() {
+    assert_reports("var[1.5]", "a fractional subscript", |p| {
+        matches!(&p.kind, ProblemKind::DynamicIndexNotAnInteger { value } if *value == 1.5)
+            && p.span == Span::new(4, 7)
+    });
+}
+
 /// `{:#}` is the expanded form — source and caret, monospace assumed. The
 /// alternate flag means "more elaborate" throughout the standard library
 /// (`{:#?}`, `{:#x}`), so it means that here too.
@@ -292,11 +350,15 @@ fn a_scalar_lambda_body_still_parses() {
         "sum(1, 3, i -> i)",
         "sum(1, 3, i -> var a = i + 1; a * 2)",
         "prod(1, 3, i -> return i * i)",
-        "sum(1, 200, i -> var[i]^2 - 3.0)",
     ] {
         sojourn::compile(source, &NO_VARIABLES)
             .unwrap_or_else(|e| panic!("{source:?} should parse: {e:#}"));
     }
+    // The subscripts this unrolls into are bound by position, so they need
+    // the two hundred variables they name.
+    let names: Vec<String> = (1..=200).map(|i| format!("x{i}")).collect();
+    sojourn::compile("sum(1, 200, i -> var[i]^2 - 3.0)", &names)
+        .unwrap_or_else(|e| panic!("should parse and bind: {e:#}"));
 }
 
 // ------------------------------------------------------------- aggregates

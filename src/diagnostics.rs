@@ -143,6 +143,15 @@ pub enum ProblemKind {
     },
     /// `var[i]` was given something that is not a whole number.
     DynamicIndexNotAnInteger { value: f64 },
+    /// `var[0]`, written as such. Subscripts are one-based, and zero is the
+    /// one mistake common enough to answer with the fix: the first parameter
+    /// is `var[1]`. Known from the source alone, so reported at compile time,
+    /// where [`DynamicIndexOutOfBounds`](Self::DynamicIndexOutOfBounds) needs
+    /// a row.
+    ZeroIndex,
+    /// `var[i]` was given a negative literal, which no schema can satisfy.
+    /// Compile time, like [`ZeroIndex`](Self::ZeroIndex).
+    NegativeDynamicIndex { requested_1index: i64 },
 
     /// A subexpression made only of constants works out to NaN or an infinity.
     ///
@@ -214,6 +223,12 @@ impl ProblemKind {
             Self::DynamicIndexNotAnInteger { .. } => {
                 "attempted to use a non-integer as an index".to_owned()
             }
+            Self::ZeroIndex => {
+                "var[0] is not the first parameter (did you mean var[1]?)".to_owned()
+            }
+            Self::NegativeDynamicIndex { requested_1index } => {
+                format!("attempted to access 'var[{requested_1index}]', but subscripts start at 1")
+            }
             Self::NonFiniteConstant { value } => {
                 let what = if value.is_nan() { "NaN" } else { "infinite" };
                 format!("this is constantly {what}")
@@ -244,6 +259,7 @@ impl ProblemKind {
         match self {
             Self::EmptyExpression
             | Self::Unsupported { .. }
+            | Self::ZeroIndex
             | Self::AggregateBoundNotConstant { .. }
             | Self::AggregateTooWide { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
@@ -255,7 +271,8 @@ impl ProblemKind {
             | Self::DegenerateTolerance { tolerance: value } => format!("evaluates to {value}"),
             Self::DynamicIndexOutOfBounds {
                 requested_1index, ..
-            } => {
+            }
+            | Self::NegativeDynamicIndex { requested_1index } => {
                 format!("evaluates to {requested_1index}")
             }
         }

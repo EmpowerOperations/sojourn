@@ -190,12 +190,13 @@ pub enum SystemError {
         constraint: ConstraintRef,
         failure: CompilationFailure,
     },
-    /// A constraint names a variable the box does not declare. It could never be
-    /// satisfied, and saying so once beats saying it on every evaluation — which
-    /// is what the JVM implementation did. Carries a problem per name, each with
-    /// a span at its first reference, the way [`Unparsable`](Self::Unparsable)
-    /// does; a separate arm because it is a different sentence to whoever reads
-    /// it — declare a variable, rather than fix a formula.
+    /// A constraint names a variable the box does not declare — by name, or by
+    /// position (`var[3]` over two variables). It could never be satisfied, and
+    /// saying so once beats saying it on every evaluation — which is what the
+    /// JVM implementation did. Carries a problem per name, each with a span at
+    /// its first reference, the way [`Unparsable`](Self::Unparsable) does; a
+    /// separate arm because it is a different sentence to whoever reads it —
+    /// declare a variable, rather than fix a formula.
     #[error("constraint {constraint} did not bind: {failure}")]
     Unbound {
         constraint: ConstraintRef,
@@ -235,21 +236,6 @@ pub enum SystemError {
         constraint: ConstraintRef,
         variable: String,
     },
-    /// `var[3]` against a box that declares two variables.
-    ///
-    /// Settled the moment a box was declared, and reported here rather than
-    /// once per evaluation as `ProblemKind::DynamicIndexOutOfBounds` — which is
-    /// where it used to surface, and is a runtime answer to a static question.
-    #[error(
-        "constraint {constraint} reads var[{requested}], and the box declares {available} variable(s)"
-    )]
-    SubscriptOutOfRange {
-        constraint: ConstraintRef,
-        /// The one-based index the source asked for.
-        requested: i64,
-        /// How many variables the box declares.
-        available: usize,
-    },
 }
 
 impl ConstraintSystem {
@@ -288,10 +274,9 @@ impl ConstraintSystem {
             // whole constraint rather than reason about it, and `interval`
             // would narrow nothing through it.
             let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
-                .map_err(|out_of_range| SystemError::SubscriptOutOfRange {
+                .map_err(|fault| SystemError::Unbound {
                     constraint: named.clone(),
-                    requested: out_of_range.requested,
-                    available: out_of_range.available,
+                    failure: crate::frontend::failure(&source, vec![fault]),
                 })?;
 
             // Compiling is the binding check, and the tape it produces is the
@@ -571,6 +556,38 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(failure.problems[0].span, Span::new(5, 7));
+    }
+
+    /// The same refusal by position: `var[3]` over two variables is unbound,
+    /// and the caret lands on the subscript.
+    #[test]
+    fn a_subscript_past_the_box_points_at_it() {
+        let error = ConstraintSystem::new(
+            vec![
+                InputVariable::new("x1", 0.0, 1.0),
+                InputVariable::new("x2", 0.0, 1.0),
+            ],
+            ["x1 < var[3]"],
+        )
+        .expect_err("there is no third variable");
+
+        let SystemError::Unbound {
+            constraint,
+            failure,
+        } = error
+        else {
+            panic!("expected an unbound subscript, got {error:?}");
+        };
+        assert_eq!(constraint.index, 0);
+        assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
+        assert_eq!(
+            failure.problems[0].kind,
+            ProblemKind::DynamicIndexOutOfBounds {
+                requested_1index: 3,
+                available: 2,
+            }
+        );
+        assert_eq!(failure.problems[0].span, Span::new(9, 10));
     }
 
     fn one_variable(source: &str) -> ConstraintSystem {

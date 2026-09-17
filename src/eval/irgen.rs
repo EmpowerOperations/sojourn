@@ -9,20 +9,17 @@
 //! literals become constant registers, `LocalSlot`s become local registers
 //! one-to-one, and everything else is a temporary.
 
-use crate::ast;
 use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, Program};
 use crate::diagnostics::Span;
 
 use super::tape::{Accumulate, Constants, Instruction, VirtualRegister, VirtualTape};
 
-/// Emits `program` against a schema of `row_len` variables, with
-/// `global_positions[GlobalId]` giving each symbol's row — to the virtual
-/// tape, which [`VirtualTape::allocate`] turns into the one the executors run
-/// and `differentiate` turns into its gradient's.
-pub(crate) fn emit(program: &Program, global_positions: &[u32], row_len: usize) -> VirtualTape {
+/// Emits `program`, with `global_positions[GlobalId]` giving each symbol's
+/// row, to the virtual tape — which [`VirtualTape::allocate`] turns into the
+/// one the executors run and `differentiate` turns into its gradient's.
+pub(crate) fn emit(program: &Program, global_positions: &[u32]) -> VirtualTape {
     let mut emitter = Emitter {
         global_positions,
-        row_len,
         consts: Constants::default(),
         next_temp: 0,
         insns: Vec::new(),
@@ -36,7 +33,6 @@ pub(crate) fn emit(program: &Program, global_positions: &[u32], row_len: usize) 
 
 struct Emitter<'a> {
     global_positions: &'a [u32],
-    row_len: usize,
     consts: Constants,
     next_temp: u32,
     insns: Vec<Instruction<VirtualRegister>>,
@@ -128,20 +124,9 @@ impl Emitter<'_> {
                 }
                 self.place(reg, dst, span)
             }
+            // Only a computed subscript reaches here: a literal one became a
+            // `Global` when `bind` resolved it against the schema.
             Kind::DynamicIndex(subscript) => {
-                // A literal subscript that names a real row is a plain load,
-                // so `sum(1, 200, i -> var[i]…)` does not spend two hundred
-                // constant registers on its indices. An invalid literal keeps
-                // the gather, so it still faults at run time as the walker did.
-                if let Kind::Literal(value) = subscript.kind
-                    && let Some(index) = ast::to_index(value)
-                    && index >= 1
-                    && usize::try_from(index - 1).is_ok_and(|p| p < self.row_len)
-                {
-                    let position = u32::try_from(index - 1).expect("checked against row_len");
-                    let reg = self.load(position, span);
-                    return self.place(reg, dst, span);
-                }
                 let index = self.expr(subscript, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
                 self.emit(
@@ -430,17 +415,23 @@ mod tests {
         assert_eq!(tape.consts, Vec::<f64>::new());
     }
 
+    /// What is left for a gather: a subscript the point decides.
     #[test]
-    fn an_invalid_literal_subscript_keeps_a_gather() {
-        let tape = tape_for("var[0]", &["x1"]);
-        assert_eq!(tape.consts, vec![0.0]);
+    fn a_computed_subscript_is_a_gather() {
+        let tape = tape_for("var[x1]", &["x1", "x2"]);
         assert_eq!(
             tape.insns,
-            vec![Instruction::Gather {
-                dst: R(1),
-                index: R(0),
-                subscript: Span::new(4, 5)
-            }]
+            vec![
+                Instruction::Load {
+                    dst: R(0),
+                    input: 0
+                },
+                Instruction::Gather {
+                    dst: R(1),
+                    index: R(0),
+                    subscript: Span::new(4, 6)
+                }
+            ]
         );
     }
 
@@ -752,7 +743,7 @@ mod tests {
             },
             frame_size: 1,
         };
-        let tape = super::emit(&program, &[], 0).allocate();
+        let tape = super::emit(&program, &[]).allocate();
         assert_eq!(tape.insns, vec![Instruction::Check { reg: R(0) }]);
         assert_eq!(tape.spans, vec![Span::new(0, 1)]);
         assert_eq!(tape.result, R(0));

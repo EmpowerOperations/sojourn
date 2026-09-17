@@ -132,7 +132,30 @@ fn fold_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
                 .map(fold_expr)
                 .collect::<Result<_, Vec<Fault>>>()?,
         },
-        Kind::DynamicIndex(index) => Kind::DynamicIndex(fold_descend(*index)?),
+        // A literal subscript that no schema could satisfy — zero, negative,
+        // or not a whole number — is refused here, where the aggregate bounds
+        // are, rather than on the first row that reaches it. Which parameters
+        // *exist* needs a schema and stays with `resolve_subscripts`.
+        Kind::DynamicIndex(index) => {
+            let index = fold_descend(*index)?;
+            if let Kind::Literal(value) = index.kind {
+                let kind = match to_index(value) {
+                    None => Some(ProblemKind::DynamicIndexNotAnInteger { value }),
+                    Some(0) => Some(ProblemKind::ZeroIndex),
+                    Some(requested_1index) if requested_1index < 0 => {
+                        Some(ProblemKind::NegativeDynamicIndex { requested_1index })
+                    }
+                    Some(_) => None,
+                };
+                if let Some(kind) = kind {
+                    return Err(vec![Fault {
+                        kind,
+                        span: index.span,
+                    }]);
+                }
+            }
+            Kind::DynamicIndex(index)
+        }
         Kind::Aggregate {
             kind,
             lower,
@@ -186,19 +209,6 @@ fn fold_descend(expr: Expr) -> Result<Box<Expr>, Vec<Fault>> {
     Ok(Box::new(fold_expr(expr)?))
 }
 
-/// A subscript naming a variable the schema does not have.
-///
-/// Reported at construction, where it used to surface once per evaluation as
-/// `ProblemKind::DynamicIndexOutOfBounds` - a runtime answer to a question that
-/// was settled the moment a box was declared.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SubscriptError {
-    /// The one-based index the source asked for.
-    pub(crate) requested: i64,
-    /// How many variables the schema declares.
-    pub(crate) available: usize,
-}
-
 /// Turns `var[1]` into an ordinary reference to the schema's first variable.
 ///
 /// # Why this one takes a schema when no other rewrite does
@@ -209,8 +219,10 @@ pub(crate) struct SubscriptError {
 /// index into the **schema**, in declaration order. Nothing inside `parse` can
 /// bridge those: it has no idea what variable 1 is.
 ///
-/// So this runs later, at the first moment a schema exists, which is
-/// [`ConstraintSystem::new`](crate::ConstraintSystem::new).
+/// So this runs later, at the first moment a schema exists: in
+/// [`eval::bind`](crate::eval::bind), and before it in
+/// [`ConstraintSystem::new`](crate::ConstraintSystem::new), which keeps the
+/// resolved tree for the search.
 ///
 /// # What it buys
 ///
@@ -227,8 +239,10 @@ pub(crate) struct SubscriptError {
 /// static to resolve, and interval evaluation answers `ENTIRE` to it.
 ///
 /// # Errors
-/// [`SubscriptError`] when a literal subscript falls outside the schema.
-pub(crate) fn resolve_subscripts(ast: Ast, schema: &Schema) -> Result<Ast, SubscriptError> {
+/// A [`Fault`] at the subscript — `DynamicIndexOutOfBounds` — when a literal
+/// falls outside the schema: settled the moment the schema exists, where it
+/// used to surface once per evaluation.
+pub(crate) fn resolve_subscripts(ast: Ast, schema: &Schema) -> Result<Ast, Fault> {
     if !ast.contains_dynamic_lookup {
         return Ok(ast);
     }
@@ -255,11 +269,7 @@ pub(crate) fn resolve_subscripts(ast: Ast, schema: &Schema) -> Result<Ast, Subsc
     })
 }
 
-fn resolve_block(
-    block: Block,
-    schema: &Schema,
-    symbols: &mut Vec<String>,
-) -> Result<Block, SubscriptError> {
+fn resolve_block(block: Block, schema: &Schema, symbols: &mut Vec<String>) -> Result<Block, Fault> {
     let Block {
         assignments,
         result,
@@ -279,11 +289,7 @@ fn resolve_block(
     })
 }
 
-fn resolve_expr(
-    expr: Expr,
-    schema: &Schema,
-    symbols: &mut Vec<String>,
-) -> Result<Expr, SubscriptError> {
+fn resolve_expr(expr: Expr, schema: &Schema, symbols: &mut Vec<String>) -> Result<Expr, Fault> {
     let Expr { kind, span } = expr;
 
     let kind = match kind {
@@ -296,11 +302,19 @@ fn resolve_expr(
                     span,
                 });
             };
-            let out_of_range = |requested| SubscriptError {
-                requested,
-                available: schema.len(),
+            let out_of_range = |requested_1index| Fault {
+                kind: ProblemKind::DynamicIndexOutOfBounds {
+                    requested_1index,
+                    available: schema.len(),
+                },
+                span: subscript.span,
             };
-            let requested = crate::ast::to_index(value).ok_or_else(|| out_of_range(0))?;
+            // Folding refused anything that is not a whole number before this
+            // pass runs; the arm is here so the match is total, not reachable.
+            let requested = to_index(value).ok_or(Fault {
+                kind: ProblemKind::DynamicIndexNotAnInteger { value },
+                span: subscript.span,
+            })?;
             let name = usize::try_from(requested - 1)
                 .ok()
                 .and_then(|position| schema.names().get(position))
@@ -317,7 +331,7 @@ fn resolve_expr(
                     symbols.push(name);
                     symbols.len() - 1
                 });
-            let index = u32::try_from(index).map_err(|_| out_of_range(requested))?;
+            let index = u32::try_from(index).expect("fewer than four billion symbols");
             Kind::Global(GlobalId::from_index(index))
         }
 
@@ -1664,7 +1678,7 @@ mod tests {
 
     // ------------------------------------------------------- resolve_subscripts
 
-    fn resolved(source: &str, names: &[&str]) -> Result<Ast, SubscriptError> {
+    fn resolved(source: &str, names: &[&str]) -> Result<Ast, Fault> {
         let schema = Schema::for_names(names);
         resolve_subscripts(crate::parse(source).expect("should compile"), &schema)
     }
@@ -1722,19 +1736,22 @@ mod tests {
         );
     }
 
-    /// Settled the moment a box is declared, so it is answered then rather than
-    /// once per evaluation.
+    /// Settled the moment a schema exists, so it is answered then rather than
+    /// once per evaluation — and at the subscript, so a caret can land on it.
     #[test]
     fn a_subscript_past_the_schema_is_reported() {
         assert_eq!(
             resolved("var[3] + 1", &["x1", "x2"]),
-            Err(SubscriptError {
-                requested: 3,
-                available: 2,
+            Err(Fault {
+                kind: ProblemKind::DynamicIndexOutOfBounds {
+                    requested_1index: 3,
+                    available: 2,
+                },
+                span: Span::new(4, 5),
             })
         );
-        // One-based, so zero is out of range at the other end.
-        assert!(resolved("var[0] + 1", &["x1", "x2"]).is_err());
+        // Zero is out of range at the other end, and refused before this
+        // pass runs — `compile_errors::a_subscript_below_one_is_caught_at_compile_time`.
     }
 
     /// A computed subscript survives untouched, and keeps the flag true.
