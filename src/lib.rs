@@ -71,6 +71,29 @@
 //! Boolean expressions evaluate to a scalar whose *sign* carries the truth
 //! value: `<= 0` is true, `> 0` is false. That is the canonical `g(x) <= 0`
 //! constraint form, so a violated constraint reports how badly it was violated.
+//!
+//! # Where is it? — `tracing`
+//!
+//! Every stage boundary is a [`tracing`] event or span at `debug`: `solve`,
+//! `sample` and `repair` open a span each; the walker's burn-in and walk, a
+//! design, a contraction and each repair stage report as they go; and every
+//! COBYLA run says `cobyla starts` with its dimensions and budget *before* it
+//! runs, and reports its evaluations and its reason after. Each COBYLA
+//! evaluation is a `trace` event, numbered. So a run that should have
+//! finished and has not is located by its last line:
+//!
+//! ```no_run
+//! use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+//! tracing_subscriber::fmt()
+//!     .with_env_filter(EnvFilter::new("sojourn=trace"))
+//!     .with_span_events(FmtSpan::ENTER)
+//!     .init();
+//! ```
+//!
+//! The COBYLA in this crate is [`basin`], pure Rust: a stack inside `nlopt`
+//! is not this crate's. Every loop in the engine is bounded by a count, never
+//! a clock, so a run that does not return is a bug here, and the last line
+//! names the stage it is in.
 
 // Crate-private while the shape is still settling; goes public when the
 // pluggable rewriter needs it.

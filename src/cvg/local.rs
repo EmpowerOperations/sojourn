@@ -196,7 +196,11 @@ pub(crate) fn find_initial(
             cube: Cube::over(bounds),
             best: RefCell::new(None),
             stop: Rc::new(Cell::new(false)),
+            evaluations: Cell::new(0),
         };
+        // Before the run, not only after it: a run that never returns leaves
+        // this as the last line, which says where and with what.
+        tracing::debug!(start, dimensions, budget, "cobyla starts");
         let solver = Cobyla::new()
             .with_initial_radius(INITIAL_RADIUS)
             .with_final_radius(FINAL_RADIUS);
@@ -314,6 +318,8 @@ struct Landing<'a> {
     /// Raised when a point has been judged feasible; the executor's stop
     /// check reads it between iterations.
     stop: Rc<Cell<bool>>,
+    /// How many times COBYLA has asked, numbering the trace of each ask.
+    evaluations: Cell<u64>,
 }
 
 impl CostFunction for &Landing<'_> {
@@ -349,6 +355,11 @@ impl CostFunction for &Landing<'_> {
             }
             self.stop.set(true);
         }
+        // Every ask, numbered, at `trace`: what a run was doing when it was
+        // last heard from, if it is never heard from again.
+        let evaluation = self.evaluations.get() + 1;
+        self.evaluations.set(evaluation);
+        tracing::trace!(evaluation, cost = total, worst, inside, "cobyla evaluation");
         Ok(total)
     }
 }
@@ -400,14 +411,17 @@ pub(crate) fn nearest(
         margin: (2.0 * clearance).max(LEAST_MARGIN),
         clear: RefCell::new(None),
         feasible: RefCell::new(None),
+        evaluations: Cell::new(0),
     };
     let start = projection.cube.normalised(from);
+    let budget = PROJECTION_EVALS_PER_DIMENSION * (dimensions as u64 + 1);
+    tracing::debug!(dimensions, clearance, budget, "cobyla starts");
 
     let solver = Cobyla::new()
         .with_initial_radius(PROJECTION_RADIUS)
         .with_final_radius(FINAL_RADIUS);
     let Ok(result) = Executor::new(&projection, solver, CobylaState::new(start))
-        .max_cost_evals(PROJECTION_EVALS_PER_DIMENSION * (dimensions as u64 + 1))
+        .max_cost_evals(budget)
         .run();
 
     let clear = projection.clear.into_inner();
@@ -440,6 +454,8 @@ struct Projection<'a> {
     /// distance; and the nearest feasible one without it.
     clear: RefCell<Option<(f64, Point)>>,
     feasible: RefCell<Option<(f64, Point)>>,
+    /// How many times COBYLA has asked, numbering the trace of each ask.
+    evaluations: Cell<u64>,
 }
 
 impl Projection<'_> {
@@ -510,12 +526,17 @@ impl CostFunction for &Projection<'_> {
                 *best = Some((distance, point.clone()));
             }
         };
-        if self.problem.is_feasible(&point, self.clearance) {
+        let clear = self.problem.is_feasible(&point, self.clearance);
+        if clear {
             keep(&self.clear);
         }
-        if self.problem.is_feasible(&point, 0.0) {
+        let feasible = self.problem.is_feasible(&point, 0.0);
+        if feasible {
             keep(&self.feasible);
         }
+        let evaluation = self.evaluations.get() + 1;
+        self.evaluations.set(evaluation);
+        tracing::trace!(evaluation, distance, clear, feasible, "cobyla evaluation");
         Ok(self.distance(unit))
     }
 }

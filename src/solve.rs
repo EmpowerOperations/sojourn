@@ -458,6 +458,12 @@ impl ConstraintSolver {
         system: &ConstraintSystem,
         rng: &mut R,
     ) -> Result<FeasibleRegion, Infeasibility> {
+        let _span = tracing::debug_span!(
+            "solve",
+            variables = system.variables.len(),
+            constraints = system.constraints.len()
+        )
+        .entered();
         let stream = Xoshiro256PlusPlus::from_rng(rng);
         let mut ladder = Ladder::new(system, stream, &self.strategies, self.budgets);
         let (verdict, progress) = cvg::open(system, &mut ladder, self.known_feasible.clone());
@@ -712,6 +718,7 @@ impl FeasibleRegion {
         count: usize,
         rng: &mut R,
     ) -> Result<Mat<f64>, SampleError> {
+        let _span = tracing::debug_span!("sample", count, existing = existing.ncols()).entered();
         let rows = self.system.variables.len();
         assert!(
             existing.ncols() == 0 || existing.nrows() == rows,
