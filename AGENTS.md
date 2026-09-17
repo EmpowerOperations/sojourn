@@ -14,7 +14,9 @@ Read these before changing anything, in this order:
    one `Ast`, a meaning-preserving front end, two backends (`eval`, `cvg`).
 2. [`docs/todo.md`](docs/todo.md) — the roadmap *and* the reasoning: measurements, dead ends,
    and the decisions that are not recoverable from the code. Part two is long on
-   purpose. Add to it when you learn something the code cannot say.
+   purpose. Add to it when you learn something the code cannot say. Entries that
+   events overtook move to [`docs/todo-overtaken.md`](docs/todo-overtaken.md),
+   verbatim, with a line on why.
 3. [`performance-records/README.md`](performance-records/README.md)
    — how to read and write a throughput number honestly.
 4. [`docs/brute-squad.md`](docs/brute-squad.md) — the plan for wide-batch
@@ -90,7 +92,8 @@ it returns, and there is no worker, no channel and no future — the async
 `solve` and the batch stream that justified them went on 2026-09-16, when the
 last consumer of a stream turned out to want one design.
 The full inventory of the engine's loops and the hedges considered is in
-`docs/todo.md` under "Hanging is the worst failure mode".
+`docs/todo-overtaken.md` under "Hanging is the worst failure mode" — overtaken
+with the worker, kept for the reasoning.
 
 **Call functions by their module.** Import modules and types; call functions
 qualified — `eval::bind(..)`, `cvg::open(..)`, `ast::to_index(..)` — rather

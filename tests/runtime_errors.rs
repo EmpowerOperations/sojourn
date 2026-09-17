@@ -12,7 +12,7 @@
 
 mod common;
 
-use sojourn::diagnostics::{CompileError, EvaluationFailure, ProblemKind};
+use sojourn::diagnostics::{EvaluationFailure, ProblemKind, Span};
 
 #[test]
 fn dynamic_index_out_of_bounds() {
@@ -35,13 +35,20 @@ fn dynamic_index_out_of_bounds() {
 #[test]
 fn missing_statically_referenced_symbol_is_reported_at_bind_time() {
     // The JVM implementation re-checked this on every evaluate(); here it is a
-    // property of the binding, so it surfaces once.
-    let err = sojourn::compile("x1 + x2", &["x1"]).expect_err("binding without x2 should fail");
+    // property of the binding, so it surfaces once — and with a span, like
+    // any other compile-time problem.
+    let failure = sojourn::compile("x1 + x2", &["x1"]).expect_err("binding without x2 should fail");
 
-    let CompileError::Bind(err) = err else {
-        panic!("expected a bind failure, got {err:?}");
-    };
-    assert_eq!(err.missing, vec!["x2".to_owned()]);
+    assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
+    let problem = &failure.problems[0];
+    assert_eq!(
+        problem.kind,
+        ProblemKind::Unbound {
+            name: "x2".to_owned()
+        }
+    );
+    assert_eq!(problem.span, Span::new(5, 7));
+    assert_eq!(problem.column_idx, 5);
 }
 /// The other side of the rule: a non-finite value handed *in* is caught at the
 /// variable rather than travelling into the arithmetic.

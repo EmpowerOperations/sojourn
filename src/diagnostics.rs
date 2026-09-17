@@ -120,6 +120,12 @@ pub enum ProblemKind {
     /// A construct babel parses but this build cannot lower yet.
     Unsupported { feature: String },
 
+    /// The expression names a variable nothing supplies: not in the list a
+    /// [`compile`](crate::compile) was given, not declared in a
+    /// [`ConstraintSystem`](crate::ConstraintSystem)'s box. Located at the
+    /// name's first reference; a name used twice is one problem.
+    Unbound { name: String },
+
     // ---- defined, but nothing produces these until the features land ----
     /// A `sum`/`prod` bound is a constant that is not a usable index: NaN,
     /// infinite, or fractional.
@@ -179,6 +185,7 @@ impl ProblemKind {
             Self::EmptyExpression => "expression is empty".to_owned(),
             Self::Syntax { .. } => "syntax error".to_owned(),
             Self::Unsupported { feature } => format!("{feature} is not supported yet"),
+            Self::Unbound { .. } => "unknown variable".to_owned(),
             Self::IllegalAggregateBound { bound, .. } => format!("illegal {bound} bound value"),
             Self::AggregateBoundNotConstant { bound } => {
                 format!("the {bound} bound of a sum or prod must be a constant")
@@ -240,6 +247,7 @@ impl ProblemKind {
             | Self::AggregateBoundNotConstant { .. }
             | Self::AggregateTooWide { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
+            Self::Unbound { .. } => "no input variable by that name".to_owned(),
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value }
             | Self::NonFiniteConstant { value }
@@ -426,7 +434,11 @@ fn join_bindings(bindings: &[(String, f64)]) -> String {
         .join(", ")
 }
 
-/// Compilation produced no evaluable expression.
+/// Compilation produced no evaluable expression: every problem found, each
+/// with its span, whether the text did not parse or it parsed and named a
+/// variable nothing supplies ([`ProblemKind::Unbound`], at the name's first
+/// reference). One type for everything between source text and a bound
+/// expression, since every problem on that road has somewhere to point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompilationFailure {
     pub source: String,
@@ -435,78 +447,11 @@ pub struct CompilationFailure {
 
 impl std::error::Error for CompilationFailure {}
 
-/// An expression named variables the caller did not declare.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindError {
-    /// Symbols the expression references that the schema does not supply.
-    pub missing: Vec<String>,
-}
-
-impl fmt::Display for BindError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "missing value(s) for {}", self.missing.join(", "))
-    }
-}
-
-impl std::error::Error for BindError {}
-
-/// Source text did not become an expression bound to a schema.
-///
-/// The two halves of [`compile`](crate::compile): the text did not parse, or
-/// it parsed and named something the schema does not have. Kept as two arms
-/// rather than one list of problems because they are different sentences to
-/// whoever reads them — the first sends someone to fix a formula, the second
-/// to add a variable — and because a bind failure has no span to point at.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompileError {
-    /// The text is not a babel expression; every problem found, with spans.
-    Parse(CompilationFailure),
-    /// A well-formed expression naming variables the schema does not supply.
-    Bind(BindError),
-}
-
-impl fmt::Display for CompileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Forward the flag, so `{:#}` still renders the caret blocks.
-        match self {
-            Self::Parse(failure) => {
-                if f.alternate() {
-                    write!(f, "{failure:#}")
-                } else {
-                    write!(f, "{failure}")
-                }
-            }
-            Self::Bind(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for CompileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Parse(failure) => Some(failure),
-            Self::Bind(e) => Some(e),
-        }
-    }
-}
-
-impl From<CompilationFailure> for CompileError {
-    fn from(failure: CompilationFailure) -> Self {
-        Self::Parse(failure)
-    }
-}
-
-impl From<BindError> for CompileError {
-    fn from(e: BindError) -> Self {
-        Self::Bind(e)
-    }
-}
-
 /// Evaluation failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvaluationFailure {
     /// The source never became an expression bound to the inputs given.
-    Compile(CompileError),
+    Compile(CompilationFailure),
     /// A problem arose while evaluating.
     Runtime(Box<RuntimeProblem>),
     /// The row handed to `evaluate` did not match the bound schema's width.
@@ -541,8 +486,8 @@ impl fmt::Display for EvaluationFailure {
 
 impl std::error::Error for EvaluationFailure {}
 
-impl From<CompileError> for EvaluationFailure {
-    fn from(e: CompileError) -> Self {
-        Self::Compile(e)
+impl From<CompilationFailure> for EvaluationFailure {
+    fn from(failure: CompilationFailure) -> Self {
+        Self::Compile(failure)
     }
 }

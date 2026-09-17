@@ -121,4 +121,65 @@ impl Ast {
     pub(crate) fn symbols(&self) -> &[String] {
         &self.symbols
     }
+
+    /// Where each symbol is first referenced, indexed like
+    /// [`symbols`](Self::symbols): the span to put a caret under when a
+    /// symbol turns out to be unbound. Read off the tree — every `Global`
+    /// node carries the span of the reference that made it — rather than
+    /// recorded beside `symbols`, so it cannot drift from what the tree says.
+    /// `None` for a symbol nothing references, which the translator never
+    /// produces but the walk does not assume.
+    pub(crate) fn reference_spans(&self) -> Vec<Option<Span>> {
+        let mut spans = vec![None; self.symbols.len()];
+        first_references(&self.program.body.result, &mut spans);
+        for assignment in &self.program.body.assignments {
+            first_references(&assignment.value, &mut spans);
+        }
+        spans
+    }
+}
+
+/// Records the earliest-spanned reference of each global under `expr`.
+fn first_references(expr: &ast::Expr, spans: &mut [Option<Span>]) {
+    use ast::Kind;
+    match &expr.kind {
+        Kind::Global(id) => {
+            let slot = &mut spans[id.index()];
+            if slot.is_none_or(|held| expr.span < held) {
+                *slot = Some(expr.span);
+            }
+        }
+        Kind::Literal(_) | Kind::Local(_) => {}
+        Kind::Unary { arg, .. } => first_references(arg, spans),
+        Kind::Binary { lhs, rhs, .. } | Kind::Compare { lhs, rhs, .. } => {
+            first_references(lhs, spans);
+            first_references(rhs, spans);
+        }
+        Kind::NearEq { lhs, rhs, .. } => {
+            first_references(lhs, spans);
+            first_references(rhs, spans);
+        }
+        Kind::And { terms } | Kind::Fold { terms, .. } => {
+            for term in terms {
+                first_references(term, spans);
+            }
+        }
+        Kind::DynamicIndex(index) => first_references(index, spans),
+        Kind::Block(block) => {
+            for assignment in &block.assignments {
+                first_references(&assignment.value, spans);
+            }
+            first_references(&block.result, spans);
+        }
+        Kind::Aggregate {
+            lower, upper, body, ..
+        } => {
+            first_references(lower, spans);
+            first_references(upper, spans);
+            for assignment in &body.assignments {
+                first_references(&assignment.value, spans);
+            }
+            first_references(&body.result, spans);
+        }
+    }
 }

@@ -192,11 +192,14 @@ pub enum SystemError {
     },
     /// A constraint names a variable the box does not declare. It could never be
     /// satisfied, and saying so once beats saying it on every evaluation — which
-    /// is what the JVM implementation did.
-    #[error("constraint {constraint} references {} which is not an input variable", .missing.join(", "))]
+    /// is what the JVM implementation did. Carries a problem per name, each with
+    /// a span at its first reference, the way [`Unparsable`](Self::Unparsable)
+    /// does; a separate arm because it is a different sentence to whoever reads
+    /// it — declare a variable, rather than fix a formula.
+    #[error("constraint {constraint} did not bind: {failure}")]
     Unbound {
         constraint: ConstraintRef,
-        missing: Vec<String>,
+        failure: CompilationFailure,
     },
     /// A scalar expression where a constraint was wanted. It has no `<= 0`
     /// reading, so asserting one would invent a constraint nobody wrote.
@@ -295,10 +298,10 @@ impl ConstraintSystem {
             // one every strategy evaluates, so it is kept rather than redone.
             let tape = match crate::eval::bind(&constraint, &schema, Gradient::BestEffort) {
                 Ok(tape) => tape,
-                Err(unbound) => {
+                Err(failure) => {
                     return Err(SystemError::Unbound {
                         constraint: named,
-                        missing: unbound.missing,
+                        failure,
                     });
                 }
             };
@@ -538,10 +541,36 @@ pub(crate) mod tests {
     use faer::Mat;
 
     use crate::cvg::incidence::{ConstraintId, Row};
-    use crate::{ConstraintSystem, InputVariable, Point};
+    use crate::diagnostics::{ProblemKind, Span};
+    use crate::{ConstraintSystem, InputVariable, Point, SystemError};
 
     pub(crate) fn system(inputs: Vec<InputVariable>, sources: &[&str]) -> ConstraintSystem {
         ConstraintSystem::new(inputs, sources.iter().copied()).expect("the fixture binds")
+    }
+
+    /// A constraint naming a variable the box does not declare is refused at
+    /// construction, and the refusal points at the name.
+    #[test]
+    fn an_unbound_name_in_a_constraint_points_at_it() {
+        let error = ConstraintSystem::new(vec![InputVariable::new("x1", 0.0, 1.0)], ["x1 < x9"])
+            .expect_err("x9 is not declared");
+
+        let SystemError::Unbound {
+            constraint,
+            failure,
+        } = error
+        else {
+            panic!("expected an unbound name, got {error:?}");
+        };
+        assert_eq!(constraint.index, 0);
+        assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
+        assert_eq!(
+            failure.problems[0].kind,
+            ProblemKind::Unbound {
+                name: "x9".to_owned()
+            }
+        );
+        assert_eq!(failure.problems[0].span, Span::new(5, 7));
     }
 
     fn one_variable(source: &str) -> ConstraintSystem {

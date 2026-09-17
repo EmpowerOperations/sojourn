@@ -25,7 +25,7 @@ use faer::{Col, Mat, MatRef};
 
 use crate::Ast;
 use crate::diagnostics::EvaluationFailure;
-use crate::diagnostics::{BindError, CompileError, Fault, Problem, RuntimeProblem};
+use crate::diagnostics::{CompilationFailure, Fault, Problem, ProblemKind, RuntimeProblem, Span};
 use crate::frontend::rewrite;
 
 use tape::{AllocatedTape, Register};
@@ -48,12 +48,12 @@ pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 /// list, one-based.
 ///
 /// # Errors
-/// [`CompileError::Parse`] with every problem found — parsing does not stop at
-/// the first — or [`CompileError::Bind`] naming the symbols `variables` lacks.
+/// [`CompilationFailure`] with every problem found — parsing does not stop at
+/// the first, and a name `variables` lacks is one, at its first reference.
 pub fn compile<S: AsRef<str>>(
     source: &str,
     variables: &[S],
-) -> Result<CompiledExpression, CompileError> {
+) -> Result<CompiledExpression, CompilationFailure> {
     Compiler::new().compile(source, variables)
 }
 
@@ -102,16 +102,16 @@ impl Compiler {
     /// text into something that runs.
     ///
     /// # Errors
-    /// [`CompileError::Parse`] with every problem found — parsing does not
-    /// stop at the first — or [`CompileError::Bind`] naming the symbols
-    /// `variables` lacks.
+    /// [`CompilationFailure`] with every problem found — parsing does not
+    /// stop at the first, and a name `variables` lacks is one, at its first
+    /// reference.
     pub fn compile<S: AsRef<str>>(
         &self,
         source: &str,
         variables: &[S],
-    ) -> Result<CompiledExpression, CompileError> {
+    ) -> Result<CompiledExpression, CompilationFailure> {
         let ast = crate::parse(source)?;
-        Ok(bind(&ast, &Schema::for_names(variables), self.gradient)?)
+        bind(&ast, &Schema::for_names(variables), self.gradient)
     }
 }
 
@@ -122,27 +122,45 @@ impl Compiler {
 /// every evaluation as the JVM implementation did.
 ///
 /// # Errors
-/// Returns [`BindError`] if the schema omits a symbol the expression needs.
+/// [`CompilationFailure`] naming every symbol the schema omits, each at its
+/// first reference in the source.
 pub(crate) fn bind(
     ast: &Ast,
     schema: &Schema,
     gradient: Gradient,
-) -> Result<CompiledExpression, BindError> {
+) -> Result<CompiledExpression, CompilationFailure> {
     let mut global_positions = Vec::with_capacity(ast.symbols.len());
-    let mut missing = Vec::new();
+    let mut problems = Vec::new();
 
-    for symbol in &ast.symbols {
+    for (symbol, span) in ast.symbols.iter().zip(ast.reference_spans()) {
         match schema.names.iter().position(|name| name == symbol) {
             Some(position) => {
                 let pos = u32::try_from(position).unwrap_or(u32::MAX);
                 global_positions.push(pos);
             }
-            None => missing.push(symbol.clone()),
+            None => {
+                // A symbol nothing references has nowhere to point; the whole
+                // expression is the honest fallback.
+                let whole = Span::new(
+                    0,
+                    u32::try_from(ast.source.chars().count()).unwrap_or(u32::MAX),
+                );
+                problems.push(Problem::new(
+                    ProblemKind::Unbound {
+                        name: symbol.clone(),
+                    },
+                    &ast.source,
+                    span.unwrap_or(whole),
+                ));
+            }
         }
     }
 
-    if !missing.is_empty() {
-        return Err(BindError { missing });
+    if !problems.is_empty() {
+        return Err(CompilationFailure {
+            source: ast.source.clone(),
+            problems,
+        });
     }
 
     // The evaluator's own view of the tree: whole powers as the
@@ -654,9 +672,8 @@ impl Tiles {
 /// precisely so that nothing has to.
 #[cfg(test)]
 pub(crate) fn eval_one(source: &str, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
-    let ast = crate::parse(source).map_err(CompileError::from)?;
-    let compiled =
-        bind(&ast, &Schema::for_table(inputs), Gradient::Never).map_err(CompileError::from)?;
+    let ast = crate::parse(source)?;
+    let compiled = bind(&ast, &Schema::for_table(inputs), Gradient::Never)?;
     let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
     let res = compiled.eval(sample.as_ref())?;
     Ok(res[0])
@@ -668,7 +685,7 @@ pub(crate) fn eval_one(source: &str, inputs: &[(&str, f64)]) -> Result<f64, Eval
 #[cfg(test)]
 pub(crate) fn eval_parsed(ast: &Ast, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
     let schema = Schema::for_table(inputs);
-    let compiled = bind(ast, &schema, Gradient::Never).map_err(CompileError::from)?;
+    let compiled = bind(ast, &schema, Gradient::Never)?;
     let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
     let res = compiled.eval(sample.as_ref())?;
     Ok(res[0])

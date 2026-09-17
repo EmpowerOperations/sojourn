@@ -15,20 +15,17 @@
 //!   computed inconsistently between call sites.
 //! * Kotlin's `rangeInText` was an inclusive `IntRange`; [`Span`] is half-open.
 
-use sojourn::diagnostics::{
-    BoundKind, CompilationFailure, CompileError, Problem, ProblemKind, Span,
-};
+use sojourn::diagnostics::{BoundKind, CompilationFailure, Problem, ProblemKind, Span};
 
 /// Nothing here binds, so no variables are declared: a parse failure is the
-/// only kind these fixtures can produce, and a bind failure would be a bug in
-/// the fixture.
+/// only kind these fixtures can produce, and an unbound name would be a bug
+/// in the fixture.
 const NO_VARIABLES: [&str; 0] = [];
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
     match sojourn::compile(expr, &NO_VARIABLES) {
         Ok(_) => panic!("expected {expr:?} to fail compilation, but it succeeded"),
-        Err(CompileError::Parse(failure)) => failure,
-        Err(other) => panic!("expected {expr:?} to fail to parse, got {other:?}"),
+        Err(failure) => failure,
     }
 }
 
@@ -199,6 +196,60 @@ fn plain_display_is_a_single_line() {
     assert!(
         rendered.starts_with("syntax error at 'end of expression'"),
         "got {rendered:?}"
+    );
+}
+
+// --------------------------------------------- an unbound name has a span
+
+/// A name the variable list lacks is a problem like any other: located, with
+/// a caret under its first reference. One problem per name, however often it
+/// is used.
+#[test]
+fn an_unbound_name_gets_a_caret_at_its_first_reference() {
+    let failure = sojourn::compile("x2 + x1*x2", &["x1"]).expect_err("x2 is unbound");
+
+    assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
+    let problem = &failure.problems[0];
+    assert_eq!(
+        problem.kind,
+        ProblemKind::Unbound {
+            name: "x2".to_owned()
+        }
+    );
+    assert_eq!(problem.span, Span::new(0, 2));
+    assert_eq!((problem.line_idx, problem.column_idx), (0, 0));
+
+    let rendered = format!("{problem:#}");
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(lines[0], "Error in 'x2': unknown variable.");
+    assert_eq!(lines[1], "x2 + x1*x2");
+    assert_eq!(lines[2], "~~ no input variable by that name");
+    assert_eq!(
+        problem.to_string(),
+        "unknown variable at 'x2': no input variable by that name"
+    );
+}
+
+/// Every unbound name is reported, in the order the expression first names
+/// them, so one round trip fixes all of them.
+#[test]
+fn every_unbound_name_is_reported() {
+    let failure = sojourn::compile("a + b + x1", &["x1"]).expect_err("a and b are unbound");
+
+    let reported: Vec<(String, Span)> = failure
+        .problems
+        .iter()
+        .map(|problem| match &problem.kind {
+            ProblemKind::Unbound { name } => (name.clone(), problem.span),
+            other => panic!("expected an unbound name, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            ("a".to_owned(), Span::new(0, 1)),
+            ("b".to_owned(), Span::new(4, 5)),
+        ]
     );
 }
 
