@@ -6,55 +6,17 @@
 //! The subscriber is scoped to the test (`with_default`), so nothing here
 //! leaks into another test's output.
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+mod common;
 
+use common::Captured;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Strategy};
-use tracing_subscriber::fmt::MakeWriter;
-
-/// Everything the subscriber wrote, readable after the run.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Captured {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("no panic held the log")
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl MakeWriter<'_> for Captured {
-    type Writer = Self;
-
-    fn make_writer(&self) -> Self {
-        self.clone()
-    }
-}
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("no panic held the log").clone())
-            .expect("the subscriber writes UTF-8")
-    }
-}
 
 #[test]
 fn a_cobyla_run_is_announced_before_it_runs_and_traced_as_it_goes() -> anyhow::Result<()> {
     let log = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .with_writer(log.clone())
-        .finish();
+    let subscriber = log.subscriber();
 
     let system = ConstraintSystem::new(
         vec![

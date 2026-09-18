@@ -714,6 +714,167 @@ mod repair_strands_on_a_product_constraint {
     fn the_50_variable_proposal_is_repaired() -> anyhow::Result<()> {
         is_repaired(50, &POINT_50)
     }
+
+    /// Artemis 0.13.5, 2026-09-18: a wolf's proposal on the 100-variable bump
+    /// with eleven coordinates clamped to the lower bound 0 and four to the
+    /// upper bound 10, verbatim. The product is exactly 0, so every partial
+    /// derivative of `prod` is exactly 0 and Newton's KKT system is singular
+    /// by construction; the nearest feasible point is the proposal with its
+    /// zeros lifted to about 1e-6 (the other ninety multiply to ~1e62).
+    const POINT_100: [f64; 100] = [
+        0.0,
+        2.22189998407938,
+        8.764678459934343,
+        3.094397616664273,
+        9.322036592108637,
+        5.96944660860104,
+        4.787862356901575,
+        10.0,
+        4.156313322093435,
+        5.492732599826343,
+        7.96266545811535,
+        2.695502308509957,
+        8.644014077791333,
+        4.555671713744944,
+        9.902076329536735,
+        2.445656114201819,
+        10.0,
+        0.0,
+        4.994131875757679,
+        0.0,
+        0.0,
+        5.777610047250547,
+        0.5699988022423685,
+        0.6962735961306832,
+        1.09929179352666,
+        5.040518425671441,
+        0.0,
+        9.088581274463243,
+        3.564946687550064,
+        6.621452820028271,
+        6.885080448669081,
+        6.550165621124641,
+        8.35953569514128,
+        6.544844407984651,
+        9.232063752528061,
+        1.354670283660715,
+        5.077923294883641,
+        7.054988665863998,
+        1.916639097571489,
+        9.137756928142721,
+        8.399863586147342,
+        5.377688101404801,
+        6.822260240396487,
+        10.0,
+        7.591575155697313,
+        0.0,
+        3.142269463722272,
+        2.695085463732622,
+        4.769566559574289,
+        6.738536825083114,
+        4.355807716420325,
+        9.969060742946116,
+        6.774070428523348,
+        8.850062252944381,
+        3.717416120592227,
+        3.200680293761951,
+        5.168521481504353,
+        2.502798634450153,
+        3.510901723504484,
+        4.01320392064421,
+        1.929152151919125,
+        6.20551029507453,
+        4.762900002487842,
+        0.0,
+        6.13932973699611,
+        0.0,
+        0.0,
+        3.731335636501735,
+        4.024881880957532,
+        0.0,
+        0.7918236521353679,
+        9.993988809039658,
+        2.173470090981415,
+        7.483616708693935,
+        8.652037630722493,
+        3.27764366356877,
+        10.0,
+        8.340596752550143,
+        6.050906151569723,
+        6.96277271298732,
+        9.023894227528649,
+        2.858096910293614,
+        4.950271479100283,
+        1.010931231541861,
+        1.3102671886915,
+        0.0,
+        0.3860269067771993,
+        5.270677597923203,
+        9.76610364621289,
+        9.422419853216706,
+        6.098498540653791,
+        6.731197910902245,
+        3.812265661718834,
+        2.432386701248863,
+        9.931687289243193,
+        8.808060980025456,
+        6.283511779263659,
+        2.858858937003123,
+        8.222027796986254,
+        6.147271873609433,
+    ];
+
+    /// The KKT optimum here has a closed form: every zero lifted to the same
+    /// `e` with `e^11 * P = 0.75`, `P` the product of the other eighty-nine,
+    /// and those eighty-nine moved by `O(e^2)`, nothing. So the nearest
+    /// feasible point is `e * sqrt(11)` away, and a repair that lands there
+    /// has *projected*; one that lands farther has searched. Before the fix
+    /// the box missed, two COBYLA runs at a hundred variables took five
+    /// seconds, and the landing was forty percent farther than this.
+    #[test]
+    fn the_100_variable_proposal_with_eleven_zeros_is_projected_not_searched() -> anyhow::Result<()>
+    {
+        let system = keane(100)?;
+        let region = ConstraintSolver::new()
+            .solve(
+                &system,
+                &mut Xoshiro256PlusPlus::seed_from_u64(0x50_50_1E_5E_ED),
+            )
+            .context("Keane's region is nearly the whole box")?;
+
+        let log = common::Captured::default();
+        let repaired = tracing::subscriber::with_default(log.subscriber(), || {
+            region.repair(&POINT_100, CLEARANCE)
+        })?;
+        assert!(system.is_feasible(&repaired, CLEARANCE));
+
+        let zeros = POINT_100.iter().filter(|x| **x == 0.0).count();
+        let others: f64 = POINT_100.iter().filter(|x| **x != 0.0).product();
+        let lift = (0.75 / others).powf(1.0 / zeros as f64);
+        let optimum = lift * (zeros as f64).sqrt();
+        // Within a ten-thousandth: the clearance step inside is 1e-11 per
+        // coordinate against a lift of 4e-6, and a search landed 40% out.
+        let moved = l2(&POINT_100, &repaired);
+        assert!(
+            moved <= optimum * (1.0 + 1e-4),
+            "landed {moved:.6e} from the proposal; the nearest feasible point is {optimum:.6e}"
+        );
+        for (was, now) in POINT_100.iter().zip(&repaired) {
+            if *was == 0.0 {
+                assert!(
+                    (now - lift).abs() <= lift * 1e-4,
+                    "a zero was lifted to {now:.6e}, not {lift:.6e}"
+                );
+            }
+        }
+        // The route: a projection, and no derivative-free search anywhere.
+        let text = log.text();
+        assert!(
+            !text.contains("cobyla starts"),
+            "COBYLA ran where a projection should have landed:\n{text}"
+        );
+        Ok(())
+    }
 }
 
 /// Artemis 0.13.4, 2026-09-16, against `82671de`: `repair` moved a coordinate

@@ -11,10 +11,58 @@
 #![allow(dead_code)]
 
 use std::hint::black_box;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faer::Mat;
 use sojourn::{ConstraintSystem, InputVariable};
+use tracing_subscriber::fmt::MakeWriter;
+
+/// Everything a `tracing` subscriber wrote, readable after the run: what a
+/// fixture uses to assert the *route* a call took — which stage answered,
+/// whether COBYLA ran — rather than a clock. Scope the subscriber with
+/// `tracing::subscriber::with_default` so nothing leaks into another test.
+#[derive(Clone, Default)]
+pub struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("no panic held the log")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl MakeWriter<'_> for Captured {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl Captured {
+    /// A subscriber at `trace` writing here, plain text.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("no panic held the log").clone())
+            .expect("the subscriber writes UTF-8")
+    }
+}
 
 /// One expression at one point, as a one-column batch.
 ///

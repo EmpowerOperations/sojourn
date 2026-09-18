@@ -356,7 +356,10 @@ where a biting constraint has no derivative or Newton did not converge —
 unless the clamp's landing is separable (bounds), where the axis projection
 already is the Euclidean one. A constraint flat where the point stands is
 walked in from the region's reference — a local solve from the box centre,
-run once by `solve` — then projected; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
+run once by `solve` — then projected by the same Newton from the chord's
+landing, where the constraint is well-scaled (a Newton step that would cross
+a box wall stops short of it and linearises again: `newton::WALL_FRACTION`),
+a candidate the box's landing may still beat; a constraint with a jump in it (`floor`, `%`, `sgn`) is also
 sampled around, a box doubling and shrinking on a clone of the region's stream — the
 backstop for "if it can be sampled it is landed near", last because it cannot
 localise a thin or high-dimensional region. **Gradients are reverse-mode over the virtual tape**, one

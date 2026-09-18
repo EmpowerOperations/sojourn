@@ -54,6 +54,19 @@
 //! every landing was dragged toward the census — a disc corner at 45° landed
 //! at 17°, where a projection lands it at 45°.
 //!
+//! **Newton from the reference's chord** — where Newton from the point
+//! declined on a constraint that has gradients: flat where the point stands,
+//! or too curved there for the linearisation to hold. A chord bisected from
+//! the region's reference to the point lands on the boundary where the
+//! constraint is well-scaled again, and Newton from *there*, toward the
+//! point, is the same projection with a start it can read from — the
+//! step-shortening in [`newton`] walks it in. Keane's bump at a hundred
+//! variables with eleven coordinates at zero: the product's gradient is
+//! exactly zero at the point, and this lands the true nearest point, the
+//! zeros lifted to `3.7e-6`, in fourteen iterations — where the box and two
+//! COBYLA runs below took five seconds and landed forty percent farther.
+//! Cheap enough to run before them: a chord is sixty evaluations.
+//!
 //! **Sample and the derivative-free solve** — off the smooth path, where
 //! Newton declined: a jump (`floor`, `%`, `sgn`) or a curvature Newton could
 //! not settle. The sampling box first — uniform draws around the point,
@@ -73,11 +86,11 @@
 //!
 //! **Reference** — nothing feasible seen at all: a constraint flat where the
 //! point stands (Keane's `0.75 − ∏xᵢ` with a coordinate at `1e-11` is `0.75`
-//! to fifty digits every way), which no slice, model or box around the point
-//! reads. A feasible point to walk *in* from — the region's reference, a
-//! local solve from the box centre that `solve` ran once, a function of the
-//! system and not of anything sampled since — a chord bisected from it to
-//! the point, and the projection from that landing, where the constraint is
+//! to fifty digits every way) *and* without a gradient Newton could use,
+//! which no slice, model or box around the point reads. The same chord from
+//! the region's reference — a local solve from the box centre that `solve`
+//! ran once, a function of the system and not of anything sampled since —
+//! and the derivative-free solve from its landing, where the constraint is
 //! well-scaled again; so the reference decides only which basin, never where
 //! in it. `Stranded` means this found nothing either.
 //!
@@ -338,13 +351,30 @@ pub(crate) fn repair(
         return nearest_of(system, &widths, landings, point, clearance);
     }
 
+    // Newton again, from the reference's chord: the constraint is flat or
+    // too curved where the point stands, and the chord's landing is where it
+    // is well-scaled. A candidate, not the answer — the reference decides
+    // which basin the chord lands in, and a nearer one may be the box's to
+    // find (`(x+2)(x-1) == 0` from 0.9, with the reference in the basin at
+    // -2). Computed once, here or below, whichever asks first.
+    let mut chord: Option<Point> = None;
+    if differentiable {
+        let from = chord.insert(along_chord(system, reference, point));
+        if let Some(landing) = newton::nearest(system, from, point)
+            && let Some(landing) = stepped_inside(system, &widths, landing, point, clearance)
+        {
+            landings.push(("chord", landing));
+        }
+    }
+
     // Off the smooth path — a constraint with a jump in it (`floor`, `%`,
     // `sgn`), or one too curved for Newton to converge on. The sampling box
     // around the point first: cheap, blind to jumps, needs only a region fat
     // enough to sample; then the derivative-free solve, only where the box
     // found nothing, since its landing may be anywhere its evaluations fell
     // feasible and it costs a hundred times the box. See the module doc.
-    if !landings.iter().any(|(_, landing)| landing.is_clear()) {
+    {
+        let projected = landings.iter().any(|(_, landing)| landing.is_clear());
         let hit = sampled(system, &widths, point, clearance, stream);
         if let Some(hit) = &hit {
             let chord = along_chord(system, hit, point);
@@ -359,8 +389,22 @@ pub(crate) fn repair(
         // nearer one on a thin, many-branched region (`(x+2)(x-1) == 0`),
         // where COBYLA's linear models, on a smooth constraint, do not. Past
         // a handful of dimensions it is neither cheap nor better than the box
-        // on the fat regions that reach here, so it waits for the box to fail.
-        if hit.is_none() || dimensions <= COBYLA_CHEAP {
+        // on the fat regions that reach here, so it waits for the box to fail
+        // — and where the chord's Newton already projected, a box that found
+        // nothing is no reason to spend it: at a hundred variables it is
+        // seconds, and it landed farther than the projection where measured.
+        if (hit.is_none() && !projected) || dimensions <= COBYLA_CHEAP {
+            // Above the cheap dimension this is the rung that makes a repair
+            // seconds rather than microseconds, and every arrival so far has
+            // been a projection that should have landed: a warning, with the
+            // point, so the caller's log names the case to file.
+            if dimensions > COBYLA_CHEAP {
+                tracing::warn!(
+                    dimensions,
+                    point = ?point,
+                    "repair fell through to the derivative-free solve; a projection should have landed here"
+                );
+            }
             landings.extend(
                 stepped_off(
                     system,
@@ -380,7 +424,7 @@ pub(crate) fn repair(
     // can read. Walk in from the reference instead — see the module doc.
     if landings.is_empty() {
         tracing::debug!(stage = "reference");
-        let chord = along_chord(system, reference, point);
+        let chord = chord.unwrap_or_else(|| along_chord(system, reference, point));
         landings.extend(
             stepped_off(
                 system,

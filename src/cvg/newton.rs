@@ -27,7 +27,10 @@
 //! # The active set is a fixed point
 //!
 //! Which constraints are active at the answer is not known in advance. The
-//! guess is the ones violated where the point stands; the solve nominates a
+//! guess is the ones the *target* violates — the point being projected, which
+//! is also where the iteration starts unless a caller starts it elsewhere; a
+//! guess taken at a feasible start would be empty, and the first step would
+//! land on the target itself. The solve nominates a
 //! point; every constraint is judged there; a newly violated one joins the
 //! set and one whose multiplier came out negative — a constraint the
 //! projection is pulling *away* from, which at the answer cannot be active —
@@ -38,6 +41,21 @@
 //! part in the set only when violated. So the constraints a gradient is
 //! computed for are the few that bite, which is what keeps this cheap on a
 //! system of two hundred.
+//!
+//! # A step stops short of a wall
+//!
+//! The step is a projection of the target onto the *linearised* constraints,
+//! and a linearisation taken where a constraint is well-scaled can send a
+//! coordinate straight through a box wall — Keane's `0.75 − ∏xᵢ` from a
+//! chord landing, toward a proposal with eleven coordinates at zero, where
+//! the product's gradient is exactly zero and the next solve is singular. So
+//! a step that would cross a wall is shortened to [`WALL_FRACTION`] of the
+//! distance to it and the constraints are linearised again from inside: the
+//! offending coordinates fall geometrically toward where the curved
+//! constraint actually puts them (3.7e-6 on that proposal) and the full
+//! steps that follow converge. The fraction-to-the-boundary rule of
+//! interior-point methods, on the box alone. A step that lands exactly *on*
+//! a wall is a projection onto it and is not shortened.
 //!
 //! # Fallible by design
 //!
@@ -78,6 +96,15 @@ const NEWTON_ITERATIONS: usize = 128;
 /// A thousandth of the clearance the doc on `repair` recommends, so the
 /// landing is exact at every scale the caller can see.
 const NEWTON_STEP: f64 = 1e-13;
+
+/// How much of the way to a box wall a step that would cross it may go.
+///
+/// Less than one, so the iterate stays strictly inside the wall it was
+/// heading through and the constraints can be linearised there again; near
+/// one, so a coordinate that belongs near a wall gets there in a few steps
+/// rather than many. Nine tenths takes a coordinate from `1` to `1e-6` in
+/// six steps.
+const WALL_FRACTION: f64 = 0.9;
 
 /// How many times the active set may change before the search is declined.
 ///
@@ -186,8 +213,9 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
 
     let p = normalised(target);
     let mut u = normalised(from);
+    // The guess: what the target violates. See the module doc.
     let mut active: Vec<usize> = (0..rows)
-        .filter(|row| residual(*row, from, &u).is_some_and(|value| value > 0.0))
+        .filter(|row| residual(*row, target, &p).is_some_and(|value| value > 0.0))
         .collect();
     // A row the residual could not be evaluated on is one the method cannot
     // reason about.
@@ -251,13 +279,39 @@ pub(crate) fn nearest(system: &ConstraintSystem, from: &[f64], target: &[f64]) -
                 (0..dimensions).map(|c| p[c] - pull[c]).collect()
             };
 
+            // A step through a box wall stops short of it, and the wall it
+            // would have crossed is linearised again from inside; see the
+            // module doc. Landing on the wall is a projection onto it and
+            // goes the whole way.
+            let fraction = (0..dimensions)
+                .filter_map(|c| {
+                    let travel = next[c] - u[c];
+                    if travel < 0.0 && next[c] < 0.0 && u[c] > 0.0 {
+                        Some(WALL_FRACTION * u[c] / -travel)
+                    } else if travel > 0.0 && next[c] > 1.0 && u[c] < 1.0 {
+                        Some(WALL_FRACTION * (1.0 - u[c]) / travel)
+                    } else {
+                        None
+                    }
+                })
+                .fold(1.0_f64, f64::min);
+            let next: Vec<f64> = if fraction < 1.0 {
+                (0..dimensions)
+                    .map(|c| u[c] + fraction * (next[c] - u[c]))
+                    .collect::<Vec<f64>>()
+            } else {
+                next
+            };
             let step = next
                 .iter()
                 .zip(&u)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
+            tracing::trace!(iterations, round, active = k, step, fraction, "newton step");
             u = next;
-            if step < NEWTON_STEP {
+            // A shortened step has not converged whatever its length: the
+            // wall it stopped short of has yet to be linearised from there.
+            if step < NEWTON_STEP && fraction >= 1.0 {
                 converged = true;
                 break;
             }
@@ -358,6 +412,57 @@ mod tests {
             .expect("applies")
             .point;
         assert!(close(&landed, &[0.2, 0.6], 1e-12), "{landed:?}");
+    }
+
+    /// From a feasible start toward a target where the constraint's gradient
+    /// is exactly zero: `1 - x*y < 0` at the origin has partials `(-y, -x)`
+    /// = `(0, 0)`, so from the target itself the KKT solve is singular; from
+    /// `(2, 2)`, with the active set guessed from what the *target* violates,
+    /// it is the ordinary projection and lands on `x*y = 1` at `(1, 1)`. A
+    /// guess taken at the start would be empty, jump to the origin and be
+    /// singular there — Keane's bump with coordinates at zero, in two.
+    #[test]
+    fn a_feasible_start_projects_a_target_with_no_gradient() {
+        let system = system(
+            vec![
+                InputVariable::new("x", 0.0, 4.0),
+                InputVariable::new("y", 0.0, 4.0),
+            ],
+            &["1 - x*y < 0"],
+        );
+        assert!(
+            nearest(&system, &[0.0, 0.0], &[0.0, 0.0]).is_none(),
+            "from the origin itself the gradient is zero and the solve singular"
+        );
+        let landed = nearest(&system, &[2.0, 2.0], &[0.0, 0.0])
+            .expect("from a feasible start the projection applies")
+            .point;
+        assert!(close(&landed, &[1.0, 1.0], 1e-9), "{landed:?}");
+    }
+
+    /// A step that would carry coordinates through a box wall stops short of
+    /// it and linearises again from inside. The smallest Keane: a product of
+    /// four on `[0, 4]`, from `(2, 2, 2, 2)` toward `(0, 0, 4, 4)`. Without
+    /// the shortening, the full step from the linearisation at the start
+    /// lands the two zero-bound coordinates *on* their walls, the product's
+    /// gradient is zero in every coordinate there, and the solve is singular
+    /// — the same decline as the hundred-variable proposal. Shortened, the
+    /// iterate stays inside and converges to the nearest point on the
+    /// surface, `(0.25, 0.25, 4, 4)`: the two lifted equally, `y·z = 1/16`.
+    /// (Three coordinates do not reproduce it, nor four with one zero; this
+    /// is the smallest case a search found that does.)
+    #[test]
+    fn a_step_through_a_wall_stops_short_and_converges() {
+        let system = system(
+            (1..=4)
+                .map(|i| InputVariable::new(format!("x{i}"), 0.0, 4.0))
+                .collect::<Vec<InputVariable>>(),
+            &["1 - prod(1, 4, i -> var[i]) < 0"],
+        );
+        let landed = nearest(&system, &[2.0; 4], &[0.0, 0.0, 4.0, 4.0])
+            .expect("the projection applies")
+            .point;
+        assert!(close(&landed, &[0.25, 0.25, 4.0, 4.0], 1e-9), "{landed:?}");
     }
 
     /// A curved constraint converges to the radial point.

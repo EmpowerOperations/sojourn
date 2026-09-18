@@ -2562,6 +2562,31 @@ by halves through all eight sweeps. A "step in from the wall you stand on" rule 
 the middle would converge in two; not needed while Newton lands, noted in case a
 non-differentiable constraint puts the clamp back in front.
 
+**2026-09-18: Newton from the chord, and a step that stops short of a wall.** Artemis 0.13.5
+on Keane's bump at a hundred variables (`docs/user-sscce/`, kept as
+`regression_fixture::repair_strands_on_a_product_constraint::the_100_variable_proposal_with_eleven_zeros_is_projected_not_searched`):
+a wolf's proposal with eleven coordinates clamped to 0 has a product of exactly 0 and a
+product gradient of exactly 0 in every coordinate, so Newton from the point is singular by
+construction; the box missed in twenty rounds; COBYLA from the point spent 2084 evaluations
+and landed infeasible; COBYLA from the reference's chord spent 1551 more and landed feasible
+— 5.4 s, and 40% farther than the nearest feasible point, which is the proposal with its zeros
+lifted to `3.7e-6` (`e^11 · P = 0.75`, `P ≈ 1e62` the product of the other eighty-nine). Two
+things were wrong in `newton::nearest`, found in that order by tracing Newton from the chord
+landing: (1) the active-set guess was "what `from` violates", which at a feasible chord landing
+is nothing, so the first step jumped to the target and its zero gradient — the guess is what the
+*target* violates now, the same set for every caller that starts at the target; (2) with the
+right guess the linearisation at the chord landing sent the eleven coordinates through zero —
+a step that would cross a box wall now stops at nine tenths of the way (`WALL_FRACTION`, the
+fraction-to-the-boundary rule) and linearises again from inside, and the coordinates fall
+geometrically to `e`, converging in fourteen iterations. `repair` runs that Newton from the
+reference's chord right after Newton from the point declines, as a *candidate* — the reference
+still decides only which basin, and `the_nearer_band_wins` caught the early return that forgot
+it — and skips COBYLA-from-the-point where the chord's projection is clear and the box found
+nothing. 5.4 s → 0.02 s, and the landing is the closed-form optimum to a ten-thousandth. The
+module doc's reference stage had described "the projection from the chord's landing" since
+2026-09-15; the code had been running COBYLA there because Newton from anywhere but the
+target could not work. The stage is now what the doc said.
+
 **2026-09-16: where a design's time goes, by count and by flame graph.** A `judged` tally on
 the walker (`burn_in` and `walk` spans at `debug`) and a `samply` run on
 `tests/profiling.rs::a_design_on_the_100_segment_beam` (200 variables, two dense
