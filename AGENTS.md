@@ -28,7 +28,7 @@ Read these before changing anything, in this order:
 | path | what | status |
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
-| `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the validated system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
+| `src/lib.rs`, `src/nodes.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, `compile_system` for a document's worth of named expressions as nodes with edges (spec: `docs/compile-system.md`), the validated constraint system, how to solve it into a `FeasibleRegion`, and the repair the region offers. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
 | `src/cvg/` | the search engine — private. Strategies, the ladder, the opening and the design, the local solve (`local.rs`, COBYLA from `basin`), branch-and-prune (`prune.rs`), the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
@@ -268,7 +268,14 @@ the variable it names on every path: a load, a reference, an incidence row,
 or a problem with a caret if the schema has no such position — the same
 `CompilationFailure` an unbound name gets. After that
 `Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
-than "a subscript", and nothing downstream special-cases one. A subscript the
+than "a subscript", and nothing downstream special-cases one. **A subscript
+indexes the inputs**, never the whole row: a `compile_system` node's row carries
+the externals and outputs it names after the inputs, and a row's shape is a
+`RowLayout { inputs, intermediates }` — the two regions, named that way
+everywhere — handed to the executors beside the batch; a gather is bounded by
+its `inputs`, the width is its `total()`, and `var[floor(x1)]` past the
+inputs faults rather than reading an output. For `compile` and
+`ConstraintSystem` a row is all inputs. A subscript the
 row decides must be a whole number by construction — `floor`/`ceil` outermost
 or inside exact integer arithmetic, an aggregate's parameter; the table is
 `ast::is_integral`, the crate's one type judgement, and extending it is a

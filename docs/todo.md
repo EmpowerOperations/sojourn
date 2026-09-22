@@ -313,6 +313,22 @@ thing to read, and is the first work item rather than an admission.
 
 ### Standing
 
+- [ ] **A computed subscript in a system is bounded, not understood.** *2026-09-21.*
+      `compile_system` (`docs/compile-system.md`) lays a node's row out as the inputs it reads
+      then the externals and outputs it names, so `var[floor(x1)]` could have reached an
+      output; a row's shape is now `RowLayout { inputs, intermediates }`, handed to the executors
+      beside the batch, a gather is bounded by its `inputs`, and past them is the same runtime
+      fault as before. That is all that was done, on
+      purpose. Two things were not: proving statically that a computed subscript can land in
+      range at all (the input count and the box are both known, so `var[floor(x1)]` with `x1`
+      on `[0, 100]` over three inputs is *mostly* a fault, and could be said so at compile
+      time), and teaching `cvg::hc4` to follow the indirection instead of answering `ENTIRE` —
+      which would mean a per-branch narrowing over every input the subscript could name, and
+      is where the cost is. The feature is half a solution looking for its problem; the
+      likely problem is *conditional variables* — "this constraint holding is what makes
+      these coordinates matter" — and the shape of that is not yet known (a table? a
+      constraint that gates a set of coordinates?). Decide the problem first; a subscript that
+      turns out to be its encoding will then know what analysis it deserves.
 - [ ] **`ast::is_integral` is the crate's one type judgement.** A table, not an analysis:
       the forms that are whole numbers by construction, each exact in `f64`. Anything that wants
       to read a value as an integer — a subscript today; an integer-typed exponent or a

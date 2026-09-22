@@ -377,7 +377,7 @@ fn resolve_expr(expr: Expr, schema: &Schema, symbols: &mut Vec<String>) -> Resul
             let out_of_range = |requested_1index| Fault {
                 kind: ProblemKind::DynamicIndexOutOfBounds {
                     requested_1index,
-                    available: schema.len(),
+                    available: schema.layout().inputs,
                 },
                 span: subscript.span,
             };
@@ -387,8 +387,11 @@ fn resolve_expr(expr: Expr, schema: &Schema, symbols: &mut Vec<String>) -> Resul
                 kind: ProblemKind::DynamicIndexNotAnInteger { value },
                 span: subscript.span,
             })?;
+            // Inputs only: a row may carry intermediates after them, and a
+            // subscript is not a way to reach one.
             let name = usize::try_from(requested - 1)
                 .ok()
+                .filter(|position| *position < schema.layout().inputs)
                 .and_then(|position| schema.names().get(position))
                 .ok_or_else(|| out_of_range(requested))?
                 .clone();

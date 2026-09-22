@@ -36,9 +36,14 @@ neither backend's lowering is visible to the other**.
 
 `translate`, then `rewrite::canonicalize`: four passes in a fixed order, which
 `parse` in [`frontend/mod.rs`](frontend/mod.rs) runs and reads top to bottom.
-It is crate-private: a caller hands source text to `compile` or to
-`ConstraintSystem::new`, and the tree between is nobody's business but the
-two backends'.
+It is crate-private: a caller hands source text to `compile`, to
+`compile_system` or to `ConstraintSystem::new`, and the tree between is
+nobody's business but the two backends'. (`compile_system`, in
+[`nodes.rs`](nodes.rs), is `compile` over a document: it parses every
+expression, resolves subscripts against the inputs alone, reads the symbol
+lists for the edges between expressions, and binds each to a row of its own
+reads — the graph facts are the front end's symbol tables put side by side,
+and the tapes are `eval`'s as ever.)
 
 ```
               fold_constants   check_subscripts   invert_monotone   unroll_aggregates   collect_powers

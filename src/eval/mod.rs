@@ -317,7 +317,9 @@ impl CompiledExpression {
 
         let mut tiles = Tiles::new(&self.tape, columns);
         while let Some((first, lanes)) = tiles.next_tile(columns) {
-            if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
+            if let Some((lane, fault)) =
+                tiles.run(&self.tape, samples, self.schema.layout(), first, lanes)
+            {
                 let column = first + lane;
                 let row = samples.col(column).iter().copied().collect::<Vec<_>>();
                 return Err(runtime_failure(
@@ -366,7 +368,7 @@ impl CompiledExpression {
 
         let mut tiles = Tiles::new(&self.tape, columns);
         while let Some((first, lanes)) = tiles.next_tile(columns) {
-            tiles.run(&self.tape, samples, first, lanes);
+            tiles.run(&self.tape, samples, self.schema.layout(), first, lanes);
             let verdicts = tiles.results(&self.tape, lanes);
             let faults = &tiles.faults[..lanes];
             for (hold, (&residual, fault)) in holds[first..first + lanes]
@@ -387,7 +389,7 @@ impl CompiledExpression {
         allow(dead_code, reason = "the GPU sieve is the only caller")
     )]
     pub(crate) fn wgsl(&self, name: &str) -> wgsl::Function {
-        wgsl::function(&self.tape, name, self.schema.len())
+        wgsl::function(&self.tape, name, self.schema.layout())
     }
 
     fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvaluationFailure> {
@@ -424,7 +426,7 @@ impl CompiledExpression {
         }
         let mut frame = vec![0.0; self.tape.registers as usize];
         self.tape.prime(&mut frame);
-        lane::run_lane(&self.tape, row, &mut frame)
+        lane::run_lane(&self.tape, row, self.schema.layout(), &mut frame)
             .map_err(|fault| runtime_failure(&self.source, &self.schema, &fault, None, row))
     }
 
@@ -500,7 +502,9 @@ impl CompiledGradient {
 
         let mut tiles = Tiles::new(&self.tape, columns);
         while let Some((first, lanes)) = tiles.next_tile(columns) {
-            if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
+            if let Some((lane, fault)) =
+                tiles.run(&self.tape, samples, self.schema.layout(), first, lanes)
+            {
                 let column = first + lane;
                 let row = samples.col(column).iter().copied().collect::<Vec<_>>();
                 return Err(runtime_failure(
@@ -546,7 +550,7 @@ impl CompiledGradient {
         }
         let mut frame = vec![0.0; self.tape.registers as usize];
         self.tape.prime(&mut frame);
-        let value = lane::run_lane(&self.tape, row, &mut frame)
+        let value = lane::run_lane(&self.tape, row, self.schema.layout(), &mut frame)
             .map_err(|fault| runtime_failure(&self.source, &self.schema, &fault, None, row))?;
         let partials = self
             .tape
@@ -564,7 +568,36 @@ impl CompiledGradient {
     }
 }
 
-/// An ordered set of variable names.
+/// The shape of a row: how many of it are inputs and how many follow them.
+///
+/// A row has two regions. The **inputs** come first — the design vector,
+/// the coordinates a caller chooses, and the only rows `var[i]` may name.
+/// The **intermediates** follow — externals and other expressions' outputs,
+/// present because an expression names them, bindable by name only. For
+/// [`compile`] and for a [`ConstraintSystem`](crate::ConstraintSystem) every
+/// row is an input; [`compile_system`](crate::compile_system) lays a node's
+/// row out as the inputs it reads followed by what else it names.
+///
+/// One value rather than two counts, because both go everywhere a row goes
+/// — an executor checks the row against [`total`](Self::total) and bounds a
+/// gather by `inputs` — and two numbers agreed on by three call sites is
+/// how the bound and the width came to be the same thing by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowLayout {
+    pub(crate) inputs: usize,
+    pub(crate) intermediates: usize,
+}
+
+impl RowLayout {
+    /// The row's length: inputs and intermediates together.
+    #[must_use]
+    pub(crate) const fn total(self) -> usize {
+        self.inputs + self.intermediates
+    }
+}
+
+/// An ordered set of variable names: the rows of a batch, with their
+/// [`RowLayout`].
 ///
 /// Order is load-bearing: `var[i]` indexes into it, one-based. This is the
 /// requirement that forced the JVM API to demand a `LinkedHashMap`.
@@ -574,19 +607,42 @@ impl CompiledGradient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Schema {
     names: Vec<String>,
+    layout: RowLayout,
 }
 
 impl Schema {
-    /// Builds a schema from names in declaration order.
+    /// Builds a schema from names in declaration order, every one an input.
     #[must_use]
     pub(crate) fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            names: names.into_iter().map(Into::into).collect(),
-        }
+        let names: Vec<String> = names.into_iter().map(Into::into).collect();
+        let layout = RowLayout {
+            inputs: names.len(),
+            intermediates: 0,
+        };
+        Self { names, layout }
+    }
+
+    /// A schema whose rows are `inputs` followed by `intermediates`: a
+    /// subscript indexes the first list and cannot reach the second.
+    #[must_use]
+    pub(crate) fn with_intermediates<I, J, S>(inputs: I, intermediates: J) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        J: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut names: Vec<String> = inputs.into_iter().map(Into::into).collect();
+        let inputs = names.len();
+        names.extend(intermediates.into_iter().map(Into::into));
+        let layout = RowLayout {
+            inputs,
+            intermediates: names.len() - inputs,
+        };
+        Self { names, layout }
     }
 
     /// A schema over a slice of anything string-like: `&["x1", "x2"]`, a
@@ -602,9 +658,17 @@ impl Schema {
         Self::new(table.iter().map(|(name, _)| *name))
     }
 
+    /// The row count: inputs and intermediates together.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.names.len()
+    }
+
+    /// The row's shape; `layout().inputs` is how many rows a subscript may
+    /// name, whatever the row holds after them.
+    #[must_use]
+    pub(crate) const fn layout(&self) -> RowLayout {
+        self.layout
     }
 
     #[must_use]
@@ -653,10 +717,12 @@ impl Tiles {
         Some((first, lanes))
     }
 
+    /// Runs one tile of `samples`, whose rows are laid out as `layout`.
     fn run(
         &mut self,
         tape: &AllocatedTape,
         samples: MatRef<'_, f64>,
+        layout: RowLayout,
         first: usize,
         lanes: usize,
     ) -> Option<(usize, tape::LaneFault)> {
@@ -664,6 +730,7 @@ impl Tiles {
         tile::run_tile(
             tape,
             samples,
+            layout,
             first,
             lanes,
             &mut self.file,

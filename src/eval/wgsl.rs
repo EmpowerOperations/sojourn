@@ -60,6 +60,7 @@ use askama::Template;
 
 use crate::ast::{BinaryOp, CompareOp, UnaryOp};
 
+use super::RowLayout;
 use super::tape::{Accumulate, AllocatedTape, Instruction};
 
 /// How far past feasible, relative to the magnitudes compared, the sieve still
@@ -105,7 +106,13 @@ impl Prelude {
 #[template(path = "wgsl/function.wgsl.jinja", escape = "none")]
 pub(crate) struct Function {
     pub(crate) name: String,
-    pub(crate) inputs: usize,
+    /// The row: the length of the array the function takes.
+    pub(crate) rows: usize,
+    /// How many of the row a computed subscript may name — the layout's
+    /// inputs, equal to `rows` for every tape the sieve runs today, since a
+    /// constraint's row is exactly the box; the guard reads this and not the
+    /// array length.
+    pub(crate) subscriptable: usize,
     /// Size of the local register array.
     pub(crate) registers: u16,
     /// Register and its literal, already spelled: number formatting is
@@ -132,8 +139,8 @@ pub(crate) enum Stmt {
     Gather(usize, String),
 }
 
-/// The tape as a [`Function`] named `name` over `inputs` coordinates.
-pub(crate) fn function(tape: &AllocatedTape, name: &str, inputs: usize) -> Function {
+/// The tape as a [`Function`] named `name` over a row laid out as `layout`.
+pub(crate) fn function(tape: &AllocatedTape, name: &str, layout: RowLayout) -> Function {
     let consts = tape
         .consts
         .iter()
@@ -179,7 +186,8 @@ pub(crate) fn function(tape: &AllocatedTape, name: &str, inputs: usize) -> Funct
 
     Function {
         name: name.to_owned(),
-        inputs,
+        rows: layout.total(),
+        subscriptable: layout.inputs,
         registers: tape.registers.max(1),
         consts,
         body,
@@ -216,7 +224,7 @@ mod tests {
 
     use askama::Template;
 
-    use super::{Prelude, function};
+    use super::{Prelude, RowLayout, function};
     use crate::Schema;
 
     /// Constraints that between them use every instruction: the three rung
@@ -287,9 +295,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{source:?}: {e}"));
             text.push('\n');
             text.push_str(
-                &function(&compiled.tape, &format!("c{index}"), 3)
-                    .render()
-                    .unwrap_or_else(|e| panic!("{source:?}: {e}")),
+                &function(
+                    &compiled.tape,
+                    &format!("c{index}"),
+                    RowLayout {
+                        inputs: 3,
+                        intermediates: 0,
+                    },
+                )
+                .render()
+                .unwrap_or_else(|e| panic!("{source:?}: {e}")),
             );
         }
         text

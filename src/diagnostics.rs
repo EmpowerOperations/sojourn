@@ -195,6 +195,24 @@ pub enum ProblemKind {
     /// rather than only its own result. A non-finite value that is allowed to
     /// travel loses the one piece of information worth having about it.
     NonFiniteValue { value: f64 },
+
+    // ---- the graph: only `compile_system` produces these ----
+    /// A name declared twice — in one of the three lists
+    /// [`compile_system`](crate::compile_system) takes, or across two of
+    /// them. Located at the second definition where that is an expression;
+    /// a clash between two declared names has no source to point at.
+    Duplicate { name: String },
+    /// An expression reads an output whose expression is a constraint. A
+    /// boolean has no value — its residual is the evaluator's convention,
+    /// not a number the author wrote — so `c2 * 2` is a mistake, not `0`
+    /// or `1`. Located at the reference.
+    ConstraintAsValue { name: String },
+    /// An output depends on itself, directly (`h: h + 1`) or round a chain.
+    /// `chain` is the outputs round the cycle starting from the expression
+    /// the problem is reported in, which is the one whose reference closed
+    /// it: `g1: g2 + 1`, `g2: g1 + 1` reports under `g2` with `[g2, g1]`,
+    /// read `g2 -> g1 -> g2`. Located at that reference.
+    Cycle { chain: Vec<String> },
 }
 
 impl ProblemKind {
@@ -264,6 +282,22 @@ impl ProblemKind {
                 };
                 format!("this evaluated to something {what}")
             }
+            Self::Duplicate { name } => format!("'{name}' is declared more than once"),
+            Self::ConstraintAsValue { name } => {
+                format!("'{name}' is a constraint and has no value to read")
+            }
+            Self::Cycle { chain } => {
+                let round = chain
+                    .iter()
+                    .chain(chain.first())
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                format!(
+                    "'{}' depends on itself: {round}",
+                    chain.first().map_or("", String::as_str)
+                )
+            }
         }
     }
 
@@ -275,7 +309,12 @@ impl ProblemKind {
             | Self::Unsupported { .. }
             | Self::ZeroIndex
             | Self::AggregateBoundNotConstant { .. }
-            | Self::AggregateTooWide { .. } => String::new(),
+            | Self::AggregateTooWide { .. }
+            | Self::Duplicate { .. }
+            | Self::Cycle { .. } => String::new(),
+            Self::ConstraintAsValue { .. } => {
+                "a boolean is not a number; compare against the expression instead".to_owned()
+            }
             Self::Syntax { message, .. } => message.clone(),
             Self::Unbound { .. } => "no input variable by that name".to_owned(),
             Self::SubscriptNotIntegral => "wrap it in floor() or ceil() to say which".to_owned(),
@@ -478,6 +517,61 @@ pub struct CompilationFailure {
 }
 
 impl std::error::Error for CompilationFailure {}
+
+/// One problem and the declared name it belongs to.
+///
+/// `name` is the output whose expression the problem was found in — a parse
+/// error, an unbound name, a cycle closed there — or, for a
+/// [`Duplicate`](ProblemKind::Duplicate) between two declared names with no
+/// expression to point at, the name declared twice. The [`Problem`] carries
+/// its own source and span as ever; this pairs it with where in the
+/// caller's document to say so.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedProblem {
+    pub name: String,
+    pub problem: Problem,
+}
+
+/// [`compile_system`](crate::compile_system) produced no nodes: every
+/// problem it could find across every expression, each under the name it
+/// belongs to.
+///
+/// A separate type from [`CompilationFailure`] rather than a field on
+/// [`Problem`]: a failure over one source text has one source, and a
+/// failure over a document has as many as it has expressions, so the two
+/// are different shapes, and an `Option<name>` on every problem would make
+/// "which one" a question with a wrong answer available.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemCompilationFailure {
+    pub problems: Vec<NamedProblem>,
+}
+
+/// `{}` is one line per problem, `name: summary at 'text': note`; `{:#}` is
+/// a block per problem headed by its name, with the caret.
+impl fmt::Display for SystemCompilationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (rendered, separator): (Vec<String>, &str) = if f.alternate() {
+            (
+                self.problems
+                    .iter()
+                    .map(|named| format!("{}:\n{:#}", named.name, named.problem))
+                    .collect(),
+                "\n\n",
+            )
+        } else {
+            (
+                self.problems
+                    .iter()
+                    .map(|named| format!("{}: {}", named.name, named.problem))
+                    .collect(),
+                "\n",
+            )
+        };
+        f.write_str(&rendered.join(separator))
+    }
+}
+
+impl std::error::Error for SystemCompilationFailure {}
 
 /// Evaluation failed.
 #[derive(Debug, Clone, PartialEq)]

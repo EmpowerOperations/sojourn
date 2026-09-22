@@ -20,6 +20,7 @@ use pulp::{Simd, WithSimd};
 
 use crate::ast::{BinaryOp, UnaryOp};
 
+use super::RowLayout;
 use super::lane;
 use super::simd;
 use super::tape::{Accumulate, AllocatedTape, FaultKind, Instruction, LaneFault, Register};
@@ -298,6 +299,8 @@ struct TileRun<'a> {
     samples: MatRef<'a, f64>,
     first_column: usize,
     lanes: usize,
+    /// The shape of `samples`' rows: a gather is bounded by its inputs.
+    layout: RowLayout,
     file: &'a mut RegisterFile,
     faults: &'a mut [Option<LaneFault>],
 }
@@ -312,10 +315,11 @@ impl WithSimd for TileRun<'_> {
             samples,
             first_column,
             lanes,
+            layout,
             file,
             faults,
         } = self;
-        let available = samples.nrows();
+        debug_assert_eq!(samples.nrows(), layout.total());
 
         for (pc, insn) in tape.insns.iter().enumerate() {
             match *insn {
@@ -383,7 +387,7 @@ impl WithSimd for TileRun<'_> {
                     // Per lane by nature: each lane reads its own row. Scalar.
                     let (d, index) = file.dst_a(dst, index, lanes);
                     for (lane, (v, &i)) in d.iter_mut().zip(index).enumerate() {
-                        match lane::resolve_index(i, available) {
+                        match lane::resolve_index(i, layout.inputs) {
                             Ok(position) => {
                                 let x = samples[(position, first_column + lane)];
                                 *v = x;
@@ -410,10 +414,12 @@ impl WithSimd for TileRun<'_> {
 
 /// Runs a straight-line tape over `lanes` columns of `samples` starting at
 /// `first_column`, on the best instruction set this machine has. Returns the
-/// lowest faulted lane, if any.
+/// lowest faulted lane, if any. `layout` is the shape of `samples`' rows: a
+/// computed subscript may name its inputs and nothing after them.
 pub(crate) fn run_tile(
     tape: &AllocatedTape,
     samples: MatRef<'_, f64>,
+    layout: RowLayout,
     first_column: usize,
     lanes: usize,
     file: &mut RegisterFile,
@@ -423,6 +429,7 @@ pub(crate) fn run_tile(
         pulp::Arch::new(),
         tape,
         samples,
+        layout,
         first_column,
         lanes,
         file,
@@ -432,10 +439,15 @@ pub(crate) fn run_tile(
 
 /// [`run_tile`] on a given backend — the seam the tests use to force the
 /// scalar one and compare.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the tape, the batch and its row layout, the tile's place in it, and the two buffers reused across tiles: every one is a different thing, and a struct of them would be this signature with a name"
+)]
 pub(crate) fn run_tile_on(
     arch: pulp::Arch,
     tape: &AllocatedTape,
     samples: MatRef<'_, f64>,
+    layout: RowLayout,
     first_column: usize,
     lanes: usize,
     file: &mut RegisterFile,
@@ -447,6 +459,7 @@ pub(crate) fn run_tile_on(
         samples,
         first_column,
         lanes,
+        layout,
         file,
         faults,
     })
@@ -460,7 +473,7 @@ mod tests {
     use faer::Mat;
 
     use super::super::tape_for;
-    use super::{RegisterFile, TILE, run_tile, run_tile_on};
+    use super::{RegisterFile, RowLayout, TILE, run_tile, run_tile_on};
     use crate::diagnostics::EvaluationFailure;
     use crate::eval::Gradient;
     use crate::{Schema, eval};
@@ -580,7 +593,18 @@ mod tests {
         let batch = Mat::from_fn(1, 4, |_, c| [4.0, -1.0, 9.0, 16.0][c]);
         let mut file = RegisterFile::new(&tape, 4);
         let mut faults = vec![None; 4];
-        let fault = run_tile(&tape, batch.as_ref(), 0, 4, &mut file, &mut faults);
+        let fault = run_tile(
+            &tape,
+            batch.as_ref(),
+            RowLayout {
+                inputs: 1,
+                intermediates: 0,
+            },
+            0,
+            4,
+            &mut file,
+            &mut faults,
+        );
         assert_eq!(fault.map(|(lane, _)| lane), Some(1));
         let out = file.reg(tape.result, 4);
         assert_eq!([out[0], out[2], out[3]], [4.0, 6.0, 8.0]);
@@ -665,6 +689,10 @@ mod tests {
                 pulp::Arch::new(),
                 &tape,
                 batch.as_ref(),
+                RowLayout {
+                    inputs: names.len(),
+                    intermediates: 0,
+                },
                 0,
                 columns,
                 &mut detected,
@@ -674,6 +702,10 @@ mod tests {
                 pulp::Arch::Scalar,
                 &tape,
                 batch.as_ref(),
+                RowLayout {
+                    inputs: names.len(),
+                    intermediates: 0,
+                },
                 0,
                 columns,
                 &mut scalar,

@@ -13,7 +13,7 @@
   A subscript is one-based, integral and in range — the same three conditions
   `resolve_index` applies on the CPU — or the candidate faults.
 -#}
-fn {{ name }}(x: ptr<function, array<f32, {{ inputs }}>>) -> f32 {
+fn {{ name }}(x: ptr<function, array<f32, {{ rows }}>>) -> f32 {
     var r: array<f32, {{ registers }}>;
 {%- for (reg, literal) in consts %}
     r[{{ reg }}] = {{ literal }};
@@ -37,7 +37,7 @@ fn {{ name }}(x: ptr<function, array<f32, {{ inputs }}>>) -> f32 {
 {%- when Stmt::Gather with (dst, index) %}
     {
         let gi = i32({{ index }}) - 1;
-        if gi < 0 || gi >= {{ inputs }} || f32(gi + 1) != {{ index }} {
+        if gi < 0 || gi >= {{ subscriptable }} || f32(gi + 1) != {{ index }} {
             return EXPR_FAULT;
         }
         r[{{ dst }}] = (*x)[u32(gi)];

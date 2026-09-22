@@ -59,6 +59,13 @@
 //! # }
 //! ```
 //!
+//! A document's worth of named expressions — over inputs, over names produced
+//! elsewhere, and over each other — is [`compile_system`]: one
+//! [`CompiledNode`] per expression, carrying the edges it reads and the row
+//! layout its tape takes, checked together for cycles, duplicates and a
+//! constraint read as a value, and classified cheap or not. No scheduler
+//! comes with it; `tests/dependency_diagram.rs` shows the caller's side.
+//!
 //! Source text goes in; nothing hands back a syntax tree. Two consumers parse
 //! it: the evaluator, which [`compile`]s an expression against a list of
 //! variable names and runs it over a batch, and the constrained vector
@@ -102,6 +109,7 @@ mod cvg;
 pub mod diagnostics;
 mod eval;
 mod frontend;
+mod nodes;
 mod repair;
 mod solve;
 mod system;
@@ -110,6 +118,7 @@ pub(crate) use eval::Schema;
 pub(crate) use frontend::{Ast, parse};
 
 pub use eval::{CompiledExpression, CompiledGradient, Compiler, Gradient, compile};
+pub use nodes::{CompiledNode, Symbol, compile_system};
 pub use repair::RepairError;
 pub use solve::{
     ConstraintSolver, DEFAULT_GPU_PROPOSAL_BUDGET, DEFAULT_PROPOSAL_BUDGET, DEFAULT_PRUNE_BUDGET,

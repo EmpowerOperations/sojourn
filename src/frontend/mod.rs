@@ -85,8 +85,8 @@ pub(crate) fn failure(source: &str, faults: Vec<Fault>) -> CompilationFailure {
 
 /// A parsed expression, ready to be bound to a [`Schema`](crate::Schema).
 ///
-/// Crate-private: a caller hands source text to `compile` or to
-/// `ConstraintSystem::new` and never sees the tree between.
+/// Crate-private: a caller hands source text to `compile`, `compile_system`
+/// or `ConstraintSystem::new` and never sees the tree between.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Ast {
     pub(crate) source: String,

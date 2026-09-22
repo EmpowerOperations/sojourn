@@ -9,8 +9,8 @@
 use crate::ast;
 use crate::diagnostics::Fault;
 
-use super::EPSILON;
 use super::tape::{AllocatedTape, FaultKind, Instruction, LaneFault};
+use super::{EPSILON, RowLayout};
 
 /// The single place a `var[i]` subscript becomes a row position.
 ///
@@ -30,8 +30,16 @@ pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, Fault
         })
 }
 
-/// Evaluates `tape` for one row. `frame` must be [`AllocatedTape::prime`]d.
-pub(crate) fn run_lane(tape: &AllocatedTape, row: &[f64], frame: &mut [f64]) -> Result<f64, Fault> {
+/// Evaluates `tape` for one row laid out as `layout`. `frame` must be
+/// [`AllocatedTape::prime`]d. A computed subscript may name the row's
+/// inputs and nothing after them.
+pub(crate) fn run_lane(
+    tape: &AllocatedTape,
+    row: &[f64],
+    layout: RowLayout,
+    frame: &mut [f64],
+) -> Result<f64, Fault> {
+    debug_assert_eq!(row.len(), layout.total());
     let fault = |pc: usize, kind: FaultKind| {
         tape.fault(LaneFault {
             insn: u32::try_from(pc).expect("fewer than 2^32 instructions"),
@@ -76,7 +84,7 @@ pub(crate) fn run_lane(tape: &AllocatedTape, row: &[f64], frame: &mut [f64]) -> 
             }
             Instruction::Gather { dst, index, .. } => {
                 let position =
-                    resolve_index(frame[index.index()], row.len()).map_err(|k| fault(pc, k))?;
+                    resolve_index(frame[index.index()], layout.inputs).map_err(|k| fault(pc, k))?;
                 frame[dst.index()] = checked(pc, row[position])?;
             }
         }
