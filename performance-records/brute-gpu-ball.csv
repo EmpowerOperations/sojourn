@@ -3,3 +3,4 @@ version                 ;timestamp               ;host                    ;adapt
 2.1.0-native            ;2026-09-06T05:15:12Z    ;DESKTOP-KH0S3BP         ;AMD Radeon(TM) Graphics (Vulkan)        ;3    ;1048576     ;4194304         ;39635290    ;950557550   ;
 2.1.0-native            ;2026-09-07T08:37:40Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;103623557   ;11651392289 ;
 0.1.0                   ;2026-09-11T22:46:47Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;84504963    ;12387058948 ;
+0.2.0                   ;2026-09-23T18:33:49Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;84031539    ;10654943649 ;

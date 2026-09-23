@@ -1,3 +1,4 @@
 sep=;
 version                 ;timestamp               ;host                    ;adapter                                 ;vars ;given-batch ;generated-batch ;given       ;generated   ;
 0.1.0                   ;2026-09-11T22:46:47Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;81346207    ;12568327159 ;
+0.2.0                   ;2026-09-23T18:33:49Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;87126319    ;11692916614 ;

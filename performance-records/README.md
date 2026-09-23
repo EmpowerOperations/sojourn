@@ -13,6 +13,7 @@ A file is one measurement's history, read top to bottom.
 | [`transcendental-mix.csv`](transcendental-mix.csv) | `sin(x1)*cos(x2)+sqrt(abs(x3))` | 3 | libm cost, which no tape work removes |
 | [`deep-arithmetic.csv`](deep-arithmetic.csv) | a nested arithmetic chain | 4 | recursion depth, against a flat tape later |
 | [`sum-200-squares.csv`](sum-200-squares.csv) | `sum(1, 200, i -> var[i]^2 - 3.0)` | 200 | lifted verbatim from the JVM fixture; unrolls to a 200-term fold |
+| [`near-equality.csv`](near-equality.csv) | `x1 == x2 +/- 0.001` | 2 | the tolerance equality, desugared by `eval::irgen` into two comparisons and a fold; first row at `0.2.0` |
 
 Written by `tests/throughput_benchmarks.rs` on `just bench`.
 
@@ -138,6 +139,7 @@ in a hundred — the cost of a check does not depend on how rare a hit is.
 | [`brute-corner.csv`](brute-corner.csv) | corner | `x_i > 1 - q` for `i = 1..3`, three constraints |
 | [`brute-ball.csv`](brute-ball.csv) | ball | `x1^2 + x2^2 + x3^2 < r^2`, one constraint |
 | [`brute-sine-corner.csv`](brute-sine-corner.csv) | sine corner | `sin(x_i) > sin(1 - q)`, three constraints, the one no solver can be asked about |
+| [`brute-real-power.csv`](brute-real-power.csv) | real power | `x1^1.234 < p^1.234`, one constraint, a non-integer `pow` |
 
 The `brute-gpu-*.csv` ledgers are the same three families through the GPU
 sieve, written only when an adapter is present. Two rates, in **candidates per
