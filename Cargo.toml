@@ -11,7 +11,7 @@ askama = "0.16"
 # The local solve that finds the search's first point: COBYLA, derivative-free,
 # with nonlinear inequality constraints in babel's own `<= 0` convention. Pure
 # Rust, no C toolchain, which is the whole reason it and not `nlopt`.
-basin = "1.11"
+basin = "1.14"
 faer = { version = "0.24.4", default-features = false, features = ["std"] }
 pollster = { version = "1.0.1", optional = true }
 # Explicit SIMD for the evaluator's tile kernels, with the instruction set
